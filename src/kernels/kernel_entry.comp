@@ -1,0 +1,171 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// =============================================================================
+// KERNEL_ENTRY — Persistent mailbox poller for RDNA4.
+// =============================================================================
+// This kernel runs forever on the GPU. The host drops a token via mailbox.
+// The kernel then executes: embed -> (norm -> attn -> norm -> mlp) x N_layers
+// -> norm -> logit -> write back token.
+// =============================================================================
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer MailboxRef {
+    uint tokenReady;
+    uint tokenAck;
+    uint tokenId;
+    uint seqLen;
+    uint layerIndex;
+    uint phase;  // 0=embed, 1=attn, 2=mlp, 3=logit, 4=done
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer TokenEmbedRef {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer OutputNormRef {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LMHeadRef {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutputRef {
+    uint data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrMailbox;
+    uint64_t addrTokenEmbed;
+    uint64_t addrOutputNorm;
+    uint64_t addrLMHead;
+    uint64_t addrHiddenState;
+    uint64_t addrOutput;
+    uint vocabSize;
+    uint embeddingDim;
+    uint nLayers;
+} pc;
+
+// Simple RMS norm (in-place on hidden state)
+void rmsNorm(uint offset, uint dim) {
+    HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
+
+    // Compute sum of squares
+    float sumSq = 0.0;
+    for (uint d = gl_LocalInvocationID.x; d < dim; d += 32) {
+        float v = H.data[offset + d];
+        sumSq += v * v;
+    }
+
+    // Subgroup reduction
+    sumSq += subgroupShuffleDown(sumSq, 16);
+    sumSq += subgroupShuffleDown(sumSq, 8);
+    sumSq += subgroupShuffleDown(sumSq, 4);
+    sumSq += subgroupShuffleDown(sumSq, 2);
+    sumSq += subgroupShuffleDown(sumSq, 1);
+    sumSq = subgroupBroadcastFirst(sumSq);
+
+    float invRms = 1.0 / sqrt(sumSq / float(dim) + 1e-6);
+
+    // Normalize
+    for (uint d = gl_LocalInvocationID.x; d < dim; d += 32) {
+        H.data[offset + d] *= invRms;
+    }
+}
+
+void embedToken(uint tokenId, uint seqPos) {
+    TokenEmbedRef E = TokenEmbedRef(pc.addrTokenEmbed);
+    HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
+
+    uint dim = pc.embeddingDim;
+    uint embOffset = tokenId * dim;
+    uint hidOffset = seqPos * dim;
+
+    for (uint d = gl_LocalInvocationID.x; d < dim; d += 32) {
+        H.data[hidOffset + d] = float(E.data[embOffset + d]);
+    }
+}
+
+void computeLogits(uint seqPos) {
+    LMHeadRef W = LMHeadRef(pc.addrLMHead);
+    HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
+    OutputRef Out = OutputRef(pc.addrOutput);
+
+    uint dim = pc.embeddingDim;
+    uint vocab = pc.vocabSize;
+    uint hidOffset = seqPos * dim;
+
+    // Each thread computes logits for vocab/32 tokens
+    uint logitsPerThread = (vocab + 31) / 32;
+
+    for (uint i = 0; i < logitsPerThread; ++i) {
+        uint tokenIdx = i * 32 + gl_LocalInvocationID.x;
+        if (tokenIdx >= vocab) break;
+
+        float logit = 0.0;
+        for (uint d = 0; d < dim; ++d) {
+            logit += H.data[hidOffset + d] * float(W.data[tokenIdx * dim + d]);
+        }
+
+        // TODO: argmax / top-k reduction across subgroup
+        // For now, just write the logit
+        if (tokenIdx < 1024) {  // Safety
+            // Out.data[tokenIdx] = floatBitsToUint(logit);  // placeholder
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    MailboxRef M = MailboxRef(pc.addrMailbox);
+
+    // Poll for token
+    while (M.tokenReady == 0) {
+        // Spin-wait. On RDNA4, this is cheap with S_SLEEP.
+    }
+
+    uint tokenId = M.tokenId;
+    uint seqLen = M.seqLen;
+    uint layer = M.layerIndex;
+    uint phase = M.phase;
+
+    if (phase == 0) {
+        // Embedding phase
+        embedToken(tokenId, seqLen - 1);
+        M.phase = 1;
+        M.layerIndex = 0;
+    }
+    else if (phase == 1) {
+        // Attention phase for current layer
+        // TODO: call attention kernel (would be separate dispatch in host model)
+        // For persistent kernel, we'd inline or use call-like pattern
+        M.phase = 2;
+    }
+    else if (phase == 2) {
+        // MLP phase for current layer
+        // TODO: call mlp kernel
+        M.layerIndex++;
+        if (M.layerIndex >= pc.nLayers) {
+            M.phase = 3;
+        } else {
+            M.phase = 1;  // Next layer's attention
+        }
+    }
+    else if (phase == 3) {
+        // Final norm + logits
+        rmsNorm((seqLen - 1) * pc.embeddingDim, pc.embeddingDim);
+        computeLogits(seqLen - 1);
+        M.phase = 4;
+        M.tokenAck = 1;
+    }
+
+    // Acknowledge
+    if (tid == 0) {
+        M.tokenReady = 0;
+    }
+}

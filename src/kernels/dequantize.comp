@@ -1,0 +1,77 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// =============================================================================
+// DEQUANTIZE — VBUFFER "mailroom" format conversion for RDNA4.
+// =============================================================================
+// Converts quantized weights (Q4_0, Q8_0) to float16 on-the-fly for GEMM.
+// Each block: 2 bytes delta (f16) + N bytes quantized weights.
+// Output is a contiguous f16 array ready for WMMA consumption.
+// =============================================================================
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer QuantRef {
+    uint data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer F16OutRef {
+    float16_t data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrQuant;
+    uint64_t addrOut;
+    uint nElements;
+    uint quantFormat;
+    uint blockSize;
+    uint blockElements;
+} pc;
+
+// Q4_0: 2 bytes delta + 16 bytes (32 nibbles) = 18 bytes per 32 elements
+// Q8_0: 2 bytes delta + 32 bytes = 34 bytes per 32 elements
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+
+    QuantRef Q = QuantRef(pc.addrQuant);
+    F16OutRef Out = F16OutRef(pc.addrOut);
+
+    uint totalBlocks = (pc.nElements + pc.blockElements - 1) / pc.blockElements;
+    uint blocksPerThread = (totalBlocks + 31) / 32;
+
+    for (uint b = 0; b < blocksPerThread; ++b) {
+        uint blockIdx = wg * 32 * blocksPerThread + tid * blocksPerThread + b;
+        if (blockIdx >= totalBlocks) break;
+
+        uint blockOffset = blockIdx * pc.blockSize;
+        uint elemOffset = blockIdx * pc.blockElements;
+
+        // Read delta (f16) at start of block
+        uint16_t deltaRaw = (uint16_t(Q.data[blockOffset + 1]) << 8) | uint16_t(Q.data[blockOffset]);
+        float delta = unpackFloat2x16(deltaRaw).x;  // f16 -> f32
+
+        if (pc.quantFormat == 2) {  // Q4_0
+            // 16 bytes of nibbles follow
+            for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
+                uint byteIdx = blockOffset + 2 + (i / 2);
+                uint8_t byte = Q.data[byteIdx];
+                uint nibble = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                float val = delta * (float(nibble) - 8.0);
+                Out.data[elemOffset + i] = float16_t(val);
+            }
+        }
+        else if (pc.quantFormat == 8) {  // Q8_0
+            // 32 bytes of int8 weights follow
+            for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
+                int8_t q = int8_t(Q.data[blockOffset + 2 + i]);
+                float val = delta * float(q);
+                Out.data[elemOffset + i] = float16_t(val);
+            }
+        }
+    }
+}
