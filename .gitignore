@@ -23,3 +23,10 @@ Debug/
 Release/
 MinSizeRel/
 RelWithDebInfo/
+
+reference/
+
+stderr.txt
+
+__pycache__/
+

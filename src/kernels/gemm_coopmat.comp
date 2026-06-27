@@ -1,0 +1,117 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Buffer references — A: float activations, B: float16_t weights, C: float output
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ARef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BRef {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer CRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA;
+    uint64_t addrB;
+    uint64_t addrC;
+    uint M;
+    uint N;
+    uint K;
+    float alpha;
+} pc;
+
+// Matrix dimensions: 16x16x16 tiles
+// RDNA4 supports: F16 x F16 -> F32 (accumulator), scope = SUBGROUP
+
+// Forward declarations for cooperative matrix types
+// co Mat Type Use Scope M N
+// coopMatLoad<T, Use, Scope, M, N>(res, buffer, stride, offset, matrixLayout)
+// coopMatStore<T, Use, Scope, M, N>(matrix, buffer, stride, offset, matrixLayout)
+// coopMatMulAdd<T, Use, Scope, M, N, K>(D, A, B, C)
+
+void main() {
+    ARef A = ARef(pc.addrA);
+    BRef B = BRef(pc.addrB);
+    CRef C = CRef(pc.addrC);
+
+    // Each workgroup (1 wave = 32 threads) computes one 16x16 output tile
+    uint tileRow = gl_WorkGroupID.x * 16;
+    uint tileCol = gl_WorkGroupID.y * 16;
+
+    if (tileRow >= pc.M || tileCol >= pc.N) return;
+
+    uint lane = gl_SubgroupInvocationID;
+
+    // Initialize accumulator: 16x16 F32 matrix
+    float32_t acc[16][16];
+    for (uint i = 0; i < 16; i++)
+        for (uint j = 0; j < 16; j++)
+            acc[i][j] = float32_t(0.0);
+
+    // Loop over K in 16-element chunks
+    for (uint k = 0; k < pc.K; k += 16) {
+        if (k + 16 > pc.K) break;
+
+        // Load A fragment: A[tileRow..+15][k..+15] as float16
+        // Each thread loads multiple elements (256 elements / 32 threads = 8 per thread)
+        float16_t aFrag[16][16];
+        for (uint idx = lane; idx < 256; idx += 32) {
+            uint i = idx / 16;
+            uint j = idx % 16;
+            uint row = tileRow + i;
+            uint col = k + j;
+            if (row < pc.M && col < pc.K) {
+                aFrag[i][j] = float16_t(A.data[row * pc.K + col]);
+            } else {
+                aFrag[i][j] = float16_t(0.0);
+            }
+        }
+
+        // Load B fragment: B[k..+15][tileCol..+15] as float16
+        float16_t bFrag[16][16];
+        for (uint idx = lane; idx < 256; idx += 32) {
+            uint i = idx / 16;
+            uint j = idx % 16;
+            uint row = k + i;
+            uint col = tileCol + j;
+            if (row < pc.K && col < pc.N) {
+                bFrag[i][j] = B.data[row * pc.N + col];
+            } else {
+                bFrag[i][j] = float16_t(0.0);
+            }
+        }
+
+        // Scalar multiply-accumulate (placeholder for hardware cooperative matrix)
+        // This will be replaced by coopMatMulAdd when the extension API is confirmed
+        for (uint i = 0; i < 16; i++) {
+            for (uint j = 0; j < 16; j++) {
+                float32_t sum = float32_t(0.0);
+                for (uint kk = 0; kk < 16; kk++) {
+                    sum += float32_t(aFrag[i][kk]) * float32_t(bFrag[kk][j]);
+                }
+                acc[i][j] += sum;
+            }
+        }
+    }
+
+    // Store result with alpha scaling
+    for (uint i = 0; i < 16; i++) {
+        uint row = tileRow + i;
+        if (row >= pc.M) continue;
+        for (uint j = 0; j < 16; j++) {
+            uint col = tileCol + j;
+            if (col >= pc.N) continue;
+            C.data[row * pc.N + col] = pc.alpha * float(acc[i][j]);
+        }
+    }
+}
