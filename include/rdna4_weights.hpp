@@ -39,16 +39,17 @@ class WeightUploader {
 public:
     VkDevice device;
     VkPhysicalDevice physicalDevice;
+    uint32_t queueFamilyIndex;
 
-    WeightUploader(VkDevice dev, VkPhysicalDevice pdev) : device(dev), physicalDevice(pdev) {}
+    WeightUploader(VkDevice dev, VkPhysicalDevice pdev, uint32_t qfi = 0)
+        : device(dev), physicalDevice(pdev), queueFamilyIndex(qfi) {}
 
     ModelDesc load(const std::string& jsonPath, const std::string& binPath);
     void loadTokenizer(Tokenizer& tokenizer, const nlohmann::json& tokenizerJson);
-    void uploadTensor(const TensorDesc& desc, const void* data);
     void freeTensor(const TensorDesc& desc);
 
 private:
-    VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr);
+    VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem);
 };
 
 } // namespace rdna4

@@ -25,9 +25,10 @@ namespace rdna4 {
 class DynamicVGPRExtension {
 public:
     VkDevice device;
+    VkPhysicalDevice physicalDevice;
     bool available = false;
 
-    DynamicVGPRExtension(VkDevice dev);
+    DynamicVGPRExtension(VkDevice dev, VkPhysicalDevice pdev);
 
     // Check if VK_AMD_shader_info is available
     bool checkSupport();

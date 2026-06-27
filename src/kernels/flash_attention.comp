@@ -47,11 +47,11 @@ layout(push_constant, scalar) uniform PushConstants {
     uint64_t addrKCache;   // K cache for this head: [maxSeqLen, headDim]
     uint64_t addrVCache;   // V cache for this head: [maxSeqLen, headDim]
     uint64_t addrOut;      // Output: [seqLen, headDim]
-    uint32_t seqLen;       // Current sequence length
-    uint32_t headDim;      // Dimension per head
-    uint32_t qRowStart;    // Starting row of Q tile this wave processes
-    uint32_t qRowCount;    // Number of rows in Q tile (Br)
-    uint32_t kvTileSize;   // Block size for K/V (Bc)
+    uint seqLen;       // Current sequence length
+    uint headDim;      // Dimension per head
+    uint qRowStart;    // Starting row of Q tile this wave processes
+    uint qRowCount;    // Number of rows in Q tile (Br)
+    uint kvTileSize;   // Block size for K/V (Bc)
     float invSqrtHeadDim;
 } pc;
 

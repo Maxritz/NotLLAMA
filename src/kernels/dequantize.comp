@@ -8,15 +8,15 @@
 // =============================================================================
 // DEQUANTIZE — VBUFFER "mailroom" format conversion for RDNA4.
 // =============================================================================
-// Converts quantized weights (Q4_0, Q8_0) to float16 on-the-fly for GEMM.
+// Converts quantized weights (Q4_0, Q8_0) to float16 on-the-fly.
 // Each block: 2 bytes delta (f16) + N bytes quantized weights.
-// Output is a contiguous f16 array ready for WMMA consumption.
+// Output is a contiguous f16 array ready for GEMM consumption.
 // =============================================================================
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer QuantRef {
-    uint data[];
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
+    int data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer F16OutRef {
     float16_t data[];
@@ -31,14 +31,28 @@ layout(push_constant, scalar) uniform PushConstants {
     uint blockElements;
 } pc;
 
-// Q4_0: 2 bytes delta + 16 bytes (32 nibbles) = 18 bytes per 32 elements
-// Q8_0: 2 bytes delta + 32 bytes = 34 bytes per 32 elements
+// Helper: read a byte from a byte-addressed buffer
+int readByte(uint addr) {
+    uint wordIdx = addr / 4;
+    uint byteInWord = addr % 4;
+    int word = ByteRef(pc.addrQuant).data[wordIdx];
+    return (word >> (int(byteInWord) * 8)) & 0xFF;
+}
+
+// Helper: read a little-endian uint16 from byte-addressed buffer
+uint readU16(uint addr) {
+    return uint(readByte(addr)) | (uint(readByte(addr + 1)) << 8);
+}
+
+// Helper: read a little-endian int16 from byte-addressed buffer
+int readI16(uint addr) {
+    return int(readU16(addr));
+}
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg = gl_WorkGroupID.x;
 
-    QuantRef Q = QuantRef(pc.addrQuant);
     F16OutRef Out = F16OutRef(pc.addrOut);
 
     uint totalBlocks = (pc.nElements + pc.blockElements - 1) / pc.blockElements;
@@ -51,24 +65,25 @@ void main() {
         uint blockOffset = blockIdx * pc.blockSize;
         uint elemOffset = blockIdx * pc.blockElements;
 
-        // Read delta (f16) at start of block
-        uint16_t deltaRaw = (uint16_t(Q.data[blockOffset + 1]) << 8) | uint16_t(Q.data[blockOffset]);
-        float delta = unpackFloat2x16(deltaRaw).x;  // f16 -> f32
+        // Read delta (f16) at start of block — 2 bytes little-endian
+        uint deltaRaw = readU16(blockOffset);
+        float delta = unpackFloat2x16(deltaRaw).x;
 
         if (pc.quantFormat == 2) {  // Q4_0
-            // 16 bytes of nibbles follow
+            // 16 bytes of nibbles (32 elements) follow the 2-byte delta
             for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
                 uint byteIdx = blockOffset + 2 + (i / 2);
-                uint8_t byte = Q.data[byteIdx];
-                uint nibble = (i % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+                int bval = readByte(byteIdx);
+                uint nibble = (i % 2 == 0) ? uint(bval & 0x0F) : uint((bval >> 4) & 0x0F);
                 float val = delta * (float(nibble) - 8.0);
                 Out.data[elemOffset + i] = float16_t(val);
             }
         }
         else if (pc.quantFormat == 8) {  // Q8_0
-            // 32 bytes of int8 weights follow
+            // 32 bytes of int8 weights follow the 2-byte delta
             for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
-                int8_t q = int8_t(Q.data[blockOffset + 2 + i]);
+                int q = readByte(blockOffset + 2 + i);
+                if (q > 127) q -= 256;  // sign extend
                 float val = delta * float(q);
                 Out.data[elemOffset + i] = float16_t(val);
             }

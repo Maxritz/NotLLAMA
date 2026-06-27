@@ -1,5 +1,6 @@
 #include "rdna4_kv_cache.hpp"
 #include <iostream>
+#include <cstring>
 
 namespace rdna4 {
 
@@ -8,108 +9,148 @@ KVCacheManager::KVCacheManager(VkDevice dev, VkPhysicalDevice pdev,
     : device(dev), physicalDevice(pdev),
       maxSeqLen(maxSeq), nLayers(nL), nKvHeads(nKV), headDim(hd) {
     layers.resize(nLayers);
-    for (auto& layer : layers) {
-        layer.currentSeqLen = 0;
-        layer.kImage = VK_NULL_HANDLE;
-        layer.vImage = VK_NULL_HANDLE;
-    }
 }
 
 bool KVCacheManager::allocate() {
-    // Total width: nKvHeads * headDim (e.g., 8 * 128 = 1024)
-    // Height: maxSeqLen (e.g., 4096)
-    // Format: R16G16B16A16_SFLOAT for 4x f16 per pixel, or R16_SFLOAT
-    uint32_t width = nKvHeads * headDim / 4;  // 4 channels per pixel
-    uint32_t height = maxSeqLen;
+    // Each layer: K buffer + V buffer, each maxSeqLen * nKvHeads * headDim * sizeof(f16)
+    // Using float16 for KV cache to save bandwidth
+    size_t layerBytes = static_cast<size_t>(maxSeqLen) * nKvHeads * headDim * sizeof(uint16_t);
 
-    VkImageCreateInfo imgInfo = {};
-    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imgInfo.imageType = VK_IMAGE_TYPE_2D;
-    imgInfo.extent = {width, height, 1};
-    imgInfo.mipLevels = 1;
-    imgInfo.arrayLayers = 1;
-    imgInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imgInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
 
     for (uint32_t i = 0; i < nLayers; ++i) {
-        // K image
-        VkResult r = vkCreateImage(device, &imgInfo, nullptr, &layers[i].kImage);
-        if (r != VK_SUCCESS) return false;
+        auto& layer = layers[i];
 
-        // V image
-        r = vkCreateImage(device, &imgInfo, nullptr, &layers[i].vImage);
-        if (r != VK_SUCCESS) return false;
+        for (int kv = 0; kv < 2; ++kv) {
+            VkBuffer& buf = (kv == 0) ? layer.kBuffer : layer.vBuffer;
+            VkDeviceMemory& mem = (kv == 0) ? layer.kMemory : layer.vMemory;
+            VkDeviceAddress& addr = (kv == 0) ? layer.kAddress : layer.vAddress;
 
-        // Allocate memory
-        VkMemoryRequirements memReqK, memReqV;
-        vkGetImageMemoryRequirements(device, layers[i].kImage, &memReqK);
-        vkGetImageMemoryRequirements(device, layers[i].vImage, &memReqV);
+            VkBufferCreateInfo bufInfo = {};
+            bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bufInfo.size = layerBytes;
+            bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        VkPhysicalDeviceMemoryProperties memProps;
-        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
-
-        uint32_t memTypeIndex = 0;
-        for (uint32_t j = 0; j < memProps.memoryTypeCount; ++j) {
-            if ((memReqK.memoryTypeBits & (1 << j)) &&
-                (memProps.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                memTypeIndex = j;
-                break;
+            VkResult r = vkCreateBuffer(device, &bufInfo, nullptr, &buf);
+            if (r != VK_SUCCESS) {
+                std::cerr << "KV cache: vkCreateBuffer failed: " << r << "\n";
+                return false;
             }
+
+            VkMemoryRequirements memReq;
+            vkGetBufferMemoryRequirements(device, buf, &memReq);
+
+            uint32_t memTypeIndex = 0;
+            bool found = false;
+            for (uint32_t j = 0; j < memProps.memoryTypeCount; ++j) {
+                if ((memReq.memoryTypeBits & (1 << j)) &&
+                    (memProps.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    memTypeIndex = j;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                for (uint32_t j = 0; j < memProps.memoryTypeCount; ++j) {
+                    if ((memReq.memoryTypeBits & (1 << j))) {
+                        memTypeIndex = j;
+                        break;
+                    }
+                }
+            }
+
+            VkMemoryAllocateFlagsInfo flagsInfo = {};
+            flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+            flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+            VkMemoryAllocateInfo allocInfo = {};
+            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocInfo.allocationSize = memReq.size;
+            allocInfo.memoryTypeIndex = memTypeIndex;
+            allocInfo.pNext = &flagsInfo;
+
+            r = vkAllocateMemory(device, &allocInfo, nullptr, &mem);
+            if (r != VK_SUCCESS) {
+                std::cerr << "KV cache: vkAllocateMemory failed: " << r << "\n";
+                return false;
+            }
+
+            vkBindBufferMemory(device, buf, mem, 0);
+
+            VkBufferDeviceAddressInfo addrInfo = {};
+            addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+            addrInfo.buffer = buf;
+            addr = vkGetBufferDeviceAddress(device, &addrInfo);
         }
 
-        VkMemoryAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = memReqK.size;
-        allocInfo.memoryTypeIndex = memTypeIndex;
-
-        vkAllocateMemory(device, &allocInfo, nullptr, &layers[i].kMemory);
-        vkBindImageMemory(device, layers[i].kImage, layers[i].kMemory, 0);
-
-        allocInfo.allocationSize = memReqV.size;
-        vkAllocateMemory(device, &allocInfo, nullptr, &layers[i].vMemory);
-        vkBindImageMemory(device, layers[i].vImage, layers[i].vMemory, 0);
-
-        // Create views
-        VkImageViewCreateInfo viewInfo = {};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = layers[i].kImage;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.levelCount = 1;
-        viewInfo.subresourceRange.layerCount = 1;
-
-        vkCreateImageView(device, &viewInfo, nullptr, &layers[i].kView);
-
-        viewInfo.image = layers[i].vImage;
-        vkCreateImageView(device, &viewInfo, nullptr, &layers[i].vView);
+        layer.currentSeqLen = 0;
     }
 
     std::cout << "KV cache allocated: " << nLayers << " layers, "
               << maxSeqLen << " max seq, " << nKvHeads << " KV heads, "
-              << headDim << " head dim\n";
+              << headDim << " head dim (f16 buffers)\n";
     return true;
 }
 
 void KVCacheManager::free() {
     for (auto& layer : layers) {
-        if (layer.kView) vkDestroyImageView(device, layer.kView, nullptr);
-        if (layer.vView) vkDestroyImageView(device, layer.vView, nullptr);
-        if (layer.kImage) vkDestroyImage(device, layer.kImage, nullptr);
-        if (layer.vImage) vkDestroyImage(device, layer.vImage, nullptr);
+        if (layer.kBuffer) vkDestroyBuffer(device, layer.kBuffer, nullptr);
+        if (layer.vBuffer) vkDestroyBuffer(device, layer.vBuffer, nullptr);
         if (layer.kMemory) vkFreeMemory(device, layer.kMemory, nullptr);
         if (layer.vMemory) vkFreeMemory(device, layer.vMemory, nullptr);
+        layer.kBuffer = VK_NULL_HANDLE;
+        layer.vBuffer = VK_NULL_HANDLE;
+        layer.kMemory = VK_NULL_HANDLE;
+        layer.vMemory = VK_NULL_HANDLE;
     }
 }
 
 void KVCacheManager::append(uint32_t layer, const void* kData, const void* vData) {
-    // TODO: Use transfer queue to copy new K/V vectors into image at (currentSeqLen, 0)
-    // For now, just increment
-    layers[layer].currentSeqLen++;
+    if (layer >= layers.size()) return;
+    auto& l = layers[layer];
+
+    // Each row is nKvHeads * headDim * sizeof(f16) bytes
+    size_t rowBytes = static_cast<size_t>(nKvHeads) * headDim * sizeof(uint16_t);
+    size_t kOffset = static_cast<size_t>(l.currentSeqLen) * rowBytes;
+    size_t vOffset = kOffset;
+
+    // Map, copy, flush, unmap for K buffer
+    {
+        void* mapped = nullptr;
+        VkResult r = vkMapMemory(device, l.kMemory, kOffset, rowBytes, 0, &mapped);
+        if (r == VK_SUCCESS && mapped) {
+            std::memcpy(mapped, kData, rowBytes);
+            VkMappedMemoryRange range = {};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = l.kMemory;
+            range.offset = kOffset & ~(VK_WHOLE_SIZE - 1); // align down
+            range.size = rowBytes + (kOffset - range.offset);
+            vkFlushMappedMemoryRanges(device, 1, &range);
+            vkUnmapMemory(device, l.kMemory);
+        }
+    }
+
+    // Map, copy, flush, unmap for V buffer
+    {
+        void* mapped = nullptr;
+        VkResult r = vkMapMemory(device, l.vMemory, vOffset, rowBytes, 0, &mapped);
+        if (r == VK_SUCCESS && mapped) {
+            std::memcpy(mapped, vData, rowBytes);
+            VkMappedMemoryRange range = {};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = l.vMemory;
+            range.offset = vOffset & ~(VK_WHOLE_SIZE - 1);
+            range.size = rowBytes + (vOffset - range.offset);
+            vkFlushMappedMemoryRanges(device, 1, &range);
+            vkUnmapMemory(device, l.vMemory);
+        }
+    }
+
+    l.currentSeqLen++;
 }
 
 } // namespace rdna4

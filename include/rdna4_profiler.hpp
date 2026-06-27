@@ -44,6 +44,7 @@ public:
 
     void report() const;
     void reset();
+    void cleanup();
 
 private:
     void readbackQueries();

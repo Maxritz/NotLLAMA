@@ -32,9 +32,9 @@ layout(push_constant, scalar) uniform PushConstants {
     uint64_t addrVIn;
     uint64_t addrKCache;
     uint64_t addrVCache;
-    uint32_t seqPos;       // Position to write
-    uint32_t headDim;
-    uint32_t nKvHeads;
+    uint seqPos;       // Position to write
+    uint headDim;
+    uint nKvHeads;
 } pc;
 
 void main() {

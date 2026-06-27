@@ -86,23 +86,22 @@ bool VulkanContext::init() {
     qInfo.queueCount = queueCount;
     qInfo.pQueuePriorities = priorities;
 
-    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures = {};
-    bdaFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-    bdaFeatures.bufferDeviceAddress = VK_TRUE;
+    // Enable buffer device address (core in Vulkan 1.2+)
+    VkPhysicalDeviceVulkan12Features vulkan12Features = {};
+    vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vulkan12Features.bufferDeviceAddress = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &bdaFeatures;
+    features2.pNext = &vulkan12Features;
 
     VkDeviceCreateInfo devInfo = {};
     devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     devInfo.queueCreateInfoCount = 1;
     devInfo.pQueueCreateInfos = &qInfo;
     devInfo.pNext = &features2;
-
-    const char* devExts[] = { VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME };
-    devInfo.enabledExtensionCount = 1;
-    devInfo.ppEnabledExtensionNames = devExts;
+    devInfo.enabledExtensionCount = 0;
+    devInfo.ppEnabledExtensionNames = nullptr;
 
     r = vkCreateDevice(physicalDevice, &devInfo, nullptr, &device);
     if (r != VK_SUCCESS) {
@@ -121,8 +120,8 @@ bool VulkanContext::init() {
 }
 
 void VulkanContext::cleanup() {
-    if (device) vkDestroyDevice(device, nullptr);
-    if (instance) vkDestroyInstance(instance, nullptr);
+    if (device) { vkDestroyDevice(device, nullptr); device = VK_NULL_HANDLE; }
+    if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
 }
 
 } // namespace rdna4

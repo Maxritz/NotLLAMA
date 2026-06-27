@@ -1,6 +1,7 @@
 #include "rdna4.hpp"
 #include <vulkan/vulkan.h>
 #include <iostream>
+#include <vector>
 
 namespace rdna4 {
 
@@ -8,6 +9,8 @@ class MemoryManager {
 public:
     VkDevice device;
     VkPhysicalDevice physicalDevice;
+    std::vector<VkDeviceMemory> allocatedBuffers;
+    std::vector<VkDeviceMemory> allocatedImages;
 
     MemoryManager(VkDevice dev, VkPhysicalDevice pdev) : device(dev), physicalDevice(pdev) {}
 
@@ -28,11 +31,21 @@ public:
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
 
         uint32_t memTypeIndex = 0;
+        bool found = false;
         for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
             if ((memReq.memoryTypeBits & (1 << i)) &&
                 (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
                 memTypeIndex = i;
+                found = true;
                 break;
+            }
+        }
+        if (!found) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((memReq.memoryTypeBits & (1 << i))) {
+                    memTypeIndex = i;
+                    break;
+                }
             }
         }
 
@@ -49,6 +62,7 @@ public:
         VkDeviceMemory memory;
         vkAllocateMemory(device, &allocInfo, nullptr, &memory);
         vkBindBufferMemory(device, buffer, memory, 0);
+        allocatedBuffers.push_back(memory);
 
         if (outAddr) {
             VkBufferDeviceAddressInfo addrInfo = {};
@@ -75,8 +89,63 @@ public:
         imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         VkImage image;
-        vkCreateImage(device, &imgInfo, nullptr, &image);
+        VkResult r = vkCreateImage(device, &imgInfo, nullptr, &image);
+        if (r != VK_SUCCESS) {
+            std::cerr << "allocateImage: vkCreateImage failed: " << r << "\n";
+            return VK_NULL_HANDLE;
+        }
+
+        VkMemoryRequirements memReq;
+        vkGetImageMemoryRequirements(device, image, &memReq);
+
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+        uint32_t memTypeIndex = 0;
+        bool found = false;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1 << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                memTypeIndex = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((memReq.memoryTypeBits & (1 << i))) {
+                    memTypeIndex = i;
+                    break;
+                }
+            }
+        }
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = memTypeIndex;
+
+        VkDeviceMemory memory;
+        vkAllocateMemory(device, &allocInfo, nullptr, &memory);
+        vkBindImageMemory(device, image, memory, 0);
+        allocatedImages.push_back(memory);
+
         return image;
+    }
+
+    void freeBuffer(VkBuffer buffer) {
+        if (buffer) vkDestroyBuffer(device, buffer, nullptr);
+    }
+
+    void freeImage(VkImage image) {
+        if (image) vkDestroyImage(device, image, nullptr);
+    }
+
+    void freeAll() {
+        for (auto mem : allocatedImages) vkFreeMemory(device, mem, nullptr);
+        for (auto mem : allocatedBuffers) vkFreeMemory(device, mem, nullptr);
+        allocatedImages.clear();
+        allocatedBuffers.clear();
     }
 };
 

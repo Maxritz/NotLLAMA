@@ -25,6 +25,10 @@ Profiler::~Profiler() {
     if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
 }
 
+void Profiler::cleanup() {
+    if (queryPool) { vkDestroyQueryPool(device, queryPool, nullptr); queryPool = VK_NULL_HANDLE; }
+}
+
 void Profiler::beginCpu(const std::string& name, uint32_t ace) {
     active[name] = {ace, std::chrono::high_resolution_clock::now()};
 }

@@ -2,6 +2,7 @@
 #include "rdna4_types.hpp"
 #include "rdna4_scheduler.hpp"
 #include "rdna4_allocator.hpp"
+#include "rdna4_kv_cache.hpp"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -95,9 +96,9 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
                              &ropePC, sizeof(ropePC), model->headCount, 1, 1);
         scheduler->syncAll();
 
-        // KV cache write
-        uint64_t kCacheAddr = findTensorAddr(*model, prefix + ".attn_k.cache");
-        uint64_t vCacheAddr = findTensorAddr(*model, prefix + ".attn_v.cache");
+        // KV cache write — use buffer addresses from KVCacheManager
+        uint64_t kCacheAddr = kvCache->getKBufferAddress(layer);
+        uint64_t vCacheAddr = kvCache->getVBufferAddress(layer);
         if (kCacheAddr && vCacheAddr) {
             KVCacheWritePushConstants kvPC = {kAddr, vAddr, kCacheAddr, vCacheAddr, seqPos, headDim, model->headCountKv};
             scheduler->dispatch(pipelines->getPipeline("kv_cache_write"), pipelines->getLayout("kv_cache_write"),
@@ -183,23 +184,20 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
     scheduler->syncAll();
 
     // Read back sampled token
-    // If ring allocator is host-visible, just read from mapped pointer
-    // Otherwise, we'd need a copy to staging buffer
     uint32_t nextToken = 0;
     if (allocator->mappedPtr) {
         size_t localOffset = sampleOutAddr - allocator->baseAddress;
 
-        // Ensure GPU writes are visible to host
+        // Invalidate mapped memory to ensure GPU writes are visible to host
         VkMappedMemoryRange range = {};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        range.memory = allocator->memory;  // Need to expose this or use flush
-        range.offset = localOffset;
-        range.size = sizeof(uint32_t);
-        // vkInvalidateMappedMemoryRanges(device, 1, &range);  // Requires allocator to expose memory handle
+        range.memory = allocator->memory;
+        range.offset = localOffset & ~(4096 - 1); // align to nonCoherentAtomSize
+        range.size = VK_WHOLE_SIZE;
+        vkInvalidateMappedMemoryRanges(ctx->device, 1, &range);
 
         std::memcpy(&nextToken, allocator->mappedPtr + localOffset, sizeof(uint32_t));
     } else {
-        // Fallback: host-side argmax on logits (would need copy back)
         nextToken = sampleArgmax(nullptr, model->vocabSize);
     }
 
@@ -293,6 +291,7 @@ std::vector<uint32_t> InferenceEngine::generateSpeculative(const std::string& pr
 }
 
 uint32_t InferenceEngine::draftForward(uint32_t tokenId, uint32_t seqPos, uint32_t nLayers) {
+    (void)nLayers;
     return forward(tokenId, seqPos);
 }
 

@@ -5,18 +5,18 @@
 
 namespace rdna4 {
 
-// KV cache stored as DCC-compressed images for bandwidth efficiency.
-// Each layer has K and V caches: [maxSeqLen, nKvHeads, headDim]
-// Stored as 2D images where rows = seq positions, cols = headDim * nKvHeads
+// KV cache as flat buffers with buffer device address for shader access.
+// Each layer has K and V buffers: totalBytes = maxSeqLen * nKvHeads * headDim * sizeof(float16)
+// Buffers use SHADER_DEVICE_ADDRESS_BIT so shaders access them via buffer_reference.
 
-struct KVCacheLayer {
-    VkImage kImage;
-    VkImage vImage;
-    VkDeviceMemory kMemory;
-    VkDeviceMemory vMemory;
-    VkImageView kView;
-    VkImageView vView;
-    uint32_t currentSeqLen;
+struct KVCacheBuffer {
+    VkBuffer kBuffer = VK_NULL_HANDLE;
+    VkBuffer vBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory kMemory = VK_NULL_HANDLE;
+    VkDeviceMemory vMemory = VK_NULL_HANDLE;
+    VkDeviceAddress kAddress = 0;
+    VkDeviceAddress vAddress = 0;
+    uint32_t currentSeqLen = 0;
 };
 
 class KVCacheManager {
@@ -29,7 +29,7 @@ public:
     uint32_t nKvHeads;
     uint32_t headDim;
 
-    std::vector<KVCacheLayer> layers;
+    std::vector<KVCacheBuffer> layers;
 
     KVCacheManager(VkDevice dev, VkPhysicalDevice pdev,
                    uint32_t maxSeq, uint32_t nL, uint32_t nKV, uint32_t hd);
@@ -40,9 +40,9 @@ public:
     // Append new K/V vectors for the current token at position currentSeqLen
     void append(uint32_t layer, const void* kData, const void* vData);
 
-    // Get image views for binding to compute shaders
-    VkImageView getKView(uint32_t layer) const { return layers[layer].kView; }
-    VkImageView getVView(uint32_t layer) const { return layers[layer].vView; }
+    // Get buffer addresses for binding to compute shaders via push constants
+    VkDeviceAddress getKBufferAddress(uint32_t layer) const { return layers[layer].kAddress; }
+    VkDeviceAddress getVBufferAddress(uint32_t layer) const { return layers[layer].vAddress; }
 
     uint32_t getSeqLen(uint32_t layer) const { return layers[layer].currentSeqLen; }
     void incrementSeqLen(uint32_t layer) { layers[layer].currentSeqLen++; }
