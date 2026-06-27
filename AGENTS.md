@@ -80,4 +80,32 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Child DOX Index
 
-This project is not yet indexed. Before continuing you must scan the project, build the DOX tree and replace this message with the actual index. Go deep and scan files recursively to properly evaluate complexity and create nested DOX files where needed.
+### Ownership Map
+
+- **Root** (`/`): Build system (`CMakeLists.txt`), entry point (`main.cpp`), project-wide instructions, DEEPSEEK_CONTEXT.md (project state document)
+- **`include/`**: Headers owned by corresponding `src/host/` implementations. No child DOX needed.
+- **`src/host/`**: Inference engine, scheduler, allocator, KV cache, weight uploader, tokenizer, profiler, pipeline builder, mailbox
+  - `inference_engine.cpp` — main inference loop, GPU sampling, CPU fallback
+  - `scheduler.cpp` — Vulkan queue submission, fence handling, cleanup lifecycle
+- **`src/kernels/`**: 13 GLSL compute shaders compiled to SPIR-V via glslc. No child DOX needed.
+- **`tools/`**: Python weight converter, GGUF inspector, RAG tool. Owned separately.
+- **`reference/`**: Vulkan SDK reference files. Read-only.
+- **`graphify-out/`**: Knowledge graph outputs (auto-generated, not edited directly).
+- **`build/`**: CMake build output. Not checked in.
+
+### Key Contracts
+
+- `scheduler.cleanup()` must be called before `ctx.cleanup()` in main.cpp — destroys command pools while VkDevice is still alive.
+- `TopKPushConstants` includes `addrScratch` (vocabSize floats for probabilities), `topP`, `seed`. The topk shader does temperature-scaled softmax (parallel reduce-max + reduce-sum), then single-threaded (tid==0) bounded min-heap top-K scan over all vocabSize probabilities, top-P nucleus filtering, and PCG random weighted sampling in one dispatch. O(vocabSize log K) heap ops, single-threaded — no data race.
+- `kv_cache_write.comp`: KInRef/VInRef are `float` (not `float16_t`). Explicit `float16_t()` conversion on cache write. Cache stays float16.
+- `rope.comp`: Two-pass pattern — all threads read paired Q/K values into registers before any thread writes, eliminating data race.
+- `flash_attention.comp`: Tiled — each thread owns `headDim/32` elements. Uses `myQ[8]`, `myAcc[8]`, `s_scores[32]` shared. Online softmax over KV tiles. Requires subgroup shuffle/ballot extensions.
+- `kernel_entry.comp`: MailboxRef is `coherent`. Spin-wait loop calls `memoryBarrierBuffer()` before reading `tokenReady`. `computeLogits()` writes all logits unconditionally.
+- `inference_engine.cpp`: Ring allocator calls checked for zero (overflow). CPU fallback guards `cpuLogits` null before `sampleArgmax`.
+- Dequant dispatches are capped at 1M workgroups per dispatch (chunking). Embedding cache is persistent DEVICE_LOCAL — do not re-dequantize per token.
+
+### Verification
+
+- Build: `cd build && cmake --build . --config Release`
+- Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
+- Runtime: `rdna4_llama.exe` must not crash (VK_ERROR_DEVICE_LOST or 0xC0000005)

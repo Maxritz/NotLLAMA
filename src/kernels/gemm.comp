@@ -11,7 +11,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ARe
     float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer CRef {
     float data[];
@@ -25,6 +25,7 @@ layout(push_constant, scalar) uniform PushConstants {
     uint N;
     uint K;
     float alpha;
+    uint transB;
 } pc;
 
 void main() {
@@ -38,7 +39,12 @@ void main() {
     float acc = 0.0;
     for (uint k = 0; k < pc.K; ++k) {
         float a = A.data[k];
-        float b = float(B.data[k * pc.N + col]);
+        float b;
+        if (pc.transB != 0) {
+            b = B.data[col * pc.K + k];
+        } else {
+            b = B.data[k * pc.N + col];
+        }
         acc += a * b;
     }
 

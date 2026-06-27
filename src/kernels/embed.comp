@@ -14,7 +14,7 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer EmbedTableRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
     float data[];
@@ -38,6 +38,6 @@ void main() {
     HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
 
     for (uint d = tid; d < dim; d += 32) {
-        H.data[hiddenOffset + d] = float(E.data[embedOffset + d]);
+        H.data[hiddenOffset + d] = E.data[embedOffset + d];
     }
 }

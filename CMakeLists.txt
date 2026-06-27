@@ -82,5 +82,35 @@ endforeach()
 add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 add_dependencies(rdna4_llama shaders)
 
+# --- test_inference ---
+set(TEST_INFERENCE_SRC
+    src/host/context.cpp
+    src/host/mailbox.cpp
+    src/host/memory.cpp
+    src/host/scheduler.cpp
+    src/host/weight_uploader.cpp
+    src/host/kv_cache.cpp
+    src/host/pipeline_builder.cpp
+    src/host/tokenizer.cpp
+    src/host/inference_engine.cpp
+    src/host/profiler.cpp
+    src/host/allocator.cpp
+    src/host/vgpr_stub.cpp
+    test_inference.cpp
+    cpu_reference.cpp
+)
+
+add_executable(test_inference ${TEST_INFERENCE_SRC})
+target_include_directories(test_inference PRIVATE include)
+target_link_libraries(test_inference PRIVATE Vulkan::Vulkan nlohmann_json::nlohmann_json)
+add_dependencies(test_inference shaders)
+
+if(MSVC)
+    target_compile_options(test_inference PRIVATE /W3 /EHsc)
+    target_compile_definitions(test_inference PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_inference PRIVATE -Wall -Wextra)
+endif()
+
 install(TARGETS rdna4_llama DESTINATION bin)
 install(FILES ${SPV_FILES} DESTINATION bin/shaders)

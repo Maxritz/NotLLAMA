@@ -20,7 +20,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer InR
     float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer WeightRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
     float data[];
@@ -66,6 +66,6 @@ void main() {
 
     // Normalize and scale by weight
     for (uint i = tid; i < pc.rowSize; i += 32) {
-        Out.data[base + i] = In.data[base + i] * invRms * float(W.data[i]);
+        Out.data[base + i] = In.data[base + i] * invRms * W.data[i];
     }
 }

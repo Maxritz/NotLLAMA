@@ -4,28 +4,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_ballot : require
 
-// =============================================================================
-// FLASH ATTENTION — Memory-efficient causal attention for RDNA4.
-// =============================================================================
-// Algorithm (tiling + online softmax):
-//   For each Q tile (Br rows × headDim cols):
-//     Initialize m = -inf, l = 0, acc = 0
-//     For each K/V tile (Bc rows × headDim cols):
-//       1. Load Q tile (Br × headDim) and K tile (Bc × headDim) into VGPRs
-//       2. Compute S = Q @ K^T  (Br × Bc matrix, kept in registers)
-//       3. Apply causal mask: S[i,j] = -inf if j > current_seq_pos + i
-//       4. Online softmax update:
-//          m_new = max(m, max(S))
-//          P = exp(S - m_new)
-//          l = l * exp(m - m_new) + sum(P)
-//          acc = acc * exp(m - m_new) + P @ V_tile
-//          m = m_new
-//     5. Output = acc / l
-//
-// Tile sizes: Br = Bc = 32 (one wave). Each thread owns one row of Q.
-// headDim is split across threads: each thread handles headDim/32 elements.
-// =============================================================================
+// Flash Attention — tiled, RDNA4-friendly.
+// Each thread handles hd/32 elements of each Q/K/V row.
+// Online softmax over K/V tiles of size Bc=32.
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -43,121 +28,96 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
 };
 
 layout(push_constant, scalar) uniform PushConstants {
-    uint64_t addrQ;        // Q for this head: [seqLen, headDim]
-    uint64_t addrKCache;   // K cache for this head: [maxSeqLen, headDim]
-    uint64_t addrVCache;   // V cache for this head: [maxSeqLen, headDim]
-    uint64_t addrOut;      // Output: [seqLen, headDim]
-    uint seqLen;       // Current sequence length
-    uint headDim;      // Dimension per head
-    uint qRowStart;    // Starting row of Q tile this wave processes
-    uint qRowCount;    // Number of rows in Q tile (Br)
-    uint kvTileSize;   // Block size for K/V (Bc)
+    uint64_t addrQ;
+    uint64_t addrKCache;
+    uint64_t addrVCache;
+    uint64_t addrOut;
+    uint seqLen;
+    uint headDim;
+    uint qRowStart;
+    uint qRowCount;
+    uint kvTileSize;
     float invSqrtHeadDim;
 } pc;
 
-// Each thread handles one row of Q (qRowCount = 32 = one wave).
-// headDim is split: each thread owns headDim/32 elements.
+shared float s_scores[32];
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint hd = pc.headDim;
     uint sl = pc.seqLen;
     uint qStart = pc.qRowStart;
-    uint qCount = pc.qRowCount;
     uint kvTile = pc.kvTileSize;
+    uint hdPerThread = hd / 32;
 
     QRef Q = QRef(pc.addrQ);
     KCacheRef K = KCacheRef(pc.addrKCache);
     VCacheRef V = VCacheRef(pc.addrVCache);
     OutRef Out = OutRef(pc.addrOut);
 
-    // This thread's Q row index
     uint qRow = qStart + tid;
     if (qRow >= sl) return;
 
-    // Load Q row into registers (headDim elements, split across iterations)
-    // For simplicity, load full row (headDim <= 128 fits in VGPRs)
-    float qVec[128];  // Max headDim
+    // Each thread owns hdPerThread elements of the Q row
     uint qBase = qRow * hd;
-    for (uint d = 0; d < hd; ++d) {
-        qVec[d] = float(Q.data[qBase + d]);
+    float myQ[8];
+    for (uint d = 0; d < hdPerThread; ++d) {
+        myQ[d] = float(Q.data[qBase + tid * hdPerThread + d]);
     }
 
-    // Online softmax state
-    float m = -1e30;   // Running max
-    float l = 0.0;     // Running sum
-    float acc[128];    // Accumulated output (headDim)
-    for (uint d = 0; d < hd; ++d) acc[d] = 0.0;
+    // Per-thread accumulator and softmax state
+    float myAcc[8];
+    for (uint d = 0; d < hdPerThread; ++d) myAcc[d] = 0.0;
+    float m = -1e30;
+    float l = 0.0;
 
-    // Iterate over K/V tiles
     uint numKvTiles = (sl + kvTile - 1) / kvTile;
 
-    for (uint kvTileIdx = 0; kvTileIdx < numKvTiles; ++kvTileIdx) {
-        uint kvStart = kvTileIdx * kvTile;
+    for (uint kvIdx = 0; kvIdx < numKvTiles; ++kvIdx) {
+        uint kvStart = kvIdx * kvTile;
         uint kvEnd = min(kvStart + kvTile, sl);
         uint kvCount = kvEnd - kvStart;
-
-        // Compute S = Q_row @ K_tile^T for this thread's Q row
-        // S is a vector of length kvCount (scores for this Q row vs all K rows in tile)
-        float scores[32];  // Max kvTile size
 
         for (uint j = 0; j < kvCount; ++j) {
             uint kRow = kvStart + j;
             uint kBase = kRow * hd;
 
-            float dot = 0.0;
-            for (uint d = 0; d < hd; ++d) {
-                dot += qVec[d] * float(K.data[kBase + d]);
+            // Each thread computes partial dot for its hdPerThread slice
+            float partialDot = 0.0;
+            for (uint d = 0; d < hdPerThread; ++d) {
+                partialDot += myQ[d] * float(K.data[kBase + tid * hdPerThread + d]);
             }
-            dot *= pc.invSqrtHeadDim;
 
-            // Causal mask: if kRow > qRow, set to -inf
-            if (kRow > qRow) {
-                dot = -1e30;
+            // Reduce: thread 0 sums all 32 partials via shared memory
+            s_scores[tid] = partialDot;
+            barrier();
+            float score = 0.0;
+            if (tid == 0) {
+                for (uint t = 0; t < 32; ++t) score += s_scores[t];
             }
-            scores[j] = dot;
-        }
+            barrier();
+            score = subgroupBroadcastFirst(score) * pc.invSqrtHeadDim;
 
-        // Find max in this tile
-        float tileMax = -1e30;
-        for (uint j = 0; j < kvCount; ++j) {
-            tileMax = max(tileMax, scores[j]);
-        }
+            if (kRow > qRow) score = -1e30;
 
-        // Online softmax update
-        float mNew = max(m, tileMax);
-        float expScale = exp(m - mNew);  // Scale old accumulators
+            // Online softmax
+            float mNew = max(m, score);
+            float expScale = exp(m - mNew);
+            float p = exp(score - mNew);
 
-        // Compute exp(scores - mNew) and sum
-        float tileSum = 0.0;
-        for (uint j = 0; j < kvCount; ++j) {
-            scores[j] = exp(scores[j] - mNew);
-            tileSum += scores[j];
-        }
-
-        // Update running sum
-        l = l * expScale + tileSum;
-
-        // Update accumulator: acc = acc * expScale + scores @ V_tile
-        for (uint d = 0; d < hd; ++d) {
-            acc[d] *= expScale;
-        }
-
-        for (uint j = 0; j < kvCount; ++j) {
-            uint vRow = kvStart + j;
-            uint vBase = vRow * hd;
-            float w = scores[j];
-            for (uint d = 0; d < hd; ++d) {
-                acc[d] += w * float(V.data[vBase + d]);
+            // Update accumulator
+            for (uint d = 0; d < hdPerThread; ++d) {
+                myAcc[d] = myAcc[d] * expScale + p * float(V.data[kBase + tid * hdPerThread + d]);
             }
+            l = l * expScale + p;
+            m = mNew;
         }
-
-        m = mNew;
     }
 
-    // Normalize and write output
+    // Write output
     float invL = 1.0 / l;
     uint outBase = qRow * hd;
-    for (uint d = 0; d < hd; ++d) {
-        Out.data[outBase + d] = acc[d] * invL;
+    for (uint d = 0; d < hdPerThread; ++d) {
+        Out.data[outBase + tid * hdPerThread + d] = myAcc[d] * invL;
     }
 }

@@ -47,6 +47,10 @@ public:
 
     void syncAll();
 
+    // Must be called before VkDevice is destroyed. Waits for idle, destroys
+    // command pools, and nulls handles so the destructor is safe to run after.
+    void cleanup();
+
     void speculativeDecode(const std::vector<uint32_t>& draftTokens,
                            VkPipeline verifyPipeline, VkPipelineLayout verifyLayout,
                            const void* verifyPC, size_t verifyPCSize);

@@ -21,13 +21,13 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer UpRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer GateRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer DownRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer InRef {
     float data[];
@@ -81,8 +81,8 @@ void main() {
         float gateAcc = 0.0;
         for (uint d = 0; d < dim; ++d) {
             float x = float(In.data[tokenOffset + d]);
-            upAcc   += x * float(Up.data[d * hidden + hIdx]);
-            gateAcc += x * float(Gate.data[d * hidden + hIdx]);
+            upAcc   += x * Up.data[d * hidden + hIdx];
+            gateAcc += x * Gate.data[d * hidden + hIdx];
         }
 
         // SiLU on gate
@@ -106,7 +106,7 @@ void main() {
             uint hThread = h / hPerThread;
             uint hLocal = h % hPerThread;
             float val = subgroupShuffle(upVal[hLocal], hThread);
-            outAcc += val * float(Down.data[h * dim + dIdx]);
+            outAcc += val * Down.data[h * dim + dIdx];
         }
         Out.data[tokenOffset + dIdx] = outAcc;
     }

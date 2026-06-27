@@ -10,8 +10,8 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
     uint data[];
 };
-layout(buffer_reference, scalar, buffer_reference_align = 8) buffer F16OutRef {
-    float16_t data[];
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer FloatOutRef {
+    float data[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -41,7 +41,7 @@ float readF16(uint addr) {
 }
 
 void main() {
-    F16OutRef Out = F16OutRef(pc.addrOut);
+    FloatOutRef Out = FloatOutRef(pc.addrOut);
 
     uint gid = gl_GlobalInvocationID.x;
     uint stride = pc.totalThreads;
@@ -70,7 +70,7 @@ void main() {
 
         int val = int((q4 | (((qhByte >> qhShift) & 3) << 4))) - 32;
 
-        Out.data[i] = float16_t(d * float(sc) * float(val));
+        Out.data[i] = d * float(sc) * float(val);
     }
     else if (pc.quantFormat == 8) {
         uint blockIdx = i / 32;
@@ -79,7 +79,7 @@ void main() {
         float delta = readF16(bs);
         int q = int(readByte(bs + 2 + eleInBlock));
         if (q > 127) q -= 256;
-        Out.data[i] = float16_t(delta * float(q));
+        Out.data[i] = delta * float(q);
     }
     else if (pc.quantFormat == 2) {
         uint blockIdx = i / 32;
@@ -89,11 +89,11 @@ void main() {
         uint byteIdx = bs + 2 + (eleInBlock / 2);
         uint bval = readByte(byteIdx);
         uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
-        Out.data[i] = float16_t(delta * (float(nibble) - 8.0));
+        Out.data[i] = delta * (float(nibble) - 8.0);
     }
     else if (pc.quantFormat == 1) {
         uint bs = i * 2;
-        Out.data[i] = float16_t(readF16(bs));
+        Out.data[i] = readF16(bs);
     }
     else if (pc.quantFormat == 0) {
         uint bs = i * 4;
@@ -102,7 +102,7 @@ void main() {
         uint w2 = readByte(bs + 2);
         uint w3 = readByte(bs + 3);
         uint raw = w0 | (w1 << 8) | (w2 << 16) | (w3 << 24);
-        Out.data[i] = float16_t(uintBitsToFloat(raw));
+        Out.data[i] = uintBitsToFloat(raw);
     }
 
     } // end for stride loop

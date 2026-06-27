@@ -18,8 +18,16 @@ Scheduler::Scheduler(VkDevice dev, VkQueue q[4], uint32_t qfIndex)
 }
 
 Scheduler::~Scheduler() {
+    cleanup();
+}
+
+void Scheduler::cleanup() {
+    syncAll();
     for (int i = 0; i < 4; ++i) {
-        if (cmdPools[i]) vkDestroyCommandPool(device, cmdPools[i], nullptr);
+        if (cmdPools[i]) {
+            vkDestroyCommandPool(device, cmdPools[i], nullptr);
+            cmdPools[i] = VK_NULL_HANDLE;
+        }
     }
 }
 

@@ -18,7 +18,7 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 8) buffer MailboxRef {
+layout(buffer_reference, scalar, buffer_reference_align = 8) coherent buffer MailboxRef {
     uint tokenReady;
     uint tokenAck;
     uint tokenId;
@@ -28,13 +28,13 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) buffer MailboxRef {
 };
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer TokenEmbedRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer OutputNormRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer LMHeadRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
     float data[];
@@ -91,7 +91,7 @@ void embedToken(uint tokenId, uint seqPos) {
     uint hidOffset = seqPos * dim;
 
     for (uint d = gl_LocalInvocationID.x; d < dim; d += 32) {
-        H.data[hidOffset + d] = float(E.data[embOffset + d]);
+        H.data[hidOffset + d] = E.data[embOffset + d];
     }
 }
 
@@ -99,28 +99,18 @@ void computeLogits(uint seqPos) {
     LMHeadRef W = LMHeadRef(pc.addrLMHead);
     HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
     OutputRef Out = OutputRef(pc.addrOutput);
-
     uint dim = pc.embeddingDim;
     uint vocab = pc.vocabSize;
     uint hidOffset = seqPos * dim;
-
-    // Each thread computes logits for vocab/32 tokens
     uint logitsPerThread = (vocab + 31) / 32;
-
     for (uint i = 0; i < logitsPerThread; ++i) {
         uint tokenIdx = i * 32 + gl_LocalInvocationID.x;
         if (tokenIdx >= vocab) break;
-
         float logit = 0.0;
         for (uint d = 0; d < dim; ++d) {
-            logit += H.data[hidOffset + d] * float(W.data[tokenIdx * dim + d]);
+            logit += H.data[hidOffset + d] * W.data[tokenIdx * dim + d];
         }
-
-        // TODO: argmax / top-k reduction across subgroup
-        // For now, just write the logit
-        if (tokenIdx < 1024) {  // Safety
-            // Out.data[tokenIdx] = floatBitsToUint(logit);  // placeholder
-        }
+        Out.data[tokenIdx] = floatBitsToUint(logit);
     }
 }
 
@@ -129,8 +119,9 @@ void main() {
     MailboxRef M = MailboxRef(pc.addrMailbox);
 
     // Poll for token
-    while (M.tokenReady == 0) {
-        // Spin-wait. On RDNA4, this is cheap with S_SLEEP.
+    while (true) {
+        memoryBarrierBuffer();
+        if (M.tokenReady != 0) break;
     }
 
     uint tokenId = M.tokenId;

@@ -43,24 +43,23 @@ void main() {
     float cosA = cos(angle);
     float sinA = sin(angle);
 
-    // Apply to Q for the current position (last position)
+    // Q rotation — read both paired values into registers, then write
     uint qIdx = (pc.seqLen - 1) * pc.nHeads * pc.headDim + head * pc.headDim + d;
-    uint qPair = qIdx ^ 1;  // Toggle last bit for paired dimension
-    float q1 = Q.data[qIdx & ~1u];
-    float q2 = Q.data[qIdx | 1u];
+    float q0 = Q.data[qIdx & ~1u];
+    float q1 = Q.data[qIdx | 1u];
     if (d % 2 == 0) {
-        Q.data[qIdx] = q1 * cosA - q2 * sinA;
+        Q.data[qIdx] = q0 * cosA - q1 * sinA;
     } else {
-        Q.data[qIdx] = q2 * cosA + q1 * sinA;
+        Q.data[qIdx] = q1 * cosA + q0 * sinA;
     }
 
-    // Apply to K for the current position
+    // K rotation — same two-pass pattern
     uint kIdx = (pc.seqLen - 1) * pc.nKvHeads * pc.headDim + kvHead * pc.headDim + d;
-    float k1 = K.data[kIdx & ~1u];
-    float k2 = K.data[kIdx | 1u];
+    float k0 = K.data[kIdx & ~1u];
+    float k1 = K.data[kIdx | 1u];
     if (d % 2 == 0) {
-        K.data[kIdx] = k1 * cosA - k2 * sinA;
+        K.data[kIdx] = k0 * cosA - k1 * sinA;
     } else {
-        K.data[kIdx] = k2 * cosA + k1 * sinA;
+        K.data[kIdx] = k1 * cosA + k0 * sinA;
     }
 }

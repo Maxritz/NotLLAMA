@@ -1,0 +1,18 @@
+{
+  "id": "fix_001_rope_naming",
+  "type": "fix",
+  "priority": 1,
+  "title": "Rename rope.comp paired variables q/k to q0/k0/q1/k1",
+  "description": "Simplify rope.comp by renaming paired variables for clarity. Currently uses qLo/qHi/kLo/kHi which is confusing.",
+  "files_to_read": ["src/kernels/rope.comp", "include/rdna4_types.hpp"],
+  "files_to_write": ["src/kernels/rope.comp"],
+  "validation": {
+    "build": true,
+    "shader_compile": true,
+    "test_exe": null
+  },
+  "max_retries": 3,
+  "retries": 0,
+  "status": "pending",
+  "created": "2024-01-01T00:00:00Z"
+}

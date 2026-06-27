@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(crashHandler);
 
     FILE* dbg = fopen("debug.log", "w");
+    if (!dbg) dbg = stderr;
     auto log = [&](const char* msg) { fprintf(dbg, "%s\n", msg); fflush(dbg); };
 
     log("start");
@@ -278,6 +279,9 @@ int main(int argc, char** argv) {
         log("dequant buffer init failed");
         std::cerr << "Failed to initialize dequantization buffer\n";
     }
+    if (!engine.initEmbedCache()) {
+        log("embed cache init failed (will dequantize per-token)");
+    }
     std::cout << "\nPrompt: \"" << prompt << "\"\n";
     if (useSpeculative) {
         std::cout << "Mode: Speculative decode (draft=" << nDraft << ")\n\n";
@@ -303,8 +307,10 @@ int main(int argc, char** argv) {
 
     profiler.report();
 
+    scheduler.cleanup();
     pipelines.cleanup();
     kvCache.free();
+    engine.cleanupEmbedCache();
     engine.cleanupDequantBuffer();
     uploader.freeAll(model);
     profiler.cleanup();

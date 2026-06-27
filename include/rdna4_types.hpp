@@ -9,6 +9,7 @@ struct GemmPushConstants {
     uint64_t addrC;
     uint32_t M, N, K;
     float alpha;
+    uint32_t transB;
 };
 
 struct AttentionPushConstants {
@@ -54,10 +55,13 @@ struct RopePushConstants {
 
 struct TopKPushConstants {
     uint64_t addrLogits;
-    uint64_t addrOutput;
+    uint64_t addrOutput;      // {tokenId, tokenProb} — 8 bytes
+    uint64_t addrScratch;     // temp buffer for probabilities (vocabSize floats)
     uint32_t vocabSize;
     float temperature;
     uint32_t topK;
+    float topP;
+    uint32_t seed;
 };
 
 struct AddPushConstants {
