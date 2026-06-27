@@ -5,10 +5,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ARef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BRef {
     float16_t data[];
@@ -28,10 +28,8 @@ layout(push_constant, scalar) uniform PushConstants {
 } pc;
 
 void main() {
-    uint row = gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
-
-    if (row >= pc.M || col >= pc.N) return;
+    if (col >= pc.N) return;
 
     ARef A = ARef(pc.addrA);
     BRef B = BRef(pc.addrB);
@@ -39,10 +37,10 @@ void main() {
 
     float acc = 0.0;
     for (uint k = 0; k < pc.K; ++k) {
-        float a = float(A.data[row * pc.K + k]);
+        float a = A.data[k];
         float b = float(B.data[k * pc.N + col]);
         acc += a * b;
     }
 
-    C.data[row * pc.N + col] = pc.alpha * acc;
+    C.data[col] = pc.alpha * acc;
 }

@@ -12,12 +12,15 @@ KVCacheManager::KVCacheManager(VkDevice dev, VkPhysicalDevice pdev,
 }
 
 bool KVCacheManager::allocate() {
-    // Each layer: K buffer + V buffer, each maxSeqLen * nKvHeads * headDim * sizeof(f16)
-    // Using float16 for KV cache to save bandwidth
     size_t layerBytes = static_cast<size_t>(maxSeqLen) * nKvHeads * headDim * sizeof(uint16_t);
 
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+    VkPhysicalDeviceProperties physProps;
+    vkGetPhysicalDeviceProperties(physicalDevice, &physProps);
+    VkDeviceSize atomSize = physProps.limits.nonCoherentAtomSize;
+    VkDeviceSize atomMask = atomSize - 1;
 
     for (uint32_t i = 0; i < nLayers; ++i) {
         auto& layer = layers[i];
@@ -44,19 +47,17 @@ bool KVCacheManager::allocate() {
             VkMemoryRequirements memReq;
             vkGetBufferMemoryRequirements(device, buf, &memReq);
 
-            uint32_t memTypeIndex = 0;
-            bool found = false;
+            uint32_t memTypeIndex = UINT32_MAX;
             for (uint32_t j = 0; j < memProps.memoryTypeCount; ++j) {
                 if ((memReq.memoryTypeBits & (1 << j)) &&
                     (memProps.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
                     memTypeIndex = j;
-                    found = true;
                     break;
                 }
             }
-            if (!found) {
+            if (memTypeIndex == UINT32_MAX) {
                 for (uint32_t j = 0; j < memProps.memoryTypeCount; ++j) {
-                    if ((memReq.memoryTypeBits & (1 << j))) {
+                    if (memReq.memoryTypeBits & (1 << j)) {
                         memTypeIndex = j;
                         break;
                     }
@@ -90,9 +91,8 @@ bool KVCacheManager::allocate() {
         layer.currentSeqLen = 0;
     }
 
-    std::cout << "KV cache allocated: " << nLayers << " layers, "
-              << maxSeqLen << " max seq, " << nKvHeads << " KV heads, "
-              << headDim << " head dim (f16 buffers)\n";
+    fprintf(stderr, "[kv_cache] allocated: %u layers, %u max seq, %u KV heads, %u head dim\n",
+            nLayers, maxSeqLen, nKvHeads, headDim);
     return true;
 }
 
@@ -113,12 +113,14 @@ void KVCacheManager::append(uint32_t layer, const void* kData, const void* vData
     if (layer >= layers.size()) return;
     auto& l = layers[layer];
 
-    // Each row is nKvHeads * headDim * sizeof(f16) bytes
     size_t rowBytes = static_cast<size_t>(nKvHeads) * headDim * sizeof(uint16_t);
     size_t kOffset = static_cast<size_t>(l.currentSeqLen) * rowBytes;
-    size_t vOffset = kOffset;
 
-    // Map, copy, flush, unmap for K buffer
+    VkPhysicalDeviceProperties physProps;
+    vkGetPhysicalDeviceProperties(physicalDevice, &physProps);
+    VkDeviceSize atomSize = physProps.limits.nonCoherentAtomSize;
+    VkDeviceSize atomMask = atomSize - 1;
+
     {
         void* mapped = nullptr;
         VkResult r = vkMapMemory(device, l.kMemory, kOffset, rowBytes, 0, &mapped);
@@ -127,24 +129,23 @@ void KVCacheManager::append(uint32_t layer, const void* kData, const void* vData
             VkMappedMemoryRange range = {};
             range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
             range.memory = l.kMemory;
-            range.offset = kOffset & ~(VK_WHOLE_SIZE - 1); // align down
-            range.size = rowBytes + (kOffset - range.offset);
+            range.offset = kOffset & ~atomMask;
+            range.size = (rowBytes + (kOffset & atomMask) + atomMask) & ~atomMask;
             vkFlushMappedMemoryRanges(device, 1, &range);
             vkUnmapMemory(device, l.kMemory);
         }
     }
 
-    // Map, copy, flush, unmap for V buffer
     {
         void* mapped = nullptr;
-        VkResult r = vkMapMemory(device, l.vMemory, vOffset, rowBytes, 0, &mapped);
+        VkResult r = vkMapMemory(device, l.vMemory, kOffset, rowBytes, 0, &mapped);
         if (r == VK_SUCCESS && mapped) {
             std::memcpy(mapped, vData, rowBytes);
             VkMappedMemoryRange range = {};
             range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
             range.memory = l.vMemory;
-            range.offset = vOffset & ~(VK_WHOLE_SIZE - 1);
-            range.size = rowBytes + (vOffset - range.offset);
+            range.offset = kOffset & ~atomMask;
+            range.size = (rowBytes + (kOffset & atomMask) + atomMask) & ~atomMask;
             vkFlushMappedMemoryRanges(device, 1, &range);
             vkUnmapMemory(device, l.vMemory);
         }

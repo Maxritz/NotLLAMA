@@ -59,7 +59,6 @@ void Scheduler::dispatch(VkPipeline pipeline, VkPipelineLayout layout,
     submitInfo.pCommandBuffers = &cmd;
 
     vkQueueSubmit(queues[aceIndex], 1, &submitInfo, fence);
-    vkFreeCommandBuffers(device, cmdPools[aceIndex], 1, &cmd);
 }
 
 void Scheduler::dispatchTimed(const std::string& name, Profiler* profiler,
@@ -121,6 +120,10 @@ void Scheduler::dispatchMulti(const std::vector<std::tuple<VkPipeline, VkPipelin
 void Scheduler::syncAll() {
     for (int i = 0; i < 4; ++i) {
         vkQueueWaitIdle(queues[i]);
+    }
+    // Reset pools to free all command buffers allocated since last reset
+    for (int i = 0; i < 4; ++i) {
+        vkResetCommandPool(device, cmdPools[i], 0);
     }
 }
 

@@ -11,10 +11,10 @@ public:
     VkDevice device;
     VkPhysicalDevice physicalDevice;
 
-    VkBuffer buffer;
-    VkDeviceMemory memory;  // Exposed for invalidate/flush
-    VkDeviceAddress baseAddress;
-    uint8_t* mappedPtr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress baseAddress = 0;
+    uint8_t* mappedPtr = nullptr;
 
     size_t capacity;
     size_t offset;

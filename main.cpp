@@ -12,10 +12,29 @@
 #include <iostream>
 #include <fstream>
 #include <cstdio>
+#include <Windows.h>
 
 using namespace rdna4;
 
+static LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
+    fprintf(stderr, "\n=== CRASH: 0x%08X at addr %p ===\n",
+            ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    fprintf(stderr, "RAX=%p RBX=%p RCX=%p RDX=%p\n",
+            (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+            (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx);
+    fprintf(stderr, "RSI=%p RDI=%p RBP=%p RSP=%p\n",
+            (void*)ep->ContextRecord->Rsi, (void*)ep->ContextRecord->Rdi,
+            (void*)ep->ContextRecord->Rbp, (void*)ep->ContextRecord->Rsp);
+    fprintf(stderr, "R8=%p R9=%p R10=%p R11=%p\n",
+            (void*)ep->ContextRecord->R8, (void*)ep->ContextRecord->R9,
+            (void*)ep->ContextRecord->R10, (void*)ep->ContextRecord->R11);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char** argv) {
+    SetUnhandledExceptionFilter(crashHandler);
+
     FILE* dbg = fopen("debug.log", "w");
     auto log = [&](const char* msg) { fprintf(dbg, "%s\n", msg); fflush(dbg); };
 
@@ -90,7 +109,7 @@ int main(int argc, char** argv) {
               << " | Embed: " << model.embeddingLength
               << " | Heads: " << model.headCount << "/" << model.headCountKv
               << " | Vocab: " << model.vocabSize
-              << " | Tensors: " << model.tensors.size() << "\n";
+              << " | Tensors: " << model.tensors.size() << "\n" << std::flush;
 
     log("loading tokenizer");
     Tokenizer tokenizer;
@@ -101,14 +120,20 @@ int main(int argc, char** argv) {
 
     log("kv cache alloc");
     uint32_t headDim = model.embeddingLength / model.headCount;
+    // Cap context to what fits in VRAM (131072 would need 4.5GB for KV alone)
+    uint32_t maxContext = std::min(model.contextLength, 2048u);
+    fprintf(stderr, "[kv_cache] context capped: %u -> %u (was %.1f GB for KV)\n",
+            model.contextLength, maxContext,
+            (double)model.contextLength * model.blockCount * model.headCountKv * headDim * 2 * 2 / (1024.0*1024*1024));
+    fflush(stderr);
     KVCacheManager kvCache(ctx.device, ctx.physicalDevice,
-                           model.contextLength, model.blockCount,
+                           maxContext, model.blockCount,
                            model.headCountKv, headDim);
     if (!kvCache.allocate()) { log("kv cache OOM"); std::cerr << "KV cache OOM\n"; fclose(dbg); return 1; }
     log("kv cache OK");
 
     log("ring alloc");
-    size_t ringSize = 512 * 1024 * 1024;
+    size_t ringSize = 64 * 1024 * 1024;  // 64 MB for activations (enough for single token forward)
     RingAllocator allocator(ctx.device, ctx.physicalDevice, ringSize);
     log("ring OK");
 
@@ -133,6 +158,7 @@ int main(int argc, char** argv) {
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
+    loadPipe("dequantize", sizeof(DequantizePushConstants));
 
     log("all pipelines OK");
     std::cout << "Pipelines loaded (including Flash Attention)\n";
@@ -142,6 +168,10 @@ int main(int argc, char** argv) {
 
     log("creating engine");
     InferenceEngine engine(&ctx, &model, &kvCache, &pipelines, &tokenizer, &scheduler, &allocator);
+    if (!engine.initDequantBuffer()) {
+        log("dequant buffer init failed");
+        std::cerr << "Failed to initialize dequantization buffer\n";
+    }
     std::cout << "\nPrompt: \"" << prompt << "\"\n";
     if (useSpeculative) {
         std::cout << "Mode: Speculative decode (draft=" << nDraft << ")\n\n";
@@ -150,6 +180,7 @@ int main(int argc, char** argv) {
     }
 
     log("starting generate");
+    std::cout << std::flush;
     std::vector<uint32_t> tokens;
     if (useSpeculative) {
         tokens = engine.generateSpeculative(prompt, 32, nDraft);
@@ -162,12 +193,14 @@ int main(int argc, char** argv) {
     for (auto t : tokens) std::cout << t << " ";
     std::cout << "\n";
 
-    std::cout << "\nDecoded: \"" << tokenizer.decode(tokens) << "\"\n";
+    std::cout << "\nDecoded: \"" << tokenizer.decode(tokens) << "\"\n" << std::flush;
 
     profiler.report();
 
     pipelines.cleanup();
     kvCache.free();
+    engine.cleanupDequantBuffer();
+    uploader.freeAll(model);
     profiler.cleanup();
     ctx.cleanup();
     log("all cleaned up");

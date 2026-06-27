@@ -5,14 +5,6 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
-// =============================================================================
-// DEQUANTIZE — VBUFFER "mailroom" format conversion for RDNA4.
-// =============================================================================
-// Converts quantized weights (Q4_0, Q8_0) to float16 on-the-fly.
-// Each block: 2 bytes delta (f16) + N bytes quantized weights.
-// Output is a contiguous f16 array ready for GEMM consumption.
-// =============================================================================
-
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
@@ -20,6 +12,9 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Byt
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer F16OutRef {
     float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer UIntOutRef {
+    uint data[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -31,7 +26,6 @@ layout(push_constant, scalar) uniform PushConstants {
     uint blockElements;
 } pc;
 
-// Helper: read a byte from a byte-addressed buffer
 int readByte(uint addr) {
     uint wordIdx = addr / 4;
     uint byteInWord = addr % 4;
@@ -39,14 +33,8 @@ int readByte(uint addr) {
     return (word >> (int(byteInWord) * 8)) & 0xFF;
 }
 
-// Helper: read a little-endian uint16 from byte-addressed buffer
 uint readU16(uint addr) {
     return uint(readByte(addr)) | (uint(readByte(addr + 1)) << 8);
-}
-
-// Helper: read a little-endian int16 from byte-addressed buffer
-int readI16(uint addr) {
-    return int(readU16(addr));
 }
 
 void main() {
@@ -55,6 +43,13 @@ void main() {
 
     F16OutRef Out = F16OutRef(pc.addrOut);
 
+    // DEBUG: every thread writes its global ID to the start of the output buffer
+    {
+        uint globalId = wg * 32 + tid;
+        UIntOutRef UOut = UIntOutRef(pc.addrOut);
+        UOut.data[globalId] = globalId + 0x10000u;
+    }
+
     uint totalBlocks = (pc.nElements + pc.blockElements - 1) / pc.blockElements;
     uint blocksPerThread = (totalBlocks + 31) / 32;
 
@@ -62,30 +57,74 @@ void main() {
         uint blockIdx = wg * 32 * blocksPerThread + tid * blocksPerThread + b;
         if (blockIdx >= totalBlocks) break;
 
-        uint blockOffset = blockIdx * pc.blockSize;
-        uint elemOffset = blockIdx * pc.blockElements;
+        uint bs = blockIdx * pc.blockSize;
+        uint eo = blockIdx * pc.blockElements;
 
-        // Read delta (f16) at start of block — 2 bytes little-endian
-        uint deltaRaw = readU16(blockOffset);
-        float delta = unpackFloat2x16(deltaRaw).x;
+        if (pc.quantFormat == 14) {
+            // Q6_K block_q6_K layout (210 bytes, 256 elements):
+            //   ql[128]   at offset 0    (lower 4-bit quants)
+            //   qh[64]    at offset 128  (upper 2-bit quants)
+            //   scales[16] at offset 192 (per-sub-block int8 scales)
+            //   d(2)      at offset 208 (super-block f16 scale)
 
-        if (pc.quantFormat == 2) {  // Q4_0
-            // 16 bytes of nibbles (32 elements) follow the 2-byte delta
-            for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
-                uint byteIdx = blockOffset + 2 + (i / 2);
-                int bval = readByte(byteIdx);
-                uint nibble = (i % 2 == 0) ? uint(bval & 0x0F) : uint((bval >> 4) & 0x0F);
-                float val = delta * (float(nibble) - 8.0);
-                Out.data[elemOffset + i] = float16_t(val);
+            float d = unpackFloat2x16(readU16(bs + 208)).x;
+
+            for (uint idx = 0; idx < 256 && (eo + idx) < pc.nElements; ++idx) {
+                // 2 passes of 128 elements each
+                uint pass = idx / 128;
+                uint posInPass = idx % 128;
+                uint subBlock = posInPass / 16;  // 0..7
+                uint posInSub = posInPass % 16;  // 0..15
+
+                // Read scale for this sub-block (16 sub-blocks total, 8 per pass)
+                int sc = readByte(bs + 192 + pass * 8 + subBlock);
+
+                // Read low 4-bit quants from ql
+                uint qlIdx = pass * 64 + subBlock * 8 + posInSub;
+                uint q4 = uint(readByte(bs + qlIdx));
+
+                // Read high 2-bit quants from qh
+                uint qhIdx = pass * 32 + subBlock * 4 + (posInSub / 4);
+                uint qhByte = uint(readByte(bs + 128 + qhIdx));
+                uint qhShift = (posInSub % 4) * 2;
+
+                // Combine: low nibble + 2 high bits - 32
+                int val = int(((q4 & 0xF) | (((qhByte >> qhShift) & 3) << 4))) - 32;
+
+                Out.data[eo + idx] = float16_t(d * float(sc) * float(val));
             }
         }
-        else if (pc.quantFormat == 8) {  // Q8_0
-            // 32 bytes of int8 weights follow the 2-byte delta
-            for (uint i = 0; i < pc.blockElements && (elemOffset + i) < pc.nElements; ++i) {
-                int q = readByte(blockOffset + 2 + i);
-                if (q > 127) q -= 256;  // sign extend
-                float val = delta * float(q);
-                Out.data[elemOffset + i] = float16_t(val);
+        else if (pc.quantFormat == 8) {
+            // Q8_0: d(2) + qs(32) = 34 bytes, 32 elements
+            float delta = unpackFloat2x16(readU16(bs)).x;
+            for (uint i = 0; i < pc.blockElements && (eo + i) < pc.nElements; ++i) {
+                int q = readByte(bs + 2 + i);
+                if (q > 127) q -= 256;
+                Out.data[eo + i] = float16_t(delta * float(q));
+            }
+        }
+        else if (pc.quantFormat == 2) {
+            // Q4_0: d(2) + qs(16) = 18 bytes, 32 elements
+            float delta = unpackFloat2x16(readU16(bs)).x;
+            for (uint i = 0; i < pc.blockElements && (eo + i) < pc.nElements; ++i) {
+                uint byteIdx = bs + 2 + (i / 2);
+                int bval = readByte(byteIdx);
+                uint nibble = (i % 2 == 0) ? uint(bval & 0x0F) : uint((bval >> 4) & 0x0F);
+                Out.data[eo + i] = float16_t(delta * (float(nibble) - 8.0));
+            }
+        }
+        else if (pc.quantFormat == 1) {
+            for (uint i = 0; i < pc.blockElements && (eo + i) < pc.nElements; ++i) {
+                Out.data[eo + i] = float16_t(unpackFloat2x16(readU16(bs + i * 2)).x);
+            }
+        }
+        else if (pc.quantFormat == 0) {
+            for (uint i = 0; i < pc.blockElements && (eo + i) < pc.nElements; ++i) {
+                uint w0 = uint(readByte(bs + i * 4));
+                uint w1 = uint(readByte(bs + i * 4 + 1));
+                uint w2 = uint(readByte(bs + i * 4 + 2));
+                uint w3 = uint(readByte(bs + i * 4 + 3));
+                Out.data[eo + i] = float16_t(uintBitsToFloat(w0 | (w1 << 8) | (w2 << 16) | (w3 << 24)));
             }
         }
     }

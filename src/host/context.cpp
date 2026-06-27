@@ -86,14 +86,20 @@ bool VulkanContext::init() {
     qInfo.queueCount = queueCount;
     qInfo.pQueuePriorities = priorities;
 
-    // Enable buffer device address (core in Vulkan 1.2+)
+    // Enable required device features
+    VkPhysicalDeviceVulkan11Features vulkan11Features = {};
+    vulkan11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    vulkan11Features.storageBuffer16BitAccess = VK_TRUE;
+
     VkPhysicalDeviceVulkan12Features vulkan12Features = {};
     vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     vulkan12Features.bufferDeviceAddress = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &vulkan12Features;
+    features2.features.shaderInt64 = VK_TRUE;
+    features2.pNext = &vulkan11Features;
+    vulkan11Features.pNext = &vulkan12Features;
 
     VkDeviceCreateInfo devInfo = {};
     devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

@@ -43,9 +43,9 @@ class GGUFLoader:
         GGMLType.Q4_0: 18, GGMLType.Q4_1: 20,
         GGMLType.Q5_0: 22, GGMLType.Q5_1: 24,
         GGMLType.Q8_0: 34, GGMLType.Q8_1: 36,
-        GGMLType.Q2_K: 256, GGMLType.Q3_K: 256,
-        GGMLType.Q4_K: 256, GGMLType.Q5_K: 256,
-        GGMLType.Q6_K: 256, GGMLType.Q8_K: 256,
+        GGMLType.Q2_K: 84, GGMLType.Q3_K: 110,
+        GGMLType.Q4_K: 144, GGMLType.Q5_K: 176,
+        GGMLType.Q6_K: 210, GGMLType.Q8_K: 292,
         GGMLType.IQ2_XXS: 256, GGMLType.IQ2_XS: 256,
         GGMLType.IQ3_XXS: 256, GGMLType.IQ1_S: 256,
         GGMLType.IQ4_NL: 256, GGMLType.IQ3_S: 256,
@@ -196,12 +196,47 @@ class GGUFLoader:
         floats = [struct.unpack("<e", raw[i*2:(i+1)*2])[0] for i in range(num_elements)]
         return floats, shape
 
+    def dequantize_q6_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        QK_K = 256
+        for _ in range((num_elements + QK_K - 1) // QK_K):
+            d = struct.unpack("<e", raw[pos:pos+2])[0]
+            pos += 2
+            scales = list(raw[pos:pos+16])
+            pos += 16
+            ql = raw[pos:pos+128]
+            pos += 128
+            qh = raw[pos:pos+64]
+            pos += 64
+
+            for j in range(16):
+                sc = scales[j]
+                for l in range(16):
+                    idx = j * 16 + l
+                    if idx >= QK_K:
+                        break
+                    q4_low = ql[j * 8 + l]
+                    qh_byte = qh[j * 4 + l // 4]
+                    shift = (l % 4) * 2
+                    val = ((q4_low & 0xF) | (((qh_byte >> shift) & 3) << 4)) - 32
+                    result.append(d * sc * val)
+        return result[:num_elements], shape
+
     def dequantize(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
         dtype = self.tensors[name].dtype
         if dtype == GGMLType.Q4_0:
             return self.dequantize_q4_0(name)
         elif dtype == GGMLType.Q8_0:
             return self.dequantize_q8_0(name)
+        elif dtype == GGMLType.Q6_K:
+            return self.dequantize_q6_k(name)
         elif dtype == GGMLType.F16:
             return self.dequantize_f16(name)
         elif dtype == GGMLType.F32:

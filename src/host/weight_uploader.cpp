@@ -39,14 +39,17 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     model.vocabSize = m.value("vocab_size", 0);
     model.contextLength = m.value("context_length", 0);
 
-    std::cerr << "  [uploader] JSON parsed: " << model.architecture << "\n";
+    fprintf(stderr, "[uploader] JSON parsed: %s | blocks=%u dim=%u heads=%u\n",
+            model.architecture.c_str(), model.blockCount, model.embeddingLength, model.headCount);
+    fflush(stderr);
 
     std::ifstream binFile(binPath, std::ios::binary | std::ios::ate);
     size_t binSize = binFile.tellg();
     binFile.seekg(0, std::ios::beg);
     std::vector<uint8_t> binData(binSize);
     binFile.read(reinterpret_cast<char*>(binData.data()), binSize);
-    std::cerr << "  [uploader] Binary loaded: " << (binSize / 1024 / 1024) << " MB\n";
+    fprintf(stderr, "[uploader] Binary loaded: %zu MB\n", binSize / 1024 / 1024);
+    fflush(stderr);
 
     // Create staging buffer — one buffer, reused for all tensors
     VkDeviceSize maxTensorSize = 0;
@@ -54,7 +57,8 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         VkDeviceSize s = t.value("bin_size", 0);
         if (s > maxTensorSize) maxTensorSize = s;
     }
-    std::cerr << "  [uploader] Max tensor: " << (maxTensorSize / 1024 / 1024) << " MB\n";
+    fprintf(stderr, "[uploader] Max tensor: %zu MB\n", (size_t)(maxTensorSize / 1024 / 1024));
+    fflush(stderr);
 
     VkBufferCreateInfo stagingInfo = {};
     stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -64,11 +68,10 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
 
     VkBuffer staging;
     VkResult sr = vkCreateBuffer(device, &stagingInfo, nullptr, &staging);
-    fprintf(stderr, "  [uploader] staging buffer create: %d\n", sr); fflush(stderr);
+    fprintf(stderr, "[uploader] staging create: %d\n", sr); fflush(stderr);
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device, staging, &memReq);
-    fprintf(stderr, "  [uploader] staging mem req: %zu bytes\n", (size_t)memReq.size); fflush(stderr);
 
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
@@ -83,7 +86,7 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         }
     }
     if (memTypeIndex == UINT32_MAX) {
-        fprintf(stderr, "  [uploader] No HOST_VISIBLE|HOST_COHERENT memory for staging\n"); fflush(stderr);
+        fprintf(stderr, "[uploader] No HOST_VISIBLE|HOST_COHERENT memory\n"); fflush(stderr);
         return model;
     }
 
@@ -94,15 +97,15 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
 
     VkDeviceMemory stagingMem;
     VkResult sr2 = vkAllocateMemory(device, &stagingAlloc, nullptr, &stagingMem);
-    fprintf(stderr, "  [uploader] staging alloc: %d (%zu bytes)\n", sr2, (size_t)memReq.size); fflush(stderr);
+    fprintf(stderr, "[uploader] staging alloc: %d (%zu bytes)\n", sr2, (size_t)memReq.size); fflush(stderr);
     if (sr2 != VK_SUCCESS) return model;
 
     VkResult sr3 = vkBindBufferMemory(device, staging, stagingMem, 0);
-    fprintf(stderr, "  [uploader] staging bind: %d\n", sr3); fflush(stderr);
+    fprintf(stderr, "[uploader] staging bind: %d\n", sr3); fflush(stderr);
 
     void* mapped = nullptr;
     VkResult sr4 = vkMapMemory(device, stagingMem, 0, maxTensorSize, 0, &mapped);
-    fprintf(stderr, "  [uploader] staging map: %d, ptr=%p\n", sr4, mapped); fflush(stderr);
+    fprintf(stderr, "[uploader] staging map: %d ptr=%p\n", sr4, mapped); fflush(stderr);
     if (sr4 != VK_SUCCESS || !mapped) return model;
 
     // Command buffer for all copies
@@ -126,28 +129,45 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(uploadCmd, &beginInfo);
 
+    size_t tensorIdx = 0;
+    size_t totalTensors = j["tensors"].size();
     for (auto& t : j["tensors"]) {
         TensorDesc desc;
         desc.name = t.value("name", "");
         desc.format = ggmlToQuantFormat(t.value("dtype_id", 0));
         desc.shape = t.value("shape", std::vector<uint32_t>{});
         desc.nDims = t.value("n_dims", 0);
-        desc.sizeBytes = t.value("size_bytes", 0);
-        desc.binOffset = t.value("bin_offset", 0);
-        desc.binSize = t.value("bin_size", 0);
+        desc.sizeBytes = t.value<size_t>("size_bytes", 0);
+        desc.binOffset = t.value<size_t>("bin_offset", 0);
+        desc.binSize = t.value<size_t>("bin_size", 0);
         desc.blockSize = t.value("quant_block_size", 1);
         desc.blockElements = t.value("quant_block_elements", 1);
 
+        fprintf(stderr, "\n[tensor %zu/%zu] %s binOffset=%zu binSize=%zu sizeBytes=%zu\n",
+                tensorIdx + 1, totalTensors, desc.name.c_str(),
+                desc.binOffset, desc.binSize, desc.sizeBytes);
+        fflush(stderr);
+
+        // Bounds check
+        if (desc.binOffset + desc.binSize > binSize) {
+            fprintf(stderr, "  [!] OUT OF BOUNDS: offset %zu + size %zu = %zu > binSize %zu\n",
+                    desc.binOffset, desc.binSize, desc.binOffset + desc.binSize, binSize);
+            fflush(stderr);
+            tensorIdx++;
+            continue;
+        }
+
+        fprintf(stderr, "  [1] createGpuBuffer...\n"); fflush(stderr);
         VkDeviceAddress addr = 0;
         VkDeviceMemory bufMem = VK_NULL_HANDLE;
-        std::cerr << "  [uploader] Allocating GPU buffer for " << desc.name 
-                  << " (" << (desc.binSize / 1024) << " KB)\n";
         desc.buffer = createGpuBuffer(desc.binSize, &addr, &bufMem);
         desc.gpuAddress = addr;
         desc.memory = bufMem;
 
-        // Copy data into persistent staging buffer, record copy
+        fprintf(stderr, "  [2] memcpy to staging...\n"); fflush(stderr);
         std::memcpy(mapped, binData.data() + desc.binOffset, desc.binSize);
+
+        fprintf(stderr, "  [3] flush...\n"); fflush(stderr);
         VkMappedMemoryRange flushRange = {};
         flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         flushRange.memory = stagingMem;
@@ -155,17 +175,25 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         flushRange.size = VK_WHOLE_SIZE;
         vkFlushMappedMemoryRanges(device, 1, &flushRange);
 
+        fprintf(stderr, "  [4] vkCmdCopyBuffer...\n"); fflush(stderr);
         VkBufferCopy copyRegion = {};
         copyRegion.srcOffset = 0;
         copyRegion.dstOffset = 0;
         copyRegion.size = desc.binSize;
         vkCmdCopyBuffer(uploadCmd, staging, desc.buffer, 1, &copyRegion);
 
+        fprintf(stderr, "  [5] push_back...\n"); fflush(stderr);
         model.tensors.push_back(desc);
+
+        fprintf(stderr, "  [6] cout...\n"); fflush(stderr);
         std::cout << "Queued: " << desc.name << " @ 0x" << std::hex << addr
                   << " (" << std::dec << (desc.sizeBytes / 1024 / 1024) << " MB)\n";
+
+        tensorIdx++;
+        fprintf(stderr, "  [done]\n"); fflush(stderr);
     }
 
+    fprintf(stderr, "\n[uploader] All %zu tensors queued. Submitting...\n", model.tensors.size()); fflush(stderr);
     vkEndCommandBuffer(uploadCmd);
 
     VkSubmitInfo submitInfo = {};
@@ -176,7 +204,9 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     VkQueue uploadQueue;
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &uploadQueue);
     vkQueueSubmit(uploadQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    fprintf(stderr, "[uploader] vkQueueSubmit done, waiting...\n"); fflush(stderr);
     vkQueueWaitIdle(uploadQueue);
+    fprintf(stderr, "[uploader] Upload complete!\n"); fflush(stderr);
 
     vkUnmapMemory(device, stagingMem);
     vkDestroyBuffer(device, staging, nullptr);
@@ -185,7 +215,7 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     vkFreeCommandBuffers(device, uploadPool, 1, &uploadCmd);
     vkDestroyCommandPool(device, uploadPool, nullptr);
 
-    std::cout << "All " << model.tensors.size() << " tensors uploaded.\n";
+    fprintf(stderr, "[uploader] Model ready: %zu tensors\n", model.tensors.size()); fflush(stderr);
     return model;
 }
 
@@ -200,7 +230,7 @@ void WeightUploader::loadTokenizer(Tokenizer& tokenizer, const nlohmann::json& t
     uint32_t unk = special.value("unk", 3);
 
     tokenizer.loadFromGGUF(vocab, merges, bos, eos, pad, unk);
-    std::cout << "Tokenizer loaded: " << vocab.size() << " tokens, " << merges.size() << " merges\n";
+    fprintf(stderr, "[tokenizer] %zu tokens, %zu merges\n", vocab.size(), merges.size());
 }
 
 VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem) {
@@ -221,7 +251,6 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
         fprintf(stderr, "  [gpu] vkCreateBuffer failed: %d\n", r); fflush(stderr);
         return VK_NULL_HANDLE;
     }
-    fprintf(stderr, "  [gpu] vkCreateBuffer OK\n"); fflush(stderr);
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device, buffer, &memReq);
@@ -238,7 +267,7 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
         }
     }
     if (memTypeIndex == UINT32_MAX) {
-        fprintf(stderr, "  [gpu] No DEVICE_LOCAL memory type\n"); fflush(stderr);
+        fprintf(stderr, "  [gpu] No DEVICE_LOCAL memory\n"); fflush(stderr);
         vkDestroyBuffer(device, buffer, nullptr);
         return VK_NULL_HANDLE;
     }
@@ -260,7 +289,6 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
         vkDestroyBuffer(device, buffer, nullptr);
         return VK_NULL_HANDLE;
     }
-    fprintf(stderr, "  [gpu] vkAllocateMemory OK (%zu bytes)\n", (size_t)memReq.size); fflush(stderr);
 
     r = vkBindBufferMemory(device, buffer, memory, 0);
     if (r != VK_SUCCESS) {
@@ -269,14 +297,14 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
         vkDestroyBuffer(device, buffer, nullptr);
         return VK_NULL_HANDLE;
     }
-    fprintf(stderr, "  [gpu] vkBindBufferMemory OK\n"); fflush(stderr);
 
     VkBufferDeviceAddressInfo addrInfo = {};
     addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     addrInfo.buffer = buffer;
-    fprintf(stderr, "  [gpu] calling vkGetBufferDeviceAddress\n"); fflush(stderr);
     *outAddr = vkGetBufferDeviceAddress(device, &addrInfo);
-    fprintf(stderr, "  [gpu] vkGetBufferDeviceAddress returned: 0x%llx\n", (unsigned long long)*outAddr); fflush(stderr);
+    fprintf(stderr, "  [gpu] buf=%p mem=%p addr=0x%llx reqSize=%zu\n",
+            (void*)buffer, (void*)memory, (unsigned long long)*outAddr, (size_t)memReq.size);
+    fflush(stderr);
     *outMem = memory;
 
     return buffer;
@@ -285,6 +313,11 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
 void WeightUploader::freeTensor(const TensorDesc& desc) {
     if (desc.buffer) vkDestroyBuffer(device, desc.buffer, nullptr);
     if (desc.memory) vkFreeMemory(device, desc.memory, nullptr);
+}
+
+void WeightUploader::freeAll(ModelDesc& model) {
+    for (auto& t : model.tensors) freeTensor(t);
+    model.tensors.clear();
 }
 
 } // namespace rdna4

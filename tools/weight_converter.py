@@ -19,16 +19,19 @@ class WeightConverter:
         bin_path = f"{out_prefix}.weights.bin"
         json_path = f"{out_prefix}.weights.json"
 
+        arch = self.loader.metadata.get("general.architecture", "llama")
+        prefix = arch
+
         metadata = {
             "model": {
-                "architecture": self.loader.metadata.get("general.architecture", "unknown"),
-                "block_count": self.loader.metadata.get("llama.block_count", 0),
-                "embedding_length": self.loader.metadata.get("llama.embedding_length", 0),
-                "feed_forward_length": self.loader.metadata.get("llama.feed_forward_length", 0),
-                "attention.head_count": self.loader.metadata.get("llama.attention.head_count", 0),
-                "attention.head_count_kv": self.loader.metadata.get("llama.attention.head_count_kv", 0),
-                "vocab_size": self.loader.metadata.get("llama.vocab_size", 0),
-                "context_length": self.loader.metadata.get("llama.context_length", 0),
+                "architecture": arch,
+                "block_count": self.loader.metadata.get(f"{prefix}.block_count", 0),
+                "embedding_length": self.loader.metadata.get(f"{prefix}.embedding_length", 0),
+                "feed_forward_length": self.loader.metadata.get(f"{prefix}.feed_forward_length", 0),
+                "attention.head_count": self.loader.metadata.get(f"{prefix}.attention.head_count", 0),
+                "attention.head_count_kv": self.loader.metadata.get(f"{prefix}.attention.head_count_kv", 0),
+                "vocab_size": self.loader.metadata.get(f"{prefix}.vocab_size", len(self.loader.get_vocab())),
+                "context_length": self.loader.metadata.get(f"{prefix}.context_length", 0),
             },
             "tokenizer": {
                 "vocab": self.loader.get_vocab(),

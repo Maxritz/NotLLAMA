@@ -47,6 +47,7 @@ public:
     ModelDesc load(const std::string& jsonPath, const std::string& binPath);
     void loadTokenizer(Tokenizer& tokenizer, const nlohmann::json& tokenizerJson);
     void freeTensor(const TensorDesc& desc);
+    void freeAll(ModelDesc& model);
 
 private:
     VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem);

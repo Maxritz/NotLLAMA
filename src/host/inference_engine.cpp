@@ -16,9 +16,152 @@ static uint64_t findTensorAddr(const ModelDesc& model, const std::string& name) 
     return 0;
 }
 
+static const TensorDesc* findTensor(const ModelDesc& model, const std::string& name) {
+    for (const auto& t : model.tensors) {
+        if (t.name == name) return &t;
+    }
+    return nullptr;
+}
+
+// Dequantize a weight tensor to float16 using the dedicated staging buffer
+static uint64_t dequantWeight(Scheduler* sched, PipelineBuilder* pipes,
+                               uint64_t dequantBufAddr, size_t dequantBufSize,
+                               const ModelDesc& model, const std::string& name) {
+    const TensorDesc* t = findTensor(model, name);
+    if (!t) return 0;
+    // F16/F32 weights don't need dequantization
+    if (t->format == QuantFormat::F16 || t->format == QuantFormat::F32) return t->gpuAddress;
+
+    uint32_t nElements = 1;
+    for (auto d : t->shape) nElements *= d;
+
+    size_t outBytes = nElements * sizeof(uint16_t);
+    if (outBytes > dequantBufSize) return 0;  // Too large
+
+    DequantizePushConstants pc = {};
+    pc.addrQuant = t->gpuAddress;
+    pc.addrOut = dequantBufAddr;
+    pc.nElements = nElements;
+    pc.quantFormat = static_cast<uint32_t>(t->format);
+    pc.blockSize = t->blockSize;
+    pc.blockElements = t->blockElements;
+
+    uint32_t nBlocks = (nElements + t->blockElements - 1) / t->blockElements;
+    uint32_t nWorkgroups = (nBlocks + 31) / 32;
+    if (nWorkgroups == 0) nWorkgroups = 1;
+
+    fprintf(stderr, "[dequant] dispatching: quant=0x%llx out=0x%llx nElem=%u fmt=%u bs=%u be=%u wg=%u\n",
+            (unsigned long long)pc.addrQuant, (unsigned long long)pc.addrOut,
+            pc.nElements, pc.quantFormat, pc.blockSize, pc.blockElements, nWorkgroups);
+    fflush(stderr);
+
+    sched->dispatch(pipes->getPipeline("dequantize"), pipes->getLayout("dequantize"),
+                    &pc, sizeof(pc), nWorkgroups, 1, 1);
+    sched->syncAll();
+
+    return dequantBufAddr;
+}
+
 InferenceEngine::InferenceEngine(VulkanContext* c, ModelDesc* m, KVCacheManager* k,
                                    PipelineBuilder* p, Tokenizer* t, Scheduler* s, RingAllocator* a)
     : ctx(c), model(m), kvCache(k), pipelines(p), tokenizer(t), scheduler(s), allocator(a) {}
+
+bool InferenceEngine::initDequantBuffer() {
+    // Find the largest weight tensor to determine buffer size
+    // Cap at 128 MB — anything larger (like token_embd) will use ring allocator
+    size_t maxSize = 0;
+    for (const auto& t : model->tensors) {
+        if (t.format == QuantFormat::F16 || t.format == QuantFormat::F32) continue;
+        uint32_t nElements = 1;
+        for (auto d : t.shape) nElements *= d;
+        size_t f16Bytes = nElements * sizeof(uint16_t);
+        if (f16Bytes > maxSize && f16Bytes <= 128 * 1024 * 1024) maxSize = f16Bytes;
+    }
+    if (maxSize == 0) maxSize = 16 * 1024 * 1024;  // Minimum 16 MB
+
+    dequantCapacity = maxSize;
+
+    VkBufferCreateInfo bufInfo = {};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = maxSize;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult r = vkCreateBuffer(ctx->device, &bufInfo, nullptr, &dequantBuffer);
+    if (r != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReq;
+    vkGetBufferMemoryRequirements(ctx->device, dequantBuffer, &memReq);
+
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(ctx->physicalDevice, &memProps);
+
+    uint32_t memTypeIndex = UINT32_MAX;
+    // Prefer HOST_VISIBLE + DEVICE_LOCAL (resizable BAR) for debug readback
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1 << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            memTypeIndex = i;
+            break;
+        }
+    }
+    if (memTypeIndex == UINT32_MAX) {
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1 << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                memTypeIndex = i;
+                break;
+            }
+        }
+    }
+
+    VkMemoryAllocateFlagsInfo flagsInfo = {};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memTypeIndex;
+    allocInfo.pNext = &flagsInfo;
+
+    r = vkAllocateMemory(ctx->device, &allocInfo, nullptr, &dequantMemory);
+    if (r != VK_SUCCESS) return false;
+
+    vkBindBufferMemory(ctx->device, dequantBuffer, dequantMemory, 0);
+
+    VkBufferDeviceAddressInfo addrInfo = {};
+    addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    addrInfo.buffer = dequantBuffer;
+    dequantAddr = vkGetBufferDeviceAddress(ctx->device, &addrInfo);
+
+    // Map for debug readback
+    vkMapMemory(ctx->device, dequantMemory, 0, maxSize, 0, reinterpret_cast<void**>(&dequantMapped));
+
+    fprintf(stderr, "[dequant] staging buffer: %zu MB @ 0x%llx memType=%u props=0x%x\n",
+            maxSize / 1024 / 1024, (unsigned long long)dequantAddr,
+            memTypeIndex, memProps.memoryTypes[memTypeIndex].propertyFlags);
+    return true;
+}
+
+void InferenceEngine::cleanupDequantBuffer() {
+    if (dequantBuffer) vkDestroyBuffer(ctx->device, dequantBuffer, nullptr);
+    if (dequantMemory) vkFreeMemory(ctx->device, dequantMemory, nullptr);
+    dequantBuffer = VK_NULL_HANDLE;
+    dequantMemory = VK_NULL_HANDLE;
+    dequantAddr = 0;
+}
+
+void InferenceEngine::invalidateDequantBuffer() {
+    if (!dequantMapped) return;
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = dequantMemory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(ctx->device, 1, &range);
+}
 
 uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
     uint32_t dim = model->embeddingLength;
@@ -47,10 +190,42 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
     // Embedding
     uint64_t embedAddr = findTensorAddr(*model, "token_embd.weight");
     if (embedAddr) {
-        EmbedPushConstants embedPC = {embedAddr, hiddenAddr, tokenId, seqPos, dim};
+        // Debug: check if raw weight data is non-zero on GPU
+        const TensorDesc* embedTensor = findTensor(*model, "token_embd.weight");
+        if (embedTensor && dequantMapped) {
+            // Read raw quantized bytes from GPU via staging (not possible directly)
+            // But we can check the dequantized output
+        }
+
+        // Dequantize embedding weights
+        uint64_t embedAddr_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight");
+
+        // Debug: check dequantized embedding
+        if (dequantMapped) {
+            invalidateDequantBuffer();
+            uint16_t f16vals[8] = {0};
+            std::memcpy(f16vals, dequantMapped, sizeof(f16vals));
+            fprintf(stderr, "[debug] dequant test pattern: %u %u (expect ~42.0=0x5140 ~-3.5=0xC333)\n",
+                    f16vals[0], f16vals[1]);
+            fprintf(stderr, "[debug] dequant embed[0..7] raw f16: %u %u %u %u %u %u %u %u\n",
+                    f16vals[0], f16vals[1], f16vals[2], f16vals[3],
+                    f16vals[4], f16vals[5], f16vals[6], f16vals[7]);
+            fflush(stderr);
+        }
+
+        EmbedPushConstants embedPC = {embedAddr_dq ? embedAddr_dq : embedAddr, hiddenAddr, tokenId, seqPos, dim};
         scheduler->dispatch(pipelines->getPipeline("embed"), pipelines->getLayout("embed"),
                              &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
         scheduler->syncAll();
+
+        // Debug: read back first few elements of hidden state
+        if (allocator->mappedPtr) {
+            size_t localOff = hiddenAddr - allocator->baseAddress;
+            float vals[4] = {0};
+            std::memcpy(vals, allocator->mappedPtr + localOff, sizeof(vals));
+            fprintf(stderr, "[debug] hidden after embed: %f %f %f %f\n", vals[0], vals[1], vals[2], vals[3]);
+            fflush(stderr);
+        }
     }
 
     // Transformer blocks
@@ -77,10 +252,33 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
 
         uint64_t normHidden = attnOutAddr;
 
-        // QKV projections (parallel)
-        GemmPushConstants qpc = {normHidden, addrQW, qAddr, 1, dim, dim, 1.0f};
-        GemmPushConstants kpc = {normHidden, addrKW, kAddr, 1, headDim * model->headCountKv, dim, 1.0f};
-        GemmPushConstants vpc = {normHidden, addrVW, vAddr, 1, headDim * model->headCountKv, dim, 1.0f};
+        // QKV projections — dequantize weights to float16 first
+        uint64_t addrQW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight");
+
+        // Debug: read back first few dequantized weight values
+        if (dequantMapped && addrQW_dq) {
+            invalidateDequantBuffer();
+            uint16_t f16vals[8] = {0};
+            std::memcpy(f16vals, dequantMapped, sizeof(f16vals));
+            fprintf(stderr, "[debug] dequant Q[0..7] raw f16: %u %u %u %u %u %u %u %u\n",
+                    f16vals[0], f16vals[1], f16vals[2], f16vals[3],
+                    f16vals[4], f16vals[5], f16vals[6], f16vals[7]);
+            // Check test pattern at buffer start (every thread wrote globalId + 0x10000)
+            uint32_t uintVals[8] = {0};
+            std::memcpy(uintVals, dequantMapped, sizeof(uintVals));
+            fprintf(stderr, "[debug] dequant BDA test[0..7]: 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
+                    uintVals[0], uintVals[1], uintVals[2], uintVals[3],
+                    uintVals[4], uintVals[5], uintVals[6], uintVals[7]);
+            fprintf(stderr, "[debug] (expect 0x00010000 0x00010001 0x00010002 ...)\n");
+            fflush(stderr);
+        }
+
+        uint64_t addrKW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight");
+        uint64_t addrVW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight");
+
+        GemmPushConstants qpc = {normHidden, addrQW_dq ? addrQW_dq : addrQW, qAddr, 1, dim, dim, 1.0f};
+        GemmPushConstants kpc = {normHidden, addrKW_dq ? addrKW_dq : addrKW, kAddr, 1, headDim * model->headCountKv, dim, 1.0f};
+        GemmPushConstants vpc = {normHidden, addrVW_dq ? addrVW_dq : addrVW, vAddr, 1, headDim * model->headCountKv, dim, 1.0f};
 
         scheduler->dispatchMulti({
             {pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &qpc, sizeof(qpc), (dim+31)/32, 1, 1},
@@ -119,8 +317,9 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
         }
         scheduler->syncAll();
 
-        // Output projection
-        GemmPushConstants outPC = {attnOutAddr, addrOW, mlpOutAddr, 1, dim, dim, 1.0f};
+        // Output projection — dequantize weights
+        uint64_t addrOW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight");
+        GemmPushConstants outPC = {attnOutAddr, addrOW_dq ? addrOW_dq : addrOW, mlpOutAddr, 1, dim, dim, 1.0f};
         scheduler->dispatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
                              &outPC, sizeof(outPC), (dim+31)/32, 1, 1);
         scheduler->syncAll();
@@ -139,9 +338,17 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
 
         normHidden = attnOutAddr;
 
-        // MLP
+        // MLP — dequantize weights to float16
+        uint64_t addrUpW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight");
+        uint64_t addrGateW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight");
+        uint64_t addrDownW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight");
+
         MlpPushConstants mlpPC = {
-            normHidden, addrUpW, addrGateW, addrDownW, mlpOutAddr,
+            normHidden,
+            addrUpW_dq ? addrUpW_dq : addrUpW,
+            addrGateW_dq ? addrGateW_dq : addrGateW,
+            addrDownW_dq ? addrDownW_dq : addrDownW,
+            mlpOutAddr,
             dim, hiddenDim, 0, 1.0f
         };
         scheduler->dispatch(pipelines->getPipeline("mlp"), pipelines->getLayout("mlp"),
@@ -168,11 +375,12 @@ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
 
     uint64_t normHidden = attnOutAddr;
 
-    // LM head
+    // LM head — dequantize weights
     uint64_t addrLMHead = findTensorAddr(*model, "output.weight");
     if (!addrLMHead) addrLMHead = findTensorAddr(*model, "token_embd.weight");
+    uint64_t addrLMHead_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight");
 
-    GemmPushConstants lmPC = {normHidden, addrLMHead, logitsAddr, 1, model->vocabSize, dim, 1.0f};
+    GemmPushConstants lmPC = {normHidden, addrLMHead_dq ? addrLMHead_dq : addrLMHead, logitsAddr, 1, model->vocabSize, dim, 1.0f};
     scheduler->dispatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
                          &lmPC, sizeof(lmPC), (model->vocabSize+31)/32, 1, 1);
     scheduler->syncAll();
