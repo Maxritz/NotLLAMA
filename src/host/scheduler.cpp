@@ -117,6 +117,34 @@ void Scheduler::dispatchMulti(const std::vector<std::tuple<VkPipeline, VkPipelin
     }
 }
 
+void Scheduler::dispatchBatch(const std::vector<DispatchDesc>& dispatches, int aceIndex) {
+    if (dispatches.empty()) return;
+
+    VkCommandBuffer cmd = allocateCmd(aceIndex);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    for (const auto& d : dispatches) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipeline);
+        if (d.pushConstants && d.pcSize > 0) {
+            vkCmdPushConstants(cmd, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, d.pcSize, d.pushConstants);
+        }
+        vkCmdDispatch(cmd, d.gx, d.gy, d.gz);
+    }
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    vkQueueSubmit(queues[aceIndex], 1, &submitInfo, VK_NULL_HANDLE);
+}
+
 void Scheduler::syncAll() {
     for (int i = 0; i < 4; ++i) {
         vkQueueWaitIdle(queues[i]);

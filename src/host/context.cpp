@@ -53,20 +53,59 @@ bool VulkanContext::init() {
     std::vector<VkQueueFamilyProperties> qfProps(qfCount);
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, qfProps.data());
 
+    // Log all queue families
     for (uint32_t i = 0; i < qfCount; ++i) {
-        if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qfProps[i].queueCount >= 4) {
+        std::cout << "Queue family " << i << ": flags=0x" << std::hex << qfProps[i].queueFlags
+                  << std::dec << " queues=" << qfProps[i].queueCount
+                  << " (graphics=" << !!(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                  << " compute=" << !!(qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+                  << " transfer=" << !!(qfProps[i].queueFlags & VK_QUEUE_TRANSFER_BIT)
+                  << " sparse=" << !!(qfProps[i].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT)
+                  << ")\n";
+    }
+
+    // Pass 1: prefer compute-only queue family (no graphics bit) with >= 4 queues
+    for (uint32_t i = 0; i < qfCount; ++i) {
+        if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            qfProps[i].queueCount >= 4) {
             queueFamilyIndex = i;
-            std::cout << "Queue family " << i << " has " << qfProps[i].queueCount << " queues (using 4)\n";
+            std::cout << "Queue family " << i << " (COMPUTE-ONLY) has " << qfProps[i].queueCount << " queues (using 4)\n";
             break;
         }
     }
 
-    // Fallback: any compute queue family
+    // Pass 2: compute-only with fewer queues
+    if (queueFamilyIndex == 0xFFFFFFFF) {
+        for (uint32_t i = 0; i < qfCount; ++i) {
+            if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+                !(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                queueFamilyIndex = i;
+                std::cout << "Queue family " << i << " (COMPUTE-ONLY fallback) has " << qfProps[i].queueCount
+                          << " queues (using min(4, available))\n";
+                break;
+            }
+        }
+    }
+
+    // Pass 3: graphics+compute (will route to 3D engine on AMD)
+    if (queueFamilyIndex == 0xFFFFFFFF) {
+        for (uint32_t i = 0; i < qfCount; ++i) {
+            if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qfProps[i].queueCount >= 4) {
+                queueFamilyIndex = i;
+                std::cout << "Queue family " << i << " (GRAPHICS+COMPUTE) has " << qfProps[i].queueCount
+                          << " queues (using 4) — NOTE: work will route to 3D engine\n";
+                break;
+            }
+        }
+    }
+
+    // Pass 4: any compute queue family
     if (queueFamilyIndex == 0xFFFFFFFF) {
         for (uint32_t i = 0; i < qfCount; ++i) {
             if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
                 queueFamilyIndex = i;
-                std::cout << "Queue family " << i << " has " << qfProps[i].queueCount 
+                std::cout << "Queue family " << i << " has " << qfProps[i].queueCount
                           << " queues (fallback, using min(4, available))\n";
                 break;
             }

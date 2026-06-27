@@ -30,7 +30,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Dow
     float16_t data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer InRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
     float data[];

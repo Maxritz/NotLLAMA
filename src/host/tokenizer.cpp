@@ -2,6 +2,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 
 namespace rdna4 {
 
@@ -30,7 +31,9 @@ std::vector<std::string> Tokenizer::byteFallbackEncode(const std::string& text) 
     std::vector<std::string> pieces;
     for (unsigned char c : text) {
         // Byte fallback: map bytes to special tokens like <0xXX>
-        std::string byteToken = "<0x" + std::to_string(c) + ">";
+        char hex[8];
+        snprintf(hex, sizeof(hex), "<0x%02X>", c);
+        std::string byteToken(hex);
         auto it = vocab.find(byteToken);
         if (it != vocab.end()) {
             pieces.push_back(byteToken);
@@ -74,16 +77,99 @@ std::vector<std::string> Tokenizer::bpeMerge(const std::vector<std::string>& wor
     return pieces;
 }
 
+// GPT-2 style pre-tokenization: split text into chunks matching regex patterns
+static std::vector<std::string> pretokenize(const std::string& text) {
+    std::vector<std::string> chunks;
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+
+        // Contractions: 's, 't, 're, 've, 'm, 'll, 'd
+        if (c == '\'' && i + 1 < text.size()) {
+            char next = text[i + 1];
+            if (next == 's' || next == 't' || next == 'd' || next == 'm') {
+                chunks.push_back(text.substr(i, 2));
+                i += 2;
+                continue;
+            }
+            if (i + 2 < text.size()) {
+                std::string tri = text.substr(i, 3);
+                if (tri == "'re" || tri == "'ve" || tri == "'ll") {
+                    chunks.push_back(tri);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
+        // Leading space + letters
+        if (c == ' ') {
+            size_t start = i;
+            i++;  // consume space
+            size_t letterStart = i;
+            while (i < text.size() && std::isalpha(static_cast<unsigned char>(text[i]))) i++;
+            if (i > letterStart) {
+                chunks.push_back(text.substr(start, i - start));
+                continue;
+            }
+            // Just a space, will be handled by whitespace rule
+            chunks.push_back(" ");
+            continue;
+        }
+
+        // Letters (no leading space)
+        if (std::isalpha(static_cast<unsigned char>(c))) {
+            size_t start = i;
+            while (i < text.size() && std::isalpha(static_cast<unsigned char>(text[i]))) i++;
+            chunks.push_back(text.substr(start, i - start));
+            continue;
+        }
+
+        // Numbers (with optional leading space)
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            size_t start = i;
+            while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) i++;
+            chunks.push_back(text.substr(start, i - start));
+            continue;
+        }
+
+        // Non-space/non-letter/non-number sequences
+        if (c != ' ' && !std::isalpha(static_cast<unsigned char>(c)) && !std::isdigit(static_cast<unsigned char>(c))) {
+            size_t start = i;
+            while (i < text.size()) {
+                char nc = text[i];
+                if (nc == ' ' || std::isalpha(static_cast<unsigned char>(nc)) || std::isdigit(static_cast<unsigned char>(nc))) break;
+                i++;
+            }
+            if (i > start) {
+                chunks.push_back(text.substr(start, i - start));
+                continue;
+            }
+        }
+
+        // Whitespace (spaces, tabs, newlines)
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            size_t start = i;
+            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) i++;
+            chunks.push_back(text.substr(start, i - start));
+            continue;
+        }
+
+        // Fallback: single character
+        chunks.push_back(std::string(1, c));
+        i++;
+    }
+    return chunks;
+}
+
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
     std::vector<uint32_t> result;
     result.push_back(bosId);
 
-    // Simple word-level tokenization (pre-tokenization)
-    // Real BPE uses regex patterns like GPT-2's pre-tokenizer
-    std::istringstream iss(text);
-    std::string word;
+    // GPT-2 style pre-tokenization
+    auto chunks = pretokenize(text);
 
-    while (iss >> word) {
+    for (const auto& word : chunks) {
         // Try to find the word directly in vocab
         auto it = vocab.find(word);
         if (it != vocab.end()) {
@@ -113,7 +199,16 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
                 i += longest;
             } else {
                 // Byte fallback
-                wordPieces.push_back(std::string(1, word[i]));
+                unsigned char ch = static_cast<unsigned char>(word[i]);
+                char hex[8];
+                snprintf(hex, sizeof(hex), "<0x%02X>", ch);
+                std::string byteToken(hex);
+                auto bit = vocab.find(byteToken);
+                if (bit != vocab.end()) {
+                    wordPieces.push_back(byteToken);
+                } else {
+                    wordPieces.push_back(std::string(1, word[i]));
+                }
                 i++;
             }
         }

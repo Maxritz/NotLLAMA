@@ -27,7 +27,6 @@ public:
     VkDeviceMemory dequantMemory = VK_NULL_HANDLE;
     VkDeviceAddress dequantAddr = 0;
     size_t dequantCapacity = 0;
-    uint8_t* dequantMapped = nullptr;
 
     InferenceEngine(VulkanContext* c, ModelDesc* m, KVCacheManager* k,
                       PipelineBuilder* p, Tokenizer* t, Scheduler* s, RingAllocator* a);
@@ -53,7 +52,6 @@ private:
 
     // Verify a draft token against the full model
     bool verifyDraftToken(uint32_t draftToken, uint32_t expectedToken, uint32_t seqPos);
-    void invalidateDequantBuffer();
 };
 
 } // namespace rdna4

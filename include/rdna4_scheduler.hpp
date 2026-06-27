@@ -32,8 +32,18 @@ public:
                         int aceIndex = 0);
 
     void dispatchMulti(const std::vector<std::tuple<VkPipeline, VkPipelineLayout,
-                                                      const void*, size_t,
-                                                      uint32_t, uint32_t, uint32_t>>& dispatches);
+                                                       const void*, size_t,
+                                                       uint32_t, uint32_t, uint32_t>>& dispatches);
+
+    // Batch multiple dispatches into a single command buffer submission
+    struct DispatchDesc {
+        VkPipeline pipeline;
+        VkPipelineLayout layout;
+        const void* pushConstants;
+        size_t pcSize;
+        uint32_t gx, gy, gz;
+    };
+    void dispatchBatch(const std::vector<DispatchDesc>& dispatches, int aceIndex = 0);
 
     void syncAll();
 

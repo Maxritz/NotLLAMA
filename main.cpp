@@ -166,6 +166,112 @@ int main(int argc, char** argv) {
     log("creating scheduler");
     Scheduler scheduler(ctx.device, ctx.queues, ctx.queueFamilyIndex);
 
+    // === BDA WRITE TEST ===
+    // Allocate a small test buffer, dispatch a shader that writes DEADBEEF+tid via BDA,
+    // then read back to verify BDA writes work at all.
+    {
+        log("BDA test: creating buffer");
+        const uint32_t testN = 256;
+        const size_t testBytes = testN * sizeof(uint32_t);
+
+        VkBuffer testBuf = VK_NULL_HANDLE;
+        VkDeviceMemory testMem = VK_NULL_HANDLE;
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = testBytes;
+        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(ctx.device, &bufInfo, nullptr, &testBuf);
+
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(ctx.device, testBuf, &memReq);
+
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(ctx.physicalDevice, &memProps);
+
+        // Try DEVICE_LOCAL+HOST_VISIBLE first, fallback to HOST_VISIBLE+HOST_COHERENT
+        uint32_t memTypeIdx = UINT32_MAX;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1 << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                memTypeIdx = i; break;
+            }
+        }
+        if (memTypeIdx == UINT32_MAX) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((memReq.memoryTypeBits & (1 << i)) &&
+                    (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                    (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                    memTypeIdx = i; break;
+                }
+            }
+        }
+
+        VkMemoryAllocateFlagsInfo flagsInfo = {};
+        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = memTypeIdx;
+        allocInfo.pNext = &flagsInfo;
+        vkAllocateMemory(ctx.device, &allocInfo, nullptr, &testMem);
+        vkBindBufferMemory(ctx.device, testBuf, testMem, 0);
+
+        VkBufferDeviceAddressInfo addrInfo = {};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = testBuf;
+        uint64_t testBda = vkGetBufferDeviceAddress(ctx.device, &addrInfo);
+
+        fprintf(stderr, "[BDA_TEST] buffer addr=0x%llx memType=%u\n",
+                (unsigned long long)testBda, memTypeIdx);
+        fflush(stderr);
+
+        // Load the test shader
+        log("BDA test: loading pipeline");
+        pipelines.loadShader("bda_test", "shaders/bda_test.spv");
+        pipelines.createComputePipeline("bda_test", sizeof(BdaTestPushConstants));
+
+        // Dispatch
+        log("BDA test: dispatching");
+        BdaTestPushConstants pc = {};
+        pc.addrOut = testBda;
+        pc.nElements = testN;
+        scheduler.dispatch(pipelines.getPipeline("bda_test"), pipelines.getLayout("bda_test"),
+                           &pc, sizeof(pc), 1, 1, 1);
+        scheduler.syncAll();
+
+        // Read back
+        void* mapped = nullptr;
+        vkMapMemory(ctx.device, testMem, 0, testBytes, 0, &mapped);
+        uint32_t* data = (uint32_t*)mapped;
+        bool allZero = true;
+        bool allCorrect = true;
+        for (uint32_t i = 0; i < testN; ++i) {
+            if (data[i] != 0) allZero = false;
+            if (data[i] != 0xDEADBEEF + i) allCorrect = false;
+        }
+        fprintf(stderr, "[BDA_TEST] results: allZero=%d allCorrect=%d first[0..3]=%08X %08X %08X %08X\n",
+                allZero, allCorrect, data[0], data[1], data[2], data[3]);
+        fflush(stderr);
+
+        if (allCorrect) {
+            printf("BDA TEST PASSED: shader wrote correct values via buffer device address\n");
+        } else if (allZero) {
+            printf("BDA TEST FAILED: all zeros — BDA writes NOT working\n");
+        } else {
+            printf("BDA TEST PARTIAL: some writes worked, some didn't\n");
+        }
+
+        vkUnmapMemory(ctx.device, testMem);
+        vkDestroyBuffer(ctx.device, testBuf, nullptr);
+        vkFreeMemory(ctx.device, testMem, nullptr);
+        log("BDA test: done");
+    }
+    // === END BDA TEST ===
+
     log("creating engine");
     InferenceEngine engine(&ctx, &model, &kvCache, &pipelines, &tokenizer, &scheduler, &allocator);
     if (!engine.initDequantBuffer()) {

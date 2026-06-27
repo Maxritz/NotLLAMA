@@ -94,6 +94,11 @@ struct KVCacheWritePushConstants {
     uint32_t nKvHeads;
 };
 
+struct BdaTestPushConstants {
+    uint64_t addrOut;
+    uint32_t nElements;
+};
+
 struct DequantizePushConstants {
     uint64_t addrQuant;
     uint64_t addrOut;
@@ -101,6 +106,7 @@ struct DequantizePushConstants {
     uint32_t quantFormat;
     uint32_t blockSize;
     uint32_t blockElements;
+    uint32_t totalThreads;
 };
 
 } // namespace rdna4

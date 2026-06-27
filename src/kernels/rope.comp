@@ -2,82 +2,65 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
-
-// =============================================================================
-// ROPE — Rotary Position Embedding for RDNA4.
-// =============================================================================
-// Applies rotation to Q and K vectors per position.
-// For each pair of dimensions (2i, 2i+1), rotate by angle = pos * theta_i
-// where theta_i = base^(−2i/headDim).
-// =============================================================================
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer QRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer KRef {
-    float16_t data[];
+    float data[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
     uint64_t addrQ;
     uint64_t addrK;
-    uint seqLen;       // Number of positions to rotate
+    uint seqLen;
     uint headDim;
     uint nHeads;
     uint nKvHeads;
-    float ropeBase;    // e.g., 10000.0
-    float ropeScale;   // e.g., 1.0 (or 1/sqrt(N) for NTK scaling)
+    float ropeBase;
+    float ropeScale;
 } pc;
 
-const float PI = 3.14159265359;
-
 void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint wg = gl_WorkGroupID.x;
+    uint tid = gl_GlobalInvocationID.x;
+    uint dim = pc.nHeads * pc.headDim;
+    if (tid >= dim) return;
 
-    // Each workgroup handles one head. tid handles pairs of dimensions.
-    uint head = wg;
+    uint head = tid / pc.headDim;
+    uint d = tid % pc.headDim;
     uint kvHead = head / (pc.nHeads / pc.nKvHeads);
-    uint hd = pc.headDim;
-    uint pairsPerThread = hd / (2 * 32);  // Each thread handles this many (d1,d2) pairs
+
+    if (d >= pc.headDim) return;
 
     QRef Q = QRef(pc.addrQ);
     KRef K = KRef(pc.addrK);
 
-    // For each position in the sequence
-    for (uint pos = 0; pos < pc.seqLen; ++pos) {
-        uint qBase = pos * pc.nHeads * hd + head * hd;
-        uint kBase = pos * pc.nKvHeads * hd + kvHead * hd;
+    float theta = pow(pc.ropeBase, -float(d & ~1u) / float(pc.headDim));
+    float angle = float(pc.seqLen) * theta * pc.ropeScale;
+    float cosA = cos(angle);
+    float sinA = sin(angle);
 
-        for (uint p = 0; p < pairsPerThread; ++p) {
-            uint pairIdx = tid * pairsPerThread + p;
-            uint d1 = pairIdx * 2;
-            uint d2 = d1 + 1;
+    // Apply to Q for the current position (last position)
+    uint qIdx = (pc.seqLen - 1) * pc.nHeads * pc.headDim + head * pc.headDim + d;
+    uint qPair = qIdx ^ 1;  // Toggle last bit for paired dimension
+    float q1 = Q.data[qIdx & ~1u];
+    float q2 = Q.data[qIdx | 1u];
+    if (d % 2 == 0) {
+        Q.data[qIdx] = q1 * cosA - q2 * sinA;
+    } else {
+        Q.data[qIdx] = q2 * cosA + q1 * sinA;
+    }
 
-            if (d2 >= hd) break;
-
-            // Compute rotation angle
-            float theta = pow(pc.ropeBase, -float(d1) / float(hd));
-            float angle = float(pos) * theta * pc.ropeScale;
-
-            float cosA = cos(angle);
-            float sinA = sin(angle);
-
-            // Rotate Q
-            float q1 = float(Q.data[qBase + d1]);
-            float q2 = float(Q.data[qBase + d2]);
-            Q.data[qBase + d1] = float16_t(q1 * cosA - q2 * sinA);
-            Q.data[qBase + d2] = float16_t(q1 * sinA + q2 * cosA);
-
-            // Rotate K
-            float k1 = float(K.data[kBase + d1]);
-            float k2 = float(K.data[kBase + d2]);
-            K.data[kBase + d1] = float16_t(k1 * cosA - k2 * sinA);
-            K.data[kBase + d2] = float16_t(k1 * sinA + k2 * cosA);
-        }
+    // Apply to K for the current position
+    uint kIdx = (pc.seqLen - 1) * pc.nKvHeads * pc.headDim + kvHead * pc.headDim + d;
+    float k1 = K.data[kIdx & ~1u];
+    float k2 = K.data[kIdx | 1u];
+    if (d % 2 == 0) {
+        K.data[kIdx] = k1 * cosA - k2 * sinA;
+    } else {
+        K.data[kIdx] = k2 * cosA + k1 * sinA;
     }
 }

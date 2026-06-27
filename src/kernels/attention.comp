@@ -4,26 +4,19 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
-
-// =============================================================================
-// ATTENTION — Causal self-attention for RDNA4.
-// =============================================================================
-// One wave (32 threads) handles one head. Q, K, V for that head are in VGPRs.
-// No LDS for attention scores. Cross-lane movement is subgroup shuffle (DPP).
-// =============================================================================
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KCacheRef {
     float16_t data[];
 };
-layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KRef {
-    float16_t data[];
-};
-layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VRef {
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VCacheRef {
     float16_t data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
@@ -32,10 +25,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
 
 layout(push_constant, scalar) uniform PushConstants {
     uint64_t addrQ;
-    uint64_t addrK;
-    uint64_t addrV;
+    uint64_t addrKCache;
+    uint64_t addrVCache;
     uint64_t addrOut;
-    uint seqLen;       // Current sequence length (includes new token)
+    uint seqLen;
     uint headDim;
     uint nHeads;
     uint nKvHeads;
@@ -43,8 +36,14 @@ layout(push_constant, scalar) uniform PushConstants {
     float invSqrtHeadDim;
 } pc;
 
-// Each thread handles seqLen/32 positions for the Q×K and scores×V reductions.
-// For causal attention, we only compute positions [0, seqLen) for this head.
+float dotQK(QRef Q, KCacheRef KCache, uint qBase, uint kOffset, uint hd) {
+    float dot = 0.0;
+    for (uint d = 0; d < hd; ++d) {
+        dot += Q.data[qBase + d] * float(KCache.data[kOffset + d]);
+    }
+    return dot;
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint head = pc.headIndex;
@@ -53,114 +52,48 @@ void main() {
     uint sl = pc.seqLen;
 
     QRef Q = QRef(pc.addrQ);
-    KRef K = KRef(pc.addrK);
-    VRef V = VRef(pc.addrV);
+    KCacheRef KCache = KCacheRef(pc.addrKCache);
+    VCacheRef VCache = VCacheRef(pc.addrVCache);
     OutRef Out = OutRef(pc.addrOut);
 
-    // Load Q vector (1 × headDim) for this head.
-    // Q is [seqLen, nHeads, headDim]. We want the last token's Q.
-    uint qRow = sl - 1;  // New token position
+    uint qRow = sl - 1;
     uint qBase = qRow * pc.nHeads * hd + head * hd;
 
-    float qVec[32];  // Max headDim per thread = 32 floats (headDim up to 1024)
-    uint qPerThread = hd / 32;
-    for (uint i = 0; i < qPerThread; ++i) {
-        qVec[i] = float(Q.data[qBase + tid * qPerThread + i]);
-    }
-
-    // Each thread computes scores for positions [tid, tid+32, tid+64, ...]
-    // up to seqLen. Causal mask: each position can only attend to itself and prior.
-    uint scoresPerThread = (sl + 31) / 32;
-    float scores[128];  // Max seqLen per thread
-
-    for (uint s = 0; s < scoresPerThread; ++s) {
-        uint pos = s * 32 + tid;
-        if (pos >= sl) break;
-
-        // Q @ K^T for this position
-        // K is [seqLen, nKvHeads, headDim]
-        uint kBase = pos * pc.nKvHeads * hd + kvHead * hd;
-        float dot = 0.0;
-        for (uint d = 0; d < hd; ++d) {
-            float qVal = float(Q.data[qBase + d]);  // Simplified: all threads read same Q
-            float kVal = float(K.data[kBase + d]);
-            dot += qVal * kVal;
-        }
-        scores[s] = dot * pc.invSqrtHeadDim;
-
-        // Causal mask: future positions get -inf
-        if (pos > qRow) {
-            scores[s] = -1e30;
-        }
-    }
-
-    // === SOFTMAX IN REGISTERS ===
-    // Step 1: Find max across all scores (subgroup reduction)
+    // Step 1: Compute all scores and find max
     float localMax = -1e30;
-    for (uint s = 0; s < scoresPerThread; ++s) {
-        if (s * 32 + tid < sl) {
-            localMax = max(localMax, scores[s]);
-        }
+    for (uint pos = 0; pos < sl; ++pos) {
+        uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
+        float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
+        localMax = max(localMax, score);
     }
 
-    // Butterfly reduction: 16, 8, 4, 2, 1
-    localMax = max(localMax, subgroupShuffleDown(localMax, 16));
-    localMax = max(localMax, subgroupShuffleDown(localMax, 8));
-    localMax = max(localMax, subgroupShuffleDown(localMax, 4));
-    localMax = max(localMax, subgroupShuffleDown(localMax, 2));
-    localMax = max(localMax, subgroupShuffleDown(localMax, 1));
-    localMax = subgroupBroadcastFirst(localMax);
+    float globalMax = subgroupBroadcastFirst(localMax);
 
-    // Step 2: exp and sum
+    // Step 2: Compute sum of exp(score - max)
     float sum = 0.0;
-    for (uint s = 0; s < scoresPerThread; ++s) {
-        uint pos = s * 32 + tid;
-        if (pos < sl) {
-            scores[s] = exp(scores[s] - localMax);
-            sum += scores[s];
+    for (uint pos = 0; pos < sl; ++pos) {
+        uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
+        float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
+        sum += exp(score - globalMax);
+    }
+
+    float globalSum = subgroupBroadcastFirst(sum);
+    float invSum = 1.0 / globalSum;
+
+    // Step 3: Accumulate V for this thread's output slice
+    uint outBase = head * hd;
+    uint hdPerThread = hd / 32;
+
+    for (uint d = 0; d < hdPerThread; ++d) {
+        float acc = 0.0;
+        for (uint pos = 0; pos < sl; ++pos) {
+            uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
+            uint vOffset = kOffset;
+
+            float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
+            float weight = exp(score - globalMax) * invSum;
+            acc += weight * float(VCache.data[vOffset + tid * hdPerThread + d]);
         }
-    }
-
-    sum += subgroupShuffleDown(sum, 16);
-    sum += subgroupShuffleDown(sum, 8);
-    sum += subgroupShuffleDown(sum, 4);
-    sum += subgroupShuffleDown(sum, 2);
-    sum += subgroupShuffleDown(sum, 1);
-    sum = subgroupBroadcastFirst(sum);
-
-    // Step 3: Normalize
-    float invSum = 1.0 / sum;
-    for (uint s = 0; s < scoresPerThread; ++s) {
-        uint pos = s * 32 + tid;
-        if (pos < sl) {
-            scores[s] *= invSum;
-        }
-    }
-
-    // Step 4: scores @ V (weighted sum)
-    // Each thread accumulates part of the output vector
-    float outVec[32];
-    for (uint i = 0; i < qPerThread; ++i) {
-        outVec[i] = 0.0;
-    }
-
-    for (uint s = 0; s < scoresPerThread; ++s) {
-        uint pos = s * 32 + tid;
-        if (pos >= sl) break;
-
-        uint vBase = pos * pc.nKvHeads * hd + kvHead * hd;
-        float w = scores[s];
-        for (uint d = 0; d < qPerThread; ++d) {
-            outVec[d] += w * float(V.data[vBase + tid * qPerThread + d]);
-        }
-    }
-
-    // Subgroup reduction: each thread has partial sums for its slice.
-    // We need to sum across threads for each dimension element.
-    // Actually, each thread owns a distinct slice of dimensions, so no cross-thread
-    // reduction needed for output. Just write.
-    uint outBase = qRow * pc.nHeads * hd + head * hd;
-    for (uint d = 0; d < qPerThread; ++d) {
-        Out.data[outBase + tid * qPerThread + d] = outVec[d];
+        Out.data[outBase + tid * hdPerThread + d] = acc;
     }
 }
