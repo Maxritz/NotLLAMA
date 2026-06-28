@@ -69,7 +69,7 @@ void main() {
         uint qhShift = (eleInBlock & 3u) * 2;
 
         int val = int((q4 | (((qhByte >> qhShift) & 3) << 4))) - 32;
-        Out.data[i] = d * float(val);
+        Out.data[i] = d * float(sc) * float(val);
     }
     // Q8_0 (8) — 32 elements per block, 34 bytes
     else if (pc.quantFormat == 8) {

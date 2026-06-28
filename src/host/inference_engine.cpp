@@ -162,7 +162,22 @@ bool InferenceEngine::initDequantBuffer() {
     size_t embedSize = getF16OutputSize(*model, "token_embd.weight");
     if (embedSize > maxSize) maxSize = embedSize;
 
-    if (maxSize > 640 * 1024 * 1024) maxSize = 640 * 1024 * 1024;  // Cap at 640 MB
+    if (maxSize > 640 * 1024 * 1024) maxSize = 640 * 1024 * 1024;  // Hard cap at 640 MB
+
+    // Cap at 80% of total GPU VRAM — query memProps once
+    {
+        VkPhysicalDeviceMemoryProperties vramProps;
+        vkGetPhysicalDeviceMemoryProperties(ctx->physicalDevice, &vramProps);
+        size_t vramBytes = 0;
+        for (uint32_t i = 0; i < vramProps.memoryHeapCount; ++i) {
+            if (vramProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                vramBytes += vramProps.memoryHeaps[i].size;
+        }
+        size_t vram80 = vramBytes * 8 / 10;
+        if (maxSize > vram80) maxSize = vram80;
+        fprintf(stderr, "[dequant] VRAM=%zu MB, 80%% cap=%zu MB, buffer=%zu MB\n",
+                vramBytes / 1024 / 1024, vram80 / 1024 / 1024, maxSize / 1024 / 1024);
+    }
 
     dequantCapacity = maxSize;
 
@@ -774,7 +789,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
     scheduler->endBatch(VK_NULL_HANDLE);
-    scheduler->syncAll();
+    scheduler->syncAllThrottled(0.8);
 
     uint32_t layersToRun = std::min(maxLayers, model->blockCount);
 
@@ -797,12 +812,11 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
         size_t attnOffV     = attnOffK + kSize;
         size_t attnOffO     = attnOffV + vSize;
 
-        uint64_t addrAttnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", attnOffNorm, false);
-        uint64_t addrQW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", attnOffQ, false);
-        uint64_t addrKW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", attnOffK, false);
-        uint64_t addrVW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", attnOffV, false);
-        uint64_t addrOW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", attnOffO, false);
-        scheduler->syncAll();
+        uint64_t addrAttnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", attnOffNorm);
+        uint64_t addrQW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", attnOffQ);
+        uint64_t addrKW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", attnOffK);
+        uint64_t addrVW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", attnOffV);
+        uint64_t addrOW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", attnOffO);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -971,7 +985,25 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             &addPC2, sizeof(addPC2), (dim + 255) / 256, 1, 1);
 
         scheduler->endBatch(VK_NULL_HANDLE);
-        scheduler->syncAll();
+        scheduler->syncAllThrottled(0.8);
+
+        // Diagnostic: read back dequant buffer after layer 0 completes
+        if (layer == 0 && dequantMemory) {
+            void* mapped = nullptr;
+            VkResult r = vkMapMemory(ctx->device, dequantMemory, 0, dequantCapacity, 0, &mapped);
+            if (r == VK_SUCCESS && mapped) {
+                float* df = (float*)mapped;
+                fprintf(stderr, "[diag] L0 post-sync dequant buf[0..9]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    df[0], df[1], df[2], df[3], df[4], df[5], df[6], df[7], df[8], df[9]);
+                fprintf(stderr, "[diag] Q-dq@+qOff (%zu bytes in): ", attnOffQ);
+                for (int j = 0; j < 10; ++j) fprintf(stderr, "%.6f ", df[attnOffQ / sizeof(float) + j]);
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[diag] K-dq@+kOff (%zu bytes in): ", attnOffK);
+                for (int j = 0; j < 10; ++j) fprintf(stderr, "%.6f ", df[attnOffK / sizeof(float) + j]);
+                fprintf(stderr, "\n");
+                vkUnmapMemory(ctx->device, dequantMemory);
+            }
+        }
     }
 
     // === Final Norm + LM Head Batch ===
