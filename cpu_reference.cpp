@@ -336,6 +336,23 @@ bool CpuReference::load(const std::string& jsonPath, const std::string& binPath)
         loadTensor(layers[i].ffnGate, prefix + ".ffn_gate.weight");
         loadTensor(layers[i].ffnUp, prefix + ".ffn_up.weight");
         loadTensor(layers[i].ffnDown, prefix + ".ffn_down.weight");
+        if (i == 0) {
+            if (!layers[i].ffnUp.data.empty()) {
+                fprintf(stderr, "[diag] CPU layer0 ffn_up dequant[0..9]: ");
+                for (int j = 0; j < 10; ++j) fprintf(stderr, "%f ", layers[i].ffnUp.data[j]);
+                fprintf(stderr, "\n");
+            }
+            if (!layers[i].ffnGate.data.empty()) {
+                fprintf(stderr, "[diag] CPU layer0 ffn_gate dequant[0..9]: ");
+                for (int j = 0; j < 10; ++j) fprintf(stderr, "%f ", layers[i].ffnGate.data[j]);
+                fprintf(stderr, "\n");
+            }
+            if (!layers[i].ffnDown.data.empty()) {
+                fprintf(stderr, "[diag] CPU layer0 ffn_down dequant[0..9]: ");
+                for (int j = 0; j < 10; ++j) fprintf(stderr, "%f ", layers[i].ffnDown.data[j]);
+                fprintf(stderr, "\n");
+            }
+        }
     }
 
     fprintf(stderr, "[cpu-ref] model loaded successfully\n");
@@ -379,6 +396,11 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
             normed[d] = hidden[d] * invRms * l.attnNorm.data[d];
         }
 
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 attn_norm[0..3]: %f %f %f %f\n",
+                normed[0], normed[1], normed[2], normed[3]);
+        }
+
         // Q GEMM: out[col] = sum_k normed[k] * W[k*dim + col]
         std::vector<float> q(dim);
         for (uint32_t col = 0; col < dim; ++col) {
@@ -408,6 +430,12 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
                 acc += normed[kk] * l.attnV.data[kk * kvDim + col];
             }
             v[col] = acc;
+        }
+
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 q[0..3]: %f %f %f %f\n", q[0], q[1], q[2], q[3]);
+            fprintf(stderr, "[cpu-diag] layer0 k[0..3]: %f %f %f %f\n", k[0], k[1], k[2], k[3]);
+            fprintf(stderr, "[cpu-diag] layer0 v[0..3]: %f %f %f %f\n", v[0], v[1], v[2], v[3]);
         }
 
         // RoPE (position = 0, so angle = 0 → no rotation)
@@ -473,9 +501,19 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
             mlpOut[col] = acc;
         }
 
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 attn proj out[0..3]: %f %f %f %f\n",
+                mlpOut[0], mlpOut[1], mlpOut[2], mlpOut[3]);
+        }
+
         // Residual add
         for (uint32_t d = 0; d < dim; ++d) {
             hidden[d] += mlpOut[d];
+        }
+
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 hidden after attn residual[0..3]: %f %f %f %f\n",
+                hidden[0], hidden[1], hidden[2], hidden[3]);
         }
 
         // Pre-FFN RMS norm
@@ -488,6 +526,11 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
             normed[d] = hidden[d] * invRms * l.ffnNorm.data[d];
         }
 
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 ffn_norm[0..3]: %f %f %f %f\n",
+                normed[0], normed[1], normed[2], normed[3]);
+        }
+
         // MLP: gate + up → SiLU(gate) * up → down
         std::vector<float> gate(hiddenDim);
         std::vector<float> up(hiddenDim);
@@ -498,11 +541,17 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
                 gAcc += normed[d] * l.ffnGate.data[d * hiddenDim + h];
                 uAcc += normed[d] * l.ffnUp.data[d * hiddenDim + h];
             }
-            float g = gAcc;
-            gate[h] = g / (1.0f + std::exp(-g)) * uAcc;
-        }
+        float g = gAcc;
+        gate[h] = g / (1.0f + std::exp(-g)) * uAcc;
+    }
 
-        // Down projection
+    if (layer == 0) {
+        fprintf(stderr, "[cpu-diag] layer0 silu_gate*up[0..3]: %f %f %f %f\n",
+            gate[0], gate[1], gate[2], gate[3]);
+    }
+
+    // Down projection
+
         std::vector<float> mlpOut2(dim);
         for (uint32_t d = 0; d < dim; ++d) {
             float acc = 0.0f;
@@ -512,10 +561,17 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
             mlpOut2[d] = acc;
         }
 
+        if (layer == 0) {
+            fprintf(stderr, "[cpu-diag] layer0 ffn down out[0..3]: %f %f %f %f\n",
+                mlpOut2[0], mlpOut2[1], mlpOut2[2], mlpOut2[3]);
+        }
+
         // Residual add
         for (uint32_t d = 0; d < dim; ++d) {
             hidden[d] += mlpOut2[d];
         }
+        fprintf(stderr, "[cpu-diag] hidden after layer %u[0..3]: %f %f %f %f\n",
+            layer, hidden[0], hidden[1], hidden[2], hidden[3]);
     }
 
     // Final RMS norm

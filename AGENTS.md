@@ -111,23 +111,36 @@ When the user requests a durable behavior change, record it here or in the relev
 
 - **Root** (`/`): Build system (`CMakeLists.txt`), entry point (`main.cpp`), project-wide instructions, DEEPSEEK_CONTEXT.md (project state document)
 - **`include/`**: Headers owned by corresponding `src/host/` implementations. No child DOX needed.
-  - `rdna4_compression.hpp` — Push constant structs for context compression + KV cache quantize/dequant shaders. Static asserts ≤128B.
+  - `rdna4_compression.hpp` — Push constant structs for context compression + KV cache quantize/dequant shaders. Static asserts ≤128B. Note: `CompressContextPushConstants` currently describes a quantization layout; it must be reconciled with the compaction layout in `compress_context.comp` before host dispatch (see `docs/wiring_plan.md`).
+  - `rdna4_turboquant.hpp` — Host-side block layouts for TQ4_128, TQ3_128, TQ6_64 plus packed-size helpers. Static asserts block sizes.
+  - `rdna4_types.hpp` — Host push constant structs for all shaders, including `DequantTurboPushConstants` (40B) and `GemmTurboPushConstants` (56B).
+- **`docs/`**: Design and integration documentation. Owned by root.
+  - `wiring_plan.md` — Implementation plan for wiring TurboQuant and context/KV compression assets into the engine.
+  - `turboquant_integration.md` — TurboQuant block layouts, bit-packing diagrams, and 5-step engine wiring checklist.
+  - `turboquant_formats.md` — TurboQuant format variants and comparison table.
+  - `turboquant_schema.json` — JSON schema for TurboQuant configuration.
 - **`src/host/`**: Inference engine, scheduler, allocator, KV cache, weight uploader, tokenizer, profiler, pipeline builder, mailbox
   - `inference_engine.cpp` — main inference loop, GPU sampling, CPU fallback, `forwardKernelEntry()` (one-dispatch persistent kernel), `initWeightBuffer()`, `initLayerParams()`, `initKernelEntryBuffers()`
   - `scheduler.cpp` — Vulkan queue submission, fence handling, cleanup lifecycle
-- **`src/kernels/`**: 18 GLSL compute shaders compiled to SPIR-V via glslc. No child DOX needed.
+- **`src/kernels/`**: GLSL compute shaders compiled to SPIR-V via glslc. No child DOX needed.
   - `silu_mul.comp` — Elementwise SiLU(gate) * up for MLP. 256 threads, dispatched over hiddenDim.
   - `mlp_fused_gateup.comp` — Fused MLP shader. Now unused in `forwardPartial()` (replaced by silu_mul + gemm sequence) due to algorithmic overwork bug (~45B FMAs/layer). Retained for potential `kernel_entry.comp` use or future fused rewrite.
   - `kv_cache_dequant.comp` — General-purpose dequant (bits=4,5,6,8, blockSize=64/128).
   - `kernel_entry.comp` — persistent mailbox-polling kernel. Single dispatch executes all layers (embed → N×transformer → output norm → logits+argmax). No host round-trips between layers.
-- **`tools/`**: Python weight converter, GGUF inspector, RAG tool, DOX lint. Owned separately.
+  - `dequant_turbo.comp` — Standalone TurboQuant dequant (TQ4/TQ6 implemented, TQ3 stubbed).
+  - `gemm_turbo.comp` — Fused GEMM over TurboQuant weights (TQ4/TQ6 implemented).
+- **`tools/`**: Python weight converter, GGUF inspector, RAG tool, DOX lint, TurboQuant utilities. Owned separately.
   - `dox_lint.py` — AGENTS.md compliance checker, push constant size validator, shader SPIR-V presence checker.
   - `graphify_client.py` — Python GraphifyClient for subprocess-based knowledge graph queries.
   - `benchmark_compression.py` — KV cache + context compression benchmark tool.
+  - `validate_turboquant.py` — Synthetic and optional real-model TurboQuant accuracy validation.
+  - `benchmark_turboquant.py` — Per-tensor and summary benchmarking against Q8_0 baseline.
+  - `convert_gguf_to_turboquant.py` — Standalone GGUF-derived binary → TurboQuant converter.
 - **`reference/`**: Vulkan SDK reference files. Read-only.
 - **`graphify-out/`**: Knowledge graph outputs (auto-generated, not edited directly).
 - **`test_inference.cpp`**: Test harness — loads model, runs GPU forward + CPU reference, compares logits. Includes crash handler, 2-min timeout, NaN/Inf detection.
 - **`test/test_compression.cpp`**: Compile-time test for compression push constants, config defaults, scheduler logic.
+- **`test/test_turboquant.cpp`**: Compile-time test for TurboQuant block sizes, packed-size helpers, and push constant size guards.
 - **`cpu_reference.cpp`**: CPU reference forward pass for validation. Supports F32/F16/Q6_K/Q8_0/Q4_0 dequant.
 - **`build/`**: CMake build output. Not checked in.
 
@@ -141,13 +154,50 @@ When the user requests a durable behavior change, record it here or in the relev
 - `kernel_entry.comp`: MailboxRef is `coherent`. Spin-wait loop calls `memoryBarrierBuffer()` before reading `tokenReady`. `computeLogitsAndSample()` writes logits to scratch (after V region) and does argmax reduction over subgroup to produce the next token. Output norm uses `pc.addrOutputNorm` (push constant), not the last layer's attnNorm.
 - `inference_engine.cpp`: Ring allocator calls checked for zero (overflow). CPU fallback guards `cpuLogits` null before `sampleArgmax`. `forwardPartial()` uses `allocator->reset()` at start, allocates hidden→Q→K→V→attnOut→mlpOut→logits→sampleOut then later allocates `sampleScratch` (vocabSize floats) for topk scratch. Records `lastLogitsAddr`/`lastLogitsOffset` after successful forward for external readback. `cleanup()` releases dequant/embed resources; must be called before `ctx.cleanup()`.
 - `test_inference.cpp`: Reads GPU logits from `engine.lastLogitsOffset` instead of recomputing offsets. `vkInvalidateMappedMemoryRanges` uses exact size (not `VK_WHOLE_SIZE`) for readback. GPU forward runs via `std::async` with 120s timeout. Uses `forwardPartial` path (kernel_entry path not used in test_inference — test needs ring allocator readback).
+- `forwardPartial()` pipeline barriers: inside each transformer layer the batched command buffer must contain explicit `barrierBetweenGroups()` at these producer→consumer handoffs: (1) after the attention RMS-norm write before Q/K/V GEMM reads, (2) after the attention output-projection GEMM write before the residual `add` reads it, (3) after the FFN down-projection GEMM write before the residual `add` reads it. Missing any barrier causes visible GPU/CPU hidden-state divergence.
 - Dequant dispatches are capped at 1M workgroups per dispatch (chunking). The dequant staging buffer is sized for all 9 dequantized weights in one layer (attn_norm + Q + K + V + O + ffn_norm + up + gate + down), capped at 512 MB. Embedding cache is persistent DEVICE_LOCAL — do not re-dequantize per token. `forwardPartial` refactored for Round 4: Phase 1 dequants all weights async with one sync; Phase 2 runs the full layer (attention + FFN) in a single batch submit with pipeline barriers. 2 syncs per layer (~72 for 36 layers).
 
 ### Verification
 
 - Build: `cd build && cmake --build . --config Release`
 - Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
-- Runtime: `rdna4_llama.exe` must not crash (VK_ERROR_DEVICE_LOST or 0xC0000005)
+- Runtime: `rdna4_llama.exe` must not crash (VK_ERROR_DEVICE_LOST or 0xC0000005).
+- Parity: `test_inference.exe` on the F32 `stories260K` model must match the CPU reference: GPU argmax token equals CPU token and per-layer hidden-state max absolute diff < 0.01.
+
+## Changes (2026-06-28 MiMo Round 2 + 3 — TurboQuant host-side deliverables)
+
+### MiMo Round 2 Deliverables
+
+**D1 — `include/rdna4_turboquant.hpp`**: Host-side block layouts for TQ4_128 (66B), TQ3_128 (50B), TQ6_64 (50B), plus `TQBlockHeader` and packed-size helpers. Static asserts verify sizes. One-line `// MiMo Round 2 — host-side TurboQuant block layouts` comment at top.
+
+**D2 — `include/rdna4_types.hpp`**: Appended `DequantTurboPushConstants` (40B) and `GemmTurboPushConstants` (56B) matching the layouts in `src/kernels/dequant_turbo.comp` and `src/kernels/gemm_turbo.comp`. Both under 128B with `static_assert`.
+
+**D3 — `tools/weight_converter.py`**: Appended `convert_to_tq4`, `convert_to_tq3`, `convert_to_tq6` (accept float32 array + uint16 fp16 scale) plus `dequant_tq4/tq3/tq6` helpers. Packing follows shader bit layouts: TQ4 low-nibble-first, TQ3 sequential 3-bit stream, TQ6 sequential 6-bit stream. Added `--tq-test` CLI comment placeholder.
+
+**D4 — `tools/validate_turboquant.py`**: Standalone validation script. Tests synthetic distributions (uniform, normal, sin, sparse) and optional real model weights. Prints comparison table and exits 0 if all MSE < 0.01.
+
+### MiMo Round 3 Deliverables
+
+**D1 — `tools/benchmark_turboquant.py`**: Loads a `weight_converter.py` output directory (`.weights.json` + `.bin`), quantizes each tensor to TQ4_128/TQ3_128/TQ6_64, dequantizes back, prints per-layer and summary tables. Supports `--model`, `--compare-gguf`, `--output`.
+
+**D2 — `tools/convert_gguf_to_turboquant.py`**: Standalone CLI that reads a GGUF-derived `.bin` + `.json` and emits `<model>_<format>.weights.bin` + `.json` with TQ metadata and `tensor_offsets`/`block_layout` sections.
+
+**D3 — `test/test_turboquant.cpp`**: Compile-time test including `static_assert`s for block sizes, packed-size helper asserts, and push constant size checks. Size assertions reflect actual shader scalar layouts (40B and 56B).
+
+**D4 — `docs/turboquant_integration.md`**: Integration guide with block layout byte diagrams, bit-packing diagrams, 5-step engine wiring checklist, performance targets, and files-modified list.
+
+### Guardrails respected
+- No existing engine/scheduler/main.cpp files modified.
+- No existing `QuantFormat` enum values changed.
+- No pre-dequantization of entire tensors or >1 GB buffers.
+- `CMakeLists.txt` updated only to add `dequant_turbo.comp` and `gemm_turbo.comp` to `KERNELS`.
+- 7 new files created, 3 existing files appended (`include/rdna4_types.hpp`, `tools/weight_converter.py`, `CMakeLists.txt`).
+
+## Changes (2026-06-28 — forwardPartial GPU/CPU parity fix + debug cleanup)
+
+- **`src/host/inference_engine.cpp`**: Added the three required `barrierBetweenGroups()` calls inside each transformer layer (after attention RMS-norm, after attention output-projection, after FFN down-projection) to eliminate GPU/CPU hidden-state divergence. Removed temporary per-layer and layer-0 debug capture buffers/copies/readback (`layerDebug*`, `captureLayer0`, `layer0Debug*`).
+- **`include/rdna4_engine.hpp`**: Removed `layerDebug*` debug buffer members.
+- **`AGENTS.md`**: Documented the `forwardPartial()` pipeline-barrier contract and added the F32 parity verification step.
 
 ## Changes (2026-06-28 Round 4 — Batched forwardPartial: 2 syncs/layer, all-weights-before-compute)
 

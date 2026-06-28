@@ -15,6 +15,7 @@ class GGMLType(IntEnum):
     Q8_1 = 9; Q2_K = 10; Q3_K = 11; Q4_K = 12; Q5_K = 13; Q6_K = 14; Q8_K = 15
     IQ2_XXS = 16; IQ2_XS = 17; IQ3_XXS = 18; IQ1_S = 19; IQ4_NL = 20; IQ3_S = 21
     IQ2_S = 22; IQ4_XS = 23; I8 = 24; I16 = 25; I32 = 26; I64 = 27; F64 = 28
+    IQ1_M = 29; BF16 = 30; TQ1_0 = 34; TQ2_0 = 35
 
 @dataclass
 class TensorInfo:
@@ -51,7 +52,8 @@ class GGUFLoader:
         GGMLType.IQ4_NL: 256, GGMLType.IQ3_S: 256,
         GGMLType.IQ2_S: 256, GGMLType.IQ4_XS: 256,
         GGMLType.I8: 1, GGMLType.I16: 2, GGMLType.I32: 4, GGMLType.I64: 8,
-        GGMLType.F64: 8,
+        GGMLType.F64: 8, GGMLType.BF16: 2,
+        GGMLType.IQ1_M: 256, GGMLType.TQ1_0: 256, GGMLType.TQ2_0: 256,
     }
 
     TYPE_BLOCK_ELEMENTS = {
@@ -67,7 +69,8 @@ class GGUFLoader:
         GGMLType.IQ4_NL: 256, GGMLType.IQ3_S: 256,
         GGMLType.IQ2_S: 256, GGMLType.IQ4_XS: 256,
         GGMLType.I8: 1, GGMLType.I16: 1, GGMLType.I32: 1, GGMLType.I64: 1,
-        GGMLType.F64: 1,
+        GGMLType.F64: 1, GGMLType.BF16: 1,
+        GGMLType.IQ1_M: 256, GGMLType.TQ1_0: 256, GGMLType.TQ2_0: 256,
     }
 
     def __init__(self, path: str):

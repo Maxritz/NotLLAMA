@@ -26,6 +26,7 @@ public:
     VkBuffer dequantBuffer = VK_NULL_HANDLE;
     VkDeviceMemory dequantMemory = VK_NULL_HANDLE;
     VkDeviceAddress dequantAddr = 0;
+    VkDeviceAddress dequantBufEnd = 0;
     size_t dequantCapacity = 0;
 
     // Persistent embedding cache (dequantized once, reused across all tokens)

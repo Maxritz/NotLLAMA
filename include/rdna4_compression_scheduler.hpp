@@ -2,6 +2,7 @@
 #include "rdna4_compression.hpp"
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 
 namespace rdna4 {
 

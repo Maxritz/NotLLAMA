@@ -79,5 +79,21 @@ Shaders are owned by the kernel pipeline. Host-side dispatch logic lives in `src
 - **Block layout**: Matches kv_cache_quantize.comp exactly — each uint holds 4 bytes × 2 nibbles = 8 elements
 - **Notes**: Must be dispatched before attention.comp if KV cache is quantized. One thread per element.
 
+## TurboQuant Shaders
+
+### dequant_turbo.comp
+- **Purpose**: Standalone dequantization of TurboQuant weights to F16.
+- **Input**: Packed TQ weights (uint[] bytes)
+- **Output**: F16 dequantized weights
+- **Block layout**: `[scale: uint16_t fp16][packed_weights]`. TQ4 = 66B/128 elements, TQ6 = 50B/64 elements.
+- **Notes**: TQ4 and TQ6 implemented; TQ3 is stubbed. Push constants match `rdna4_types.hpp::DequantTurboPushConstants`.
+
+### gemm_turbo.comp
+- **Purpose**: Fused GEMM over TurboQuant weights.
+- **Input**: F16 activations (M × K), packed TQ weights (K × N)
+- **Output**: F16 result (M × N)
+- **Block layout**: Same d-first TQ block layout as `dequant_turbo.comp`.
+- **Notes**: Tile size 32×4, shared activation tile. Push constants match `rdna4_types.hpp::GemmTurboPushConstants`.
+
 ## Child DOX Index
 - None (leaf directory)

@@ -135,26 +135,21 @@ bool InferenceEngine::initDequantBuffer() {
     // The staging buffer must hold ALL dequantized weights for one full layer
     // simultaneously: attn_norm + Q + K + V + O + ffn_norm + up + gate + down.
     // This enables batched dequant (one sync) before any compute dispatches.
-    size_t maxAttnSet = 0;
-    size_t maxFfnSet = 0;
+    size_t maxLayerSet = 0;
     for (uint32_t layer = 0; layer < model->blockCount; ++layer) {
         std::string prefix = "blk." + std::to_string(layer);
-        size_t attnTotal = 0;
-        attnTotal += getF16OutputSize(*model, prefix + ".attn_norm.weight");
-        attnTotal += getF16OutputSize(*model, prefix + ".attn_q.weight");
-        attnTotal += getF16OutputSize(*model, prefix + ".attn_k.weight");
-        attnTotal += getF16OutputSize(*model, prefix + ".attn_v.weight");
-        attnTotal += getF16OutputSize(*model, prefix + ".attn_output.weight");
-        if (attnTotal > maxAttnSet) maxAttnSet = attnTotal;
-
-        size_t ffnTotal = 0;
-        ffnTotal += getF16OutputSize(*model, prefix + ".ffn_norm.weight");
-        ffnTotal += getF16OutputSize(*model, prefix + ".ffn_up.weight");
-        ffnTotal += getF16OutputSize(*model, prefix + ".ffn_gate.weight");
-        ffnTotal += getF16OutputSize(*model, prefix + ".ffn_down.weight");
-        if (ffnTotal > maxFfnSet) maxFfnSet = ffnTotal;
+        size_t total = 0;
+        total += getF16OutputSize(*model, prefix + ".attn_norm.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_q.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_k.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_v.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_output.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_norm.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_up.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_gate.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_down.weight");
+        if (total > maxLayerSet) maxLayerSet = total;
     }
-    size_t maxLayerSet = std::max(maxAttnSet, maxFfnSet);
 
     size_t maxSize = maxLayerSet;
     if (maxSize == 0) maxSize = 16 * 1024 * 1024;
@@ -221,10 +216,8 @@ bool InferenceEngine::initDequantBuffer() {
     addrInfo.buffer = dequantBuffer;
     dequantAddr = vkGetBufferDeviceAddress(ctx->device, &addrInfo);
 
-    dequantBufEnd = dequantAddr + maxSize;
-    fprintf(stderr, "[dequant] staging buffer: %zu MB @ 0x%llx..0x%llx memType=%u props=0x%x\n",
+    fprintf(stderr, "[dequant] staging buffer: %zu MB @ 0x%llx memType=%u props=0x%x\n",
             maxSize / 1024 / 1024, (unsigned long long)dequantAddr,
-            (unsigned long long)dequantBufEnd,
             memTypeIndex, memProps.memoryTypes[memTypeIndex].propertyFlags);
     return true;
 }
@@ -235,7 +228,6 @@ void InferenceEngine::cleanupDequantBuffer() {
     dequantBuffer = VK_NULL_HANDLE;
     dequantMemory = VK_NULL_HANDLE;
     dequantAddr = 0;
-    dequantBufEnd = 0;
 }
 
 bool InferenceEngine::initEmbedCache() {
@@ -783,26 +775,15 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
         scheduler->beginBatch(0);
 
         // === Attention Dequant ===
-        // Each tensor gets a NON-OVERLAPPING region of the dequant buffer.
-        // Layout: attn_norm | Q | K | V | O
-        size_t attnNormSize = getF16OutputSize(*model, prefix + ".attn_norm.weight");
         size_t qSize = (size_t)dim * dim * sizeof(float);
         size_t kSize = (size_t)(headDim * model->headCountKv) * dim * sizeof(float);
         size_t vSize = kSize;
-        size_t oSize = getF16OutputSize(*model, prefix + ".attn_output.weight");
 
-        size_t attnOffNorm = 0;
-        size_t attnOffQ     = attnOffNorm + attnNormSize;
-        size_t attnOffK     = attnOffQ + qSize;
-        size_t attnOffV     = attnOffK + kSize;
-        size_t attnOffO     = attnOffV + vSize;
-
-        uint64_t addrAttnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", attnOffNorm, false);
-        uint64_t addrQW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", attnOffQ, false);
-        uint64_t addrKW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", attnOffK, false);
-        uint64_t addrVW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", attnOffV, false);
-        uint64_t addrOW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", attnOffO, false);
-        scheduler->syncAll();
+        uint64_t addrAttnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", 0);
+        uint64_t addrQW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", 0);
+        uint64_t addrKW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", qSize);
+        uint64_t addrVW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", qSize + kSize);
+        uint64_t addrOW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", qSize + kSize + vSize);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -880,34 +861,21 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 
         // === FFN Dequant ===
-        // Layout: ffn_norm | up | gate | down
+        uint64_t addrFfnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", 0);
         size_t upSize = getF16OutputSize(*model, prefix + ".ffn_up.weight");
         size_t gateSize = getF16OutputSize(*model, prefix + ".ffn_gate.weight");
-        size_t downSize = getF16OutputSize(*model, prefix + ".ffn_down.weight");
-        size_t ffnNormSize = getF16OutputSize(*model, prefix + ".ffn_norm.weight");
 
-        size_t ffnOffNorm = 0;
-        size_t ffnOffUp   = ffnOffNorm + ffnNormSize;
-        size_t ffnOffGate = ffnOffUp + upSize;
-        size_t ffnOffDown = ffnOffGate + gateSize;
-
-        uint64_t addrFfnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", ffnOffNorm);
-        uint64_t addrUpW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", ffnOffUp);
-        uint64_t addrGateW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", ffnOffGate);
-        uint64_t addrDownW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", ffnOffDown);
+        uint64_t addrUpW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", 0);
+        uint64_t addrGateW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", upSize);
+        uint64_t addrDownW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", upSize + gateSize);
 
         if (layer == 0) {
-            fprintf(stderr, "[diag] L0 attn dequant: norm@0x%llx(off=%zu) Q@0x%llx(off=%zu) K@0x%llx(off=%zu) V@0x%llx(off=%zu) O@0x%llx(off=%zu)\n",
-                (unsigned long long)addrAttnNorm_dq, attnOffNorm,
-                (unsigned long long)addrQW_dq, attnOffQ,
-                (unsigned long long)addrKW_dq, attnOffK,
-                (unsigned long long)addrVW_dq, attnOffV,
-                (unsigned long long)addrOW_dq, attnOffO);
-            fprintf(stderr, "[diag] L0 ffn   dequant: norm@0x%llx(off=%zu) up@0x%llx(off=%zu) gate@0x%llx(off=%zu) down@0x%llx(off=%zu)\n",
-                (unsigned long long)addrFfnNorm_dq, ffnOffNorm,
-                (unsigned long long)addrUpW_dq, ffnOffUp,
-                (unsigned long long)addrGateW_dq, ffnOffGate,
-                (unsigned long long)addrDownW_dq, ffnOffDown);
+            const TensorDesc* t = findTensor(*model, prefix + ".ffn_down.weight");
+            fprintf(stderr, "[diag] addrDownW_dq=0x%llx tensorGpuAddr=0x%llx format=%d binOffset=%zu\n",
+                (unsigned long long)addrDownW_dq,
+                t ? (unsigned long long)t->gpuAddress : 0ULL,
+                t ? (int)t->format : -1,
+                t ? t->binOffset : 0);
         }
 
         scheduler->barrierBetweenGroups(
@@ -978,10 +946,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
     scheduler->beginBatch(0);
     uint64_t addrOutNorm = findTensorAddr(*model, "output_norm.weight");
     if (!addrOutNorm) addrOutNorm = findTensorAddr(*model, "norm.weight");
-    size_t outNormSize = getF16OutputSize(*model, "output_norm.weight");
-    size_t finalOffNorm = 0;
-
-    uint64_t addrOutNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", finalOffNorm);
+    uint64_t addrOutNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", 0);
 
     scheduler->barrierBetweenGroups(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -995,18 +960,17 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    size_t finalOffLMHead = finalOffNorm + outNormSize;
     uint64_t addrLMHead = findTensorAddr(*model, "output.weight");
     uint64_t addrLMHead_dq = 0;
     uint32_t lmTransB = 0;
     if (addrLMHead) {
-        addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight", finalOffLMHead);
+        addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight", 0);
     } else {
         addrLMHead = findTensorAddr(*model, "token_embd.weight");
         if (embedCacheReady) {
             addrLMHead_dq = embedCacheAddr;
         } else {
-            addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", finalOffLMHead);
+            addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", 0);
         }
         lmTransB = 1;
     }
