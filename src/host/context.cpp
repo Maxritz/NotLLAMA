@@ -66,11 +66,13 @@ bool VulkanContext::init() {
 
     // Pass 1: prefer compute-only queue family (no graphics bit) with >= 4 queues
     for (uint32_t i = 0; i < qfCount; ++i) {
-        if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
-            !(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-            qfProps[i].queueCount >= 4) {
+        bool hasCompute = !!(qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT);
+        bool hasGraphics = !!(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+        if (hasCompute && !hasGraphics && qfProps[i].queueCount >= 4) {
             queueFamilyIndex = i;
-            std::cout << "Queue family " << i << " (COMPUTE-ONLY) has " << qfProps[i].queueCount << " queues (using 4)\n";
+            std::cout << "[Router] SELECTED family " << i << ": COMPUTE-ONLY (no graphics), "
+                      << qfProps[i].queueCount << " queues, flags=0x" << std::hex << qfProps[i].queueFlags
+                      << std::dec << "\n";
             break;
         }
     }
@@ -81,8 +83,8 @@ bool VulkanContext::init() {
             if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
                 !(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
                 queueFamilyIndex = i;
-                std::cout << "Queue family " << i << " (COMPUTE-ONLY fallback) has " << qfProps[i].queueCount
-                          << " queues (using min(4, available))\n";
+                std::cout << "[Router] SELECTED family " << i << ": COMPUTE-ONLY (fewer queues), flags=0x"
+                          << std::hex << qfProps[i].queueFlags << std::dec << "\n";
                 break;
             }
         }
@@ -93,8 +95,9 @@ bool VulkanContext::init() {
         for (uint32_t i = 0; i < qfCount; ++i) {
             if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qfProps[i].queueCount >= 4) {
                 queueFamilyIndex = i;
-                std::cout << "Queue family " << i << " (GRAPHICS+COMPUTE) has " << qfProps[i].queueCount
-                          << " queues (using 4)\n";
+                std::cout << "[Router] WARNING: family " << i << " has GRAPHICS+COMPUTE, flags=0x"
+                          << std::hex << qfProps[i].queueFlags << std::dec
+                          << " — will route to 3D engine, not Compute_0!\n";
                 break;
             }
         }
@@ -105,8 +108,9 @@ bool VulkanContext::init() {
         for (uint32_t i = 0; i < qfCount; ++i) {
             if (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
                 queueFamilyIndex = i;
-                std::cout << "Queue family " << i << " has " << qfProps[i].queueCount
-                          << " queues (fallback, using min(4, available))\n";
+                std::cout << "[Router] WARNING: family " << i << " fallback, flags=0x"
+                          << std::hex << qfProps[i].queueFlags << std::dec
+                          << " — may route to 3D engine!\n";
                 break;
             }
         }
@@ -117,13 +121,14 @@ bool VulkanContext::init() {
         return false;
     }
 
-    uint32_t queueCount = std::min(1u, qfProps[queueFamilyIndex].queueCount);
+    uint32_t queueCount = std::min(4u, qfProps[queueFamilyIndex].queueCount);
     float priorities[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qInfo = {};
     qInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     qInfo.queueFamilyIndex = queueFamilyIndex;
     qInfo.queueCount = queueCount;
     qInfo.pQueuePriorities = priorities;
+    std::cout << "Requesting " << queueCount << " queues from family " << queueFamilyIndex << "\n";
 
     // Enumerate device extensions and check for cooperative matrix
     uint32_t extCount = 0;
@@ -218,6 +223,8 @@ bool VulkanContext::init() {
 
     for (uint32_t i = 0; i < queueCount; ++i) {
         vkGetDeviceQueue(device, queueFamilyIndex, i, &queues[i]);
+        std::cout << "[Router] Queue[" << i << "] handle=" << (void*)queues[i]
+                  << " from family " << queueFamilyIndex << "\n";
     }
     for (uint32_t i = queueCount; i < 4; ++i) {
         queues[i] = queues[0];  // Duplicate if fewer than 4 queues
