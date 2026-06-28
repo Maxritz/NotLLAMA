@@ -100,6 +100,147 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
 
             result[i] = delta * ((float)nibble - 8.0f);
         }
+    } else if (format == QuantFormat::Q4_1) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 20;
+            float delta = readF16(data, bs);
+            float deltaMin = readF16(data, bs + 2);
+            uint8_t bval = data[bs + 4 + (eleInBlock / 2)];
+            uint32_t nibble = (eleInBlock % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            result[i] = delta * (float)nibble + deltaMin;
+        }
+    } else if (format == QuantFormat::Q5_0) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 22;
+            float delta = readF16(data, bs);
+            uint32_t byteIdx = bs + 2 + (eleInBlock * 5 / 8);
+            uint8_t bval = data[byteIdx];
+            uint32_t shift = (eleInBlock * 5) % 8;
+            uint32_t q5 = (bval >> shift) & 0x1F;
+            if (q5 > 15) q5 |= 0xE0;
+            result[i] = delta * ((float)(int)q5 - 16.0f);
+        }
+    } else if (format == QuantFormat::Q5_1) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 24;
+            float delta = readF16(data, bs);
+            float deltaMin = readF16(data, bs + 2);
+            uint32_t byteIdx = bs + 4 + (eleInBlock * 5 / 8);
+            uint8_t bval = data[byteIdx];
+            uint32_t shift = (eleInBlock * 5) % 8;
+            uint32_t q5 = (bval >> shift) & 0x1F;
+            result[i] = delta * (float)q5 + deltaMin;
+        }
+    } else if (format == QuantFormat::Q8_1) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 36;
+            float delta = readF16(data, bs);
+            float deltaMin = readF16(data, bs + 2);
+            int q = (int8_t)data[bs + 4 + eleInBlock];
+            result[i] = delta * (float)q + deltaMin;
+        }
+    } else if (format == QuantFormat::Q2_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 80;
+            float d = readF16(data, bs);
+            float dmin = readF16(data, bs + 2);
+            uint32_t subBlock = eleInBlock / 64;
+            uint32_t subEle = eleInBlock % 64;
+            uint8_t sc = data[bs + 4 + subBlock];
+            uint32_t byteIdx = bs + 8 + subBlock * 16 + subEle / 4;
+            uint8_t bval = data[byteIdx];
+            uint32_t shift = (subEle % 4) * 2;
+            uint32_t q2 = (bval >> shift) & 3;
+            result[i] = d * (float)sc * (float)(int)q2 + dmin;
+        }
+    } else if (format == QuantFormat::Q3_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 112;
+            float d = readF16(data, bs);
+            float dmin = readF16(data, bs + 2);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            uint32_t scIdx = bs + 4 + subBlock;
+            uint8_t sc = data[scIdx];
+            uint32_t byteIdx = bs + 12 + subBlock * 24 + subEle / 2;
+            uint8_t bval = data[byteIdx];
+            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            result[i] = d * (float)(int8_t)sc * (float)(int)(nibble - 8) - dmin;
+        }
+    } else if (format == QuantFormat::Q4_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 144;
+            float d = readF16(data, bs);
+            float dmin = fp16ToFloat(*(uint16_t*)(data + bs + 2));
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            uint32_t scOffset = bs + 132 + subBlock * 2;
+            float sc = readF16(data, scOffset);
+            uint32_t byteIdx = bs + 4 + subBlock * 16 + subEle / 2;
+            uint8_t bval = data[byteIdx];
+            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            uint32_t hiByte = 0;
+            if (subBlock < 4) {
+                uint32_t hiByteIdx = bs + 4 + 64 + subBlock * 8 + subEle / 2;
+                hiByte = data[hiByteIdx];
+                uint32_t hiNibble = (subEle % 2 == 0) ? (hiByte & 0x0F) : ((hiByte >> 4) & 0x0F);
+                nibble |= hiNibble << 4;
+            }
+            result[i] = sc * ((float)(int)(nibble - 16)) * d - dmin;
+        }
+    } else if (format == QuantFormat::Q5_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 176;
+            float d = readF16(data, bs);
+            float dmin = readF16(data, bs + 2);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            float sc = readF16(data, bs + 164 + subBlock * 2);
+            uint32_t nibble = 0;
+            if (subBlock < 4) {
+                uint32_t byteIdx = bs + 4 + subBlock * 20 + subEle / 2;
+                uint8_t bval = data[byteIdx];
+                uint32_t lo4 = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+                uint32_t hiByteIdx = bs + 4 + 80 + subBlock * 8 + subEle / 2;
+                uint8_t bvalHi = data[hiByteIdx];
+                uint32_t hi4 = (subEle % 2 == 0) ? (bvalHi & 0x0F) : ((bvalHi >> 4) & 0x0F);
+                nibble = lo4 | (hi4 << 4);
+            } else {
+                uint32_t byteIdx = bs + 4 + 112 + subEle / 2;
+                uint8_t bval = data[byteIdx];
+                nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            }
+            if (nibble >= 16) nibble |= 0xFFF0;
+            result[i] = sc * (float)(int)nibble * d - dmin;
+        }
+    } else if (format == QuantFormat::Q8_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 290;
+            float d = readF16(data, bs);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            int sc = (int8_t)data[bs + 2 + subBlock];
+            int q = (int8_t)data[bs + 10 + subBlock * 32 + subEle];
+            result[i] = d * (float)sc * (float)q;
+        }
     }
 
     return result;
@@ -162,6 +303,21 @@ bool CpuReference::load(const std::string& jsonPath, const std::string& binPath)
     };
 
     loadTensor(tokenEmbD, "token_embd.weight");
+    loadTensor(outputWeight, "output.weight");
+    if (outputWeight.data.empty()) {
+        fprintf(stderr, "[cpu-ref] output.weight not found, falling back to token_embd.weight (weight tying)\n");
+        // token_embd.weight is shape [vocabSize, dim] row-major.
+        // The LM head expects shape [dim, vocabSize] row-major.
+        // Transpose: outputWeight[k * vocabSize + col] = tokenEmbD[col * dim + k]
+        uint32_t vs = desc.vocabSize;
+        uint32_t d = desc.embeddingLength;
+        outputWeight.data.resize((size_t)d * vs);
+        for (uint32_t k = 0; k < d; ++k) {
+            for (uint32_t col = 0; col < vs; ++col) {
+                outputWeight.data[(size_t)k * vs + col] = tokenEmbD.data[(size_t)col * d + k];
+            }
+        }
+    }
     loadTensor(outputNorm, "output_norm.weight");
     if (outputNorm.data.empty()) {
         loadTensor(outputNorm, "norm.weight");
@@ -367,12 +523,13 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
         normed[d] = hidden[d] * invRms * outputNorm.data[d];
     }
 
-    // LM head GEMM (transB=1): logits[col] = sum_k normed[k] * W[col*dim + k]
+    // LM head GEMM: output.weight is shape [dim, vocabSize], row-major
+    // logits[col] = sum_k normed[k] * W[k * vocabSize + col]
     std::vector<float> logits(vocabSize);
     for (uint32_t col = 0; col < vocabSize; ++col) {
         float acc = 0.0f;
         for (uint32_t k = 0; k < dim; ++k) {
-            acc += normed[k] * tokenEmbD.data[col * dim + k];
+            acc += normed[k] * outputWeight.data[k * vocabSize + col];
         }
         logits[col] = acc;
     }

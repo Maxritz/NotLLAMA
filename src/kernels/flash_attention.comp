@@ -11,11 +11,16 @@
 // Flash Attention — tiled, RDNA4-friendly.
 // Each thread handles hd/32 elements of each Q/K/V row.
 // Online softmax over K/V tiles of size Bc=32.
+// MAX_HEAD_DIM=256 keeps per-thread arrays at 8 elements (256/32).
+// Models with larger headDim will be rejected at runtime.
+
+#define MAX_HEAD_DIM 256u
+#define MAX_HD_PER_THREAD (MAX_HEAD_DIM / 32u)
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KCacheRef {
     float16_t data[];
@@ -48,7 +53,6 @@ void main() {
     uint sl = pc.seqLen;
     uint qStart = pc.qRowStart;
     uint kvTile = pc.kvTileSize;
-    uint hdPerThread = hd / 32;
 
     QRef Q = QRef(pc.addrQ);
     KCacheRef K = KCacheRef(pc.addrKCache);
@@ -57,16 +61,20 @@ void main() {
 
     uint qRow = qStart + tid;
     if (qRow >= sl) return;
+    if (hd > MAX_HEAD_DIM) return;
+
+    uint hdPerThread = max(hd / 32u, 1u);
 
     // Each thread owns hdPerThread elements of the Q row
     uint qBase = qRow * hd;
-    float myQ[8];
+    float myQ[MAX_HD_PER_THREAD];
     for (uint d = 0; d < hdPerThread; ++d) {
-        myQ[d] = float(Q.data[qBase + tid * hdPerThread + d]);
+        uint idx = tid * hdPerThread + d;
+        myQ[d] = (idx < hd) ? float(Q.data[qBase + idx]) : 0.0;
     }
 
     // Per-thread accumulator and softmax state
-    float myAcc[8];
+    float myAcc[MAX_HD_PER_THREAD];
     for (uint d = 0; d < hdPerThread; ++d) myAcc[d] = 0.0;
     float m = -1e30;
     float l = 0.0;
@@ -85,7 +93,9 @@ void main() {
             // Each thread computes partial dot for its hdPerThread slice
             float partialDot = 0.0;
             for (uint d = 0; d < hdPerThread; ++d) {
-                partialDot += myQ[d] * float(K.data[kBase + tid * hdPerThread + d]);
+                uint idx = tid * hdPerThread + d;
+                if (idx >= hd) break;
+                partialDot += myQ[d] * float(K.data[kBase + idx]);
             }
 
             // Reduce: thread 0 sums all 32 partials via shared memory
@@ -107,7 +117,9 @@ void main() {
 
             // Update accumulator
             for (uint d = 0; d < hdPerThread; ++d) {
-                myAcc[d] = myAcc[d] * expScale + p * float(V.data[kBase + tid * hdPerThread + d]);
+                uint idx = tid * hdPerThread + d;
+                if (idx >= hd) break;
+                myAcc[d] = myAcc[d] * expScale + p * float(V.data[kBase + idx]);
             }
             l = l * expScale + p;
             m = mNew;
@@ -118,6 +130,8 @@ void main() {
     float invL = 1.0 / l;
     uint outBase = qRow * hd;
     for (uint d = 0; d < hdPerThread; ++d) {
-        Out.data[outBase + tid * hdPerThread + d] = myAcc[d] * invL;
+        uint idx = tid * hdPerThread + d;
+        if (idx >= hd) break;
+        Out.data[outBase + idx] = myAcc[d] * invL;
     }
 }

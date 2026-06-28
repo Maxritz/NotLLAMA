@@ -222,8 +222,8 @@ class GGUFLoader:
                     idx = j * 16 + l
                     if idx >= QK_K:
                         break
-                    q4_low = ql[j * 8 + l]
-                    qh_byte = qh[j * 4 + l // 4]
+                    q4_low = ql[(j * 16 + l) // 2]
+                    qh_byte = qh[(j * 16 + l) // 4]
                     shift = (l % 4) * 2
                     val = ((q4_low & 0xF) | (((qh_byte >> shift) & 3) << 4)) - 32
                     result.append(d * sc * val)

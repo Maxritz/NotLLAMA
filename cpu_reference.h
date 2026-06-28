@@ -6,6 +6,8 @@
 
 namespace rdna4 {
 
+
+
 struct CpuModelDesc {
     uint32_t blockCount;
     uint32_t embeddingLength;
@@ -25,6 +27,7 @@ public:
     CpuModelDesc desc{};
     CpuTensor tokenEmbD;
     CpuTensor outputNorm;
+    CpuTensor outputWeight;
 
     struct Layer {
         CpuTensor attnNorm;

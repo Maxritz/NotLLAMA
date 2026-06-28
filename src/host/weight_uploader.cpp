@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <new>
 
 namespace rdna4 {
 
@@ -15,6 +16,8 @@ static QuantFormat ggmlToQuantFormat(int ggmlType) {
         case 6: return QuantFormat::Q5_0;
         case 7: return QuantFormat::Q5_1;
         case 8: return QuantFormat::Q8_0;
+        case 10: return QuantFormat::Q2_K;
+        case 11: return QuantFormat::Q3_K;
         case 12: return QuantFormat::Q4_K;
         case 13: return QuantFormat::Q5_K;
         case 14: return QuantFormat::Q6_K;
@@ -25,8 +28,17 @@ static QuantFormat ggmlToQuantFormat(int ggmlType) {
 
 ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& binPath) {
     std::ifstream jsonFile(jsonPath);
+    if (!jsonFile.is_open()) {
+        fprintf(stderr, "[uploader] Failed to open JSON: %s\n", jsonPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
     nlohmann::json j;
-    jsonFile >> j;
+    try {
+        jsonFile >> j;
+    } catch (const nlohmann::json::parse_error& e) {
+        fprintf(stderr, "[uploader] JSON parse error: %s\n", e.what()); fflush(stderr);
+        return ModelDesc();
+    }
 
     ModelDesc model;
     auto& m = j["model"];
@@ -44,10 +56,30 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     fflush(stderr);
 
     std::ifstream binFile(binPath, std::ios::binary | std::ios::ate);
-    size_t binSize = binFile.tellg();
+    if (!binFile.is_open()) {
+        fprintf(stderr, "[uploader] Failed to open binary: %s\n", binPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+    std::streampos binEnd = binFile.tellg();
+    if (binEnd <= 0) {
+        fprintf(stderr, "[uploader] Binary file empty: %s\n", binPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+    size_t binSize = static_cast<size_t>(binEnd);
     binFile.seekg(0, std::ios::beg);
-    std::vector<uint8_t> binData(binSize);
+    std::vector<uint8_t> binData;
+    try {
+        binData.resize(binSize);
+    } catch (const std::bad_alloc&) {
+        fprintf(stderr, "[uploader] Out of memory: cannot allocate %zu MB for binary\n",
+                binSize / 1024 / 1024); fflush(stderr);
+        return ModelDesc();
+    }
     binFile.read(reinterpret_cast<char*>(binData.data()), binSize);
+    if (!binFile) {
+        fprintf(stderr, "[uploader] Failed to read %zu bytes from binary\n", binSize); fflush(stderr);
+        return ModelDesc();
+    }
     fprintf(stderr, "[uploader] Binary loaded: %zu MB\n", binSize / 1024 / 1024);
     fflush(stderr);
 
@@ -59,6 +91,11 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     }
     fprintf(stderr, "[uploader] Max tensor: %zu MB\n", (size_t)(maxTensorSize / 1024 / 1024));
     fflush(stderr);
+
+    if (maxTensorSize == 0) {
+        fprintf(stderr, "[uploader] No tensors found in JSON\n"); fflush(stderr);
+        return ModelDesc();
+    }
 
     VkBufferCreateInfo stagingInfo = {};
     stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -112,7 +149,7 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     VkCommandPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = queueFamilyIndex;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VkCommandPool uploadPool;
     vkCreateCommandPool(device, &poolInfo, nullptr, &uploadPool);
 
@@ -182,31 +219,44 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         copyRegion.size = desc.binSize;
         vkCmdCopyBuffer(uploadCmd, staging, desc.buffer, 1, &copyRegion);
 
+        // Submit and WAIT after each tensor to prevent staging buffer overwrite.
+        // The staging buffer is reused for all tensors, so we must ensure the GPU
+        // finishes copying before we overwrite the staging data for the next tensor.
+        vkEndCommandBuffer(uploadCmd);
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &uploadCmd;
+        VkFence tensorFence;
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vkCreateFence(device, &fenceInfo, nullptr, &tensorFence);
+        VkQueue submitQueue;
+        vkGetDeviceQueue(device, queueFamilyIndex, 0, &submitQueue);
+        vkQueueSubmit(submitQueue, 1, &submitInfo, tensorFence);
+        vkWaitForFences(device, 1, &tensorFence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(device, tensorFence, nullptr);
+
         fprintf(stderr, "  [5] push_back...\n"); fflush(stderr);
         model.tensors.push_back(desc);
 
         fprintf(stderr, "  [6] cout...\n"); fflush(stderr);
-        std::cout << "Queued: " << desc.name << " @ 0x" << std::hex << addr
+        std::cout << "Uploaded: " << desc.name << " @ 0x" << std::hex << addr
                   << " (" << std::dec << (desc.sizeBytes / 1024 / 1024) << " MB)\n";
 
         tensorIdx++;
         fprintf(stderr, "  [done]\n"); fflush(stderr);
+
+        // Begin new command buffer for next tensor
+        VkResult beginR = vkBeginCommandBuffer(uploadCmd, &beginInfo);
+        if (beginR != VK_SUCCESS) {
+            fprintf(stderr, "  [!] vkBeginCommandBuffer failed: %d — subsequent uploads may be lost!\n", beginR);
+            fflush(stderr);
+        }
     }
 
-    fprintf(stderr, "\n[uploader] All %zu tensors queued. Submitting...\n", model.tensors.size()); fflush(stderr);
-    vkEndCommandBuffer(uploadCmd);
-
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &uploadCmd;
-
-    VkQueue uploadQueue;
-    vkGetDeviceQueue(device, queueFamilyIndex, 0, &uploadQueue);
-    vkQueueSubmit(uploadQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    fprintf(stderr, "[uploader] vkQueueSubmit done, waiting...\n"); fflush(stderr);
-    vkQueueWaitIdle(uploadQueue);
-    fprintf(stderr, "[uploader] Upload complete!\n"); fflush(stderr);
+    // Command buffer from last iteration is already submitted; just clean up.
+    fprintf(stderr, "\n[uploader] All %zu tensors uploaded.\n", model.tensors.size()); fflush(stderr);
 
     vkUnmapMemory(device, stagingMem);
     vkDestroyBuffer(device, staging, nullptr);

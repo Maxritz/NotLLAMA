@@ -7,6 +7,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -37,11 +38,22 @@ layout(push_constant, scalar) uniform PushConstants {
 } pc;
 
 float dotQK(QRef Q, KCacheRef KCache, uint qBase, uint kOffset, uint hd) {
-    float dot = 0.0;
-    for (uint d = 0; d < hd; ++d) {
-        dot += Q.data[qBase + d] * float(KCache.data[kOffset + d]);
+    uint tid = gl_LocalInvocationID.x;
+    float partial = 0.0;
+    
+    // Each thread computes partial products for its stride
+    for (uint d = tid; d < hd; d += 32) {
+        partial += Q.data[qBase + d] * float(KCache.data[kOffset + d]);
     }
-    return dot;
+    
+    // Subgroup shuffle-down reduction
+    partial += subgroupShuffleDown(partial, 16);
+    partial += subgroupShuffleDown(partial, 8);
+    partial += subgroupShuffleDown(partial, 4);
+    partial += subgroupShuffleDown(partial, 2);
+    partial += subgroupShuffleDown(partial, 1);
+    
+    return subgroupBroadcastFirst(partial);
 }
 
 void main() {
@@ -58,42 +70,37 @@ void main() {
 
     uint qRow = sl - 1;
     uint qBase = qRow * pc.nHeads * hd + head * hd;
-
-    // Step 1: Compute all scores and find max
-    float localMax = -1e30;
-    for (uint pos = 0; pos < sl; ++pos) {
-        uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
-        float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
-        localMax = max(localMax, score);
-    }
-
-    float globalMax = subgroupBroadcastFirst(localMax);
-
-    // Step 2: Compute sum of exp(score - max)
-    float sum = 0.0;
-    for (uint pos = 0; pos < sl; ++pos) {
-        uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
-        float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
-        sum += exp(score - globalMax);
-    }
-
-    float globalSum = subgroupBroadcastFirst(sum);
-    float invSum = 1.0 / globalSum;
-
-    // Step 3: Accumulate V for this thread's output slice
     uint outBase = head * hd;
-    uint hdPerThread = hd / 32;
+    uint hdPerThread = max(hd / 32u, 1u);
+
+    // Online softmax over KV positions — single pass.
+    // dotQK is computed once per position and reused for max,
+    // sum-of-exp, and V accumulation, eliminating 3x recompute.
+    float m = -1e30;
+    float l = 0.0;
+    float myAcc[8];
+    for (uint d = 0; d < hdPerThread; ++d) myAcc[d] = 0.0;
+
+    for (uint pos = 0; pos < sl; ++pos) {
+        uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
+        float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
+
+        float mPrev = m;
+        m = max(m, score);
+        float expDiff = exp(mPrev - m);
+        l = l * expDiff + exp(score - m);
+
+        uint vOffset = kOffset;
+        for (uint d = 0; d < hdPerThread; ++d) {
+            uint idx = tid * hdPerThread + d;
+            if (idx >= hd) break;
+            myAcc[d] = myAcc[d] * expDiff + exp(score - m) * float(VCache.data[vOffset + idx]);
+        }
+    }
 
     for (uint d = 0; d < hdPerThread; ++d) {
-        float acc = 0.0;
-        for (uint pos = 0; pos < sl; ++pos) {
-            uint kOffset = pos * pc.nKvHeads * hd + kvHead * hd;
-            uint vOffset = kOffset;
-
-            float score = dotQK(Q, KCache, qBase, kOffset, hd) * pc.invSqrtHeadDim;
-            float weight = exp(score - globalMax) * invSum;
-            acc += weight * float(VCache.data[vOffset + tid * hdPerThread + d]);
-        }
-        Out.data[outBase + tid * hdPerThread + d] = acc;
+        uint idx = tid * hdPerThread + d;
+        if (idx >= hd) break;
+        Out.data[outBase + idx] = myAcc[d] / l;
     }
 }

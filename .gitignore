@@ -30,3 +30,16 @@ stderr.txt
 
 __pycache__/
 
+# Model files
+model/*.bin
+model/*.json
+*.weights.bin
+*.weights.json
+
+# Large PDFs
+*.pdf
+
+# Temporary files
+*.tmp
+*.log
+

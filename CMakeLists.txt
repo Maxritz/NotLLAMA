@@ -52,7 +52,6 @@ set(KERNELS
     src/kernels/gemm.comp
     src/kernels/attention.comp
     src/kernels/flash_attention.comp
-    src/kernels/mlp.comp
     src/kernels/rope.comp
     src/kernels/topk.comp
     src/kernels/add.comp
@@ -60,6 +59,8 @@ set(KERNELS
     src/kernels/embed.comp
     src/kernels/kv_cache_write.comp
     src/kernels/dequantize.comp
+    src/kernels/mlp_fused_gateup.comp
+    src/kernels/bda_test.comp
 )
 
 set(SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)
@@ -110,6 +111,18 @@ if(MSVC)
     target_compile_definitions(test_inference PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(test_inference PRIVATE -Wall -Wextra)
+endif()
+
+# --- test_cpu_ref (CPU-only) ---
+add_executable(test_cpu_ref test_cpu_ref.cpp cpu_reference.cpp)
+target_include_directories(test_cpu_ref PRIVATE include)
+target_link_libraries(test_cpu_ref PRIVATE Vulkan::Vulkan nlohmann_json::nlohmann_json)
+
+if(MSVC)
+    target_compile_options(test_cpu_ref PRIVATE /W3 /EHsc)
+    target_compile_definitions(test_cpu_ref PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_cpu_ref PRIVATE -Wall -Wextra)
 endif()
 
 install(TARGETS rdna4_llama DESTINATION bin)

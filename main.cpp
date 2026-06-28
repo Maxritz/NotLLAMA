@@ -101,7 +101,25 @@ int main(int argc, char** argv) {
     log("creating uploader");
     WeightUploader uploader(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex);
     log("loading weights");
-    ModelDesc model = uploader.load(jsonPath, binPath);
+    ModelDesc model;
+    try {
+        model = uploader.load(jsonPath, binPath);
+    } catch (const std::exception& e) {
+        log(("uploader.load() threw: " + std::string(e.what())).c_str());
+        std::cerr << "FATAL: " << e.what() << "\n";
+        profiler.cleanup();
+        ctx.cleanup();
+        fclose(dbg);
+        return 1;
+    }
+    if (model.tensors.empty()) {
+        log("model has no tensors");
+        std::cerr << "FATAL: Failed to load model tensors\n";
+        profiler.cleanup();
+        ctx.cleanup();
+        fclose(dbg);
+        return 1;
+    }
     log("weights loaded");
     profiler.endCpu("load_weights");
 
@@ -152,7 +170,7 @@ int main(int argc, char** argv) {
     loadPipe("gemm", sizeof(GemmPushConstants));
     loadPipe("attention", sizeof(AttentionPushConstants));
     loadPipe("flash_attention", sizeof(FlashAttentionPushConstants));
-    loadPipe("mlp", sizeof(MlpPushConstants));
+    loadPipe("mlp_fused_gateup", sizeof(MlpFusedGateUpPushConstants));
     loadPipe("rope", sizeof(RopePushConstants));
     loadPipe("topk", sizeof(TopKPushConstants));
     loadPipe("add", sizeof(AddPushConstants));
@@ -166,6 +184,8 @@ int main(int argc, char** argv) {
 
     log("creating scheduler");
     Scheduler scheduler(ctx.device, ctx.queues, ctx.queueFamilyIndex);
+    FencePool fencePool(ctx.device);
+    scheduler.fencePool = &fencePool;
 
     // === BDA WRITE TEST ===
     // Allocate a small test buffer, dispatch a shader that writes DEADBEEF+tid via BDA,
