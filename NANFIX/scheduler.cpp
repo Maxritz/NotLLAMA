@@ -69,6 +69,11 @@ void Scheduler::dispatch(VkPipeline pipeline, VkPipelineLayout layout,
     if (pushConstants && pcSize > 0) {
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pushConstants);
     }
+    if (gx > 65535 || gy > 65535 || gz > 65535) {
+        fprintf(stderr, "[Scheduler::dispatch] FATAL: workgroup count %u x %u x %u exceeds Vulkan limit 65535\n", gx, gy, gz);
+        vkFreeCommandBuffers(device, cmdPools[aceIndex], 1, &cmd);
+        return;
+    }
     vkCmdDispatch(cmd, gx, gy, gz);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
@@ -124,6 +129,11 @@ void Scheduler::dispatchTimed(const std::string& name, Profiler* profiler,
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     if (pushConstants && pcSize > 0) {
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pushConstants);
+    }
+    if (gx > 65535 || gy > 65535 || gz > 65535) {
+        fprintf(stderr, "[Scheduler::dispatch] FATAL: workgroup count %u x %u x %u exceeds Vulkan limit 65535\n", gx, gy, gz);
+        vkFreeCommandBuffers(device, cmdPools[aceIndex], 1, &cmd);
+        return;
     }
     vkCmdDispatch(cmd, gx, gy, gz);
 
@@ -440,14 +450,16 @@ void Scheduler::dispatchInBatch(VkPipeline pipeline, VkPipelineLayout layout,
                                  uint32_t gx, uint32_t gy, uint32_t gz) {
     if (batchCmdBuffer == VK_NULL_HANDLE) return;
 
+    // Vulkan minimum guaranteed limit per dimension is 65535
+    if (gx > 65535 || gy > 65535 || gz > 65535) {
+        fprintf(stderr, "[Scheduler::dispatchInBatch] FATAL: workgroup count %u x %u x %u exceeds Vulkan limit 65535\n", gx, gy, gz);
+        return;
+    }
+
     vkCmdBindPipeline(batchCmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     if (pushConstants && pcSize > 0) {
         vkCmdPushConstants(batchCmdBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            static_cast<uint32_t>(pcSize), pushConstants);
-    }
-    if (gx > 65535 || gy > 65535 || gz > 65535) {
-        fprintf(stderr, "[Scheduler::dispatchInBatch] FATAL: workgroup count %u x %u x %u exceeds Vulkan limit 65535\n", gx, gy, gz);
-        return;
     }
     vkCmdDispatch(batchCmdBuffer, gx, gy, gz);
 }
