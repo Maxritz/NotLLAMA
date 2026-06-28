@@ -1,0 +1,72 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// kv_cache_dequant.comp — Matches kv_cache_quantize.comp Q4_0 layout exactly.
+// Reverse of storeQ40() layout:
+//   - Packed data: uint[] where each uint holds 4 bytes × 2 nibbles/byte = 8 elements
+//   - Per-block scales in separate F16 buffer
+// Dispatch one thread per element (tokens × nHeads × headDim).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer UintRef {
+    uint data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Float16OutRef {
+    float16_t data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer F16ScaleRef {
+    float16_t data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrSrc;     // Quantized KV cache (uint[])
+    uint64_t addrDst;     // F16 output buffer
+    uint64_t addrScales;  // F16 scales per block (per-head * nBlocks)
+    uint n;           // Total elements
+    uint blockSize;   // Elements per block (32 for Q4_0)
+    uint headDim;     // Elements per head (for per-block stride)
+    uint nHeads;      // Number of heads (for per-block stride)
+    uint nBlocks;     // Total blocks across all heads
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+
+    UintRef src = UintRef(pc.addrSrc);
+    Float16OutRef dst = Float16OutRef(pc.addrDst);
+    F16ScaleRef scales = F16ScaleRef(pc.addrScales);
+
+    // Compute block index and offset matching kv_cache_quantize.comp layout:
+    // Block = (head * nBlocks_per_head + block_within_head)
+    // nBlocks_per_head = (seqLen + blockSize - 1) / blockSize
+    // But n here = seqLen * nHeads * headDim, so block grows per-head
+    // Actually simpler: the quantized layout is per-head contiguous.
+    // n blocks = n / (blockSize * headDim) — each block covers blockSize tokens * headDim elements
+    uint elemsPerBlock = pc.blockSize * pc.headDim;
+    uint globalBlockIdx = idx / elemsPerBlock;
+    uint blockOff = idx % elemsPerBlock;
+
+    // Word-level address matching storeQ40():
+    // elemsPerWord = 8 (4 bytes * 2 nibbles)
+    uint wordsPerBlock = elemsPerBlock / 8;
+    uint wordIdx = blockOff / 8;
+    uint byteOffInWord = (blockOff % 8) / 2;
+    uint nibbleOffInByte = (blockOff % 2) == 0 ? 0u : 4u;
+
+    uint word = src.data[globalBlockIdx * wordsPerBlock + wordIdx];
+    uint byteVal = (word >> (byteOffInWord * 8)) & 0xFFu;
+    uint q = (byteVal >> nibbleOffInByte) & 0xFu;
+
+    float scale = float(scales.data[globalBlockIdx]);
+    float deq = (float(q) - 8.0) * scale;
+
+    dst.data[idx] = float16_t(deq);
+}

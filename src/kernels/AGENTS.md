@@ -56,5 +56,28 @@ Shaders are owned by the kernel pipeline. Host-side dispatch logic lives in `src
 - Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
 - Runtime: `test_inference.exe <model.json> <model.bin>` must not crash
 
+## Compression Shaders
+
+### compress_context.comp
+- **Purpose**: Compress context embeddings using blockwise quantization
+- **Input**: F32/F16 context buffer, optional importance scores
+- **Output**: Quantized context buffer (packed weights + scales + optional zero points)
+- **Block layout**: Packed weights first, then scale (1 or 2 bytes), then optional zero point (1 byte)
+- **Strategies**: uniform (equal blocks), entropy (higher precision for high-entropy regions), importance (skip compression for important tokens)
+
+### kv_cache_quantize.comp
+- **Purpose**: Quantize K and V caches per-block (Q4_0) using blockwise symmetric quantization
+- **Input**: F16 K and V caches
+- **Output**: Quantized K and V caches (uint[] packed data) + separate F16 scale buffers per block
+- **Block layout**: 32 elements per block, 2 values per byte (4-bit each), scales stored in separate float16_t[] buffer
+- **Notes**: Only the older tier of hierarchical KV cache is quantized. Recent tokens stay F16.
+
+### kv_cache_dequant.comp
+- **Purpose**: Dequantize K and V caches back to F16 for attention computation
+- **Input**: Quantized KV cache (uint[]) + F16 scales per block (float16_t[])
+- **Output**: F16 KV cache
+- **Block layout**: Matches kv_cache_quantize.comp exactly — each uint holds 4 bytes × 2 nibbles = 8 elements
+- **Notes**: Must be dispatched before attention.comp if KV cache is quantized. One thread per element.
+
 ## Child DOX Index
 - None (leaf directory)
