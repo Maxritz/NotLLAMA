@@ -72,6 +72,13 @@ struct AddPushConstants {
     uint32_t nElements;
 };
 
+struct SiluMulPushConstants {
+    uint64_t addrGate;
+    uint64_t addrUp;
+    uint64_t addrOut;
+    uint32_t nElements;
+};
+
 struct RmsNormPushConstants {
     uint64_t addrIn;
     uint64_t addrWeight;

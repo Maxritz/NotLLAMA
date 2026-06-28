@@ -70,16 +70,15 @@ static_assert(sizeof(KVCacheQuantizePushConstants) <= 128,
 
 // Push constants for kv_cache_dequant.comp.
 // Matches GLSL layout(push_constant, scalar) in kv_cache_dequant.comp.
-// Byte layout: scales (float16_t[]) are in a separate buffer from packed weights (uint[]).
+// Byte layout: per block = [packed_weights (bytes)] [scale (1B if int8, 2B if fp16 LE)] [zp (1B, optional)].
 struct KVCacheDequantPushConstants {
-    uint64_t addrSrc;     // Quantized data (uint[])
-    uint64_t addrDst;     // F16 output
-    uint64_t addrScales;  // F16 scales per block
-    uint32_t n;           // Total elements
-    uint32_t blockSize;   // Elements per block (32 for Q4_0)
-    uint32_t headDim;
-    uint32_t nHeads;
-    uint32_t nBlocks;     // Total blocks across all heads
+    uint64_t addrSrc;     // Quantized data (uint8_t[])
+    uint64_t addrDst;     // F16 output (float16_t[])
+    uint32_t n;           // Total elements (tokens * nHeads * headDim)
+    uint32_t blockSize;   // Elements per block (64 or 128)
+    uint32_t bits;        // 4, 5, 6, or 8
+    uint32_t scaleBits;   // 8 (int8) or 16 (float16)
+    uint32_t zeroPoint;   // 0 = no zero point, 1 = int8 zero point after scale
 };
 static_assert(sizeof(KVCacheDequantPushConstants) <= 128,
     "KVCacheDequantPushConstants exceeds Vulkan 128-byte push constant limit");

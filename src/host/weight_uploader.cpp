@@ -289,7 +289,8 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
 
     VkBufferCreateInfo bufInfo = {};
     bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = size;
+    size_t alignedSize = (size + 3) & ~3;
+    bufInfo.size = alignedSize;
     bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT 
                   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
                   | VK_BUFFER_USAGE_TRANSFER_DST_BIT;

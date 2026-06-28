@@ -152,7 +152,9 @@ int main(int argc, char** argv) {
     log("kv cache OK");
 
     log("ring alloc");
-    size_t ringSize = 64 * 1024 * 1024;  // 64 MB for activations (enough for single token forward)
+    size_t ringSize = std::max<size_t>(64 * 1024 * 1024,
+        (size_t)model.vocabSize * sizeof(float) * 2 +
+        (size_t)model.embeddingLength * sizeof(float) * 8);
     RingAllocator allocator(ctx.device, ctx.physicalDevice, ringSize);
     log("ring OK");
 
@@ -174,9 +176,13 @@ int main(int argc, char** argv) {
     loadPipe("rope", sizeof(RopePushConstants));
     loadPipe("topk", sizeof(TopKPushConstants));
     loadPipe("add", sizeof(AddPushConstants));
+    loadPipe("silu_mul", sizeof(SiluMulPushConstants));
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
+    loadPipe("embed_q8_0", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
+    loadPipe("dequant_turbo", sizeof(DequantizePushConstants));
+    loadPipe("gemm_turbo", sizeof(GemmPushConstants));
     loadPipe("dequantize", sizeof(DequantizePushConstants));
 
     log("all pipelines OK");
@@ -359,6 +365,7 @@ bda_test_done:;
 
     profiler.report();
 
+    vkDeviceWaitIdle(ctx.device);
     scheduler.cleanup();
     pipelines.cleanup();
     kvCache.free();

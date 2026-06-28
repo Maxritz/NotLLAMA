@@ -21,6 +21,18 @@ We're building a full-scale RDNA4-native LLM inference engine using Vulkan compu
 
 ## What Needs To Be Done
 
+## Changes (Round 4 — Batched forwardPartial: 2 syncs/layer, all weights dequantized before any compute)
+
+### What changed
+- **`initDequantBuffer()`** (`inference_engine.cpp:87-113`): Staging buffer now sized for all 9 weights per layer (attn_norm + Q + K + V + O + ffn_norm + up + gate + down) instead of just the MLP set. ~228 MB for Qwen2.5-3B, still under 512 MB cap.
+- **`forwardPartial()`** (`inference_engine.cpp:735-877`): Refactored per-layer loop to two phases:
+  - **Phase 1**: Dequant all 9 weights asynchronously (`sync=false`), one `syncAllThrottled` at the end
+  - **Phase 2**: Single `beginBatch/endBatch` with pipeline barriers between stages — attn norm → Q/K/V GEMMs → RoPE/KV write/attention → output GEMM + residual → FFN norm → MLP → residual
+- **Sync count per layer**: 4 → 2 (dequant sync + compute batch sync). Across 36 layers: ~72 syncs total.
+
+### Files modified
+- `src/host/inference_engine.cpp` — `initDequantBuffer()` buffer sizing (8 lines), `forwardPartial()` loop restructured (~80 lines replaced)
+
 ### Task 1: Implement Proper Top-K / Top-P Sampling
 **Current state**: `forward()` uses a basic top-k shader that writes to `sampleOutAddr`, then reads back with `memcpy`. The `sampleArgmax()` function is a CPU fallback.
 

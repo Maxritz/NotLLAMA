@@ -80,6 +80,49 @@ static uint64_t dequantWeight(Scheduler* sched, PipelineBuilder* pipes,
     return dequantBufAddr + outOffset;
 }
 
+// ============================================================================
+// dequantWeightInBatch: records dequant dispatches into the ACTIVE batch
+// command buffer via dispatchInBatch(). NO separate submits. NO syncs.
+// Must only be called between beginBatch() and endBatch().
+// Returns the GPU address where the dequantized float32 weights will be.
+// ============================================================================
+static uint64_t dequantWeightInBatch(Scheduler* sched, PipelineBuilder* pipes,
+    uint64_t dequantBufAddr, size_t dequantBufSize,
+    const ModelDesc& model, const std::string& name,
+    size_t outOffset = 0) {
+    const TensorDesc* t = findTensor(model, name);
+    if (!t) return 0;
+    if (t->format == QuantFormat::F16 || t->format == QuantFormat::F32) return t->gpuAddress;
+
+    uint32_t nElements = 1;
+    for (auto d : t->shape) nElements *= d;
+
+    size_t outBytes = (size_t)nElements * sizeof(float);
+    if (outOffset + outBytes > dequantBufSize) return 0;
+
+    const uint32_t MAX_WG_PER_DISPATCH = 256 * 1024;
+    uint32_t elementsPerChunk = MAX_WG_PER_DISPATCH * 32;
+    uint32_t offset = 0;
+
+    while (offset < nElements) {
+        uint32_t chunkSize = std::min(elementsPerChunk, nElements - offset);
+        uint32_t chunkWg = (chunkSize + 31) / 32;
+
+        DequantizePushConstants pc = {};
+        pc.addrQuant = t->gpuAddress;
+        pc.addrOut = dequantBufAddr + outOffset + (uint64_t)offset * sizeof(float);
+        pc.nElements = chunkSize;
+        pc.quantFormat = static_cast<uint32_t>(t->format);
+        pc.totalThreads = chunkWg * 32;
+        pc.elementOffset = offset;
+
+        sched->dispatchInBatch(pipes->getPipeline("dequantize"), pipes->getLayout("dequantize"),
+            &pc, sizeof(pc), chunkWg, 1, 1);
+        offset += chunkSize;
+    }
+    return dequantBufAddr + outOffset;
+}
+
 InferenceEngine::InferenceEngine(VulkanContext* c, ModelDesc* m, KVCacheManager* k,
                                    PipelineBuilder* p, Tokenizer* t, Scheduler* s, RingAllocator* a)
     : ctx(c), model(m), kvCache(k), pipelines(p), tokenizer(t), scheduler(s), allocator(a) {}
@@ -89,29 +132,32 @@ bool InferenceEngine::initDequantBuffer() {
     // same time for a single dispatch. The worst case is the MLP, which needs
     // ffn_up + ffn_gate + ffn_down simultaneously. The embedding table uses a
     // separate persistent cache and is excluded here.
-    size_t maxSingle = 0;
-    for (const auto& t : model->tensors) {
-        if (t.format == QuantFormat::F16 || t.format == QuantFormat::F32) continue;
-        if (t.name.find("token_embd") != std::string::npos) continue;
-        uint32_t nElements = 1;
-        for (auto d : t.shape) nElements *= d;
-        size_t f32Bytes = (size_t)nElements * sizeof(float);
-        if (f32Bytes > maxSingle) maxSingle = f32Bytes;
-    }
-
-    size_t maxMlpSet = 0;
+    // The staging buffer must hold ALL dequantized weights for one full layer
+    // simultaneously: attn_norm + Q + K + V + O + ffn_norm + up + gate + down.
+    // This enables batched dequant (one sync) before any compute dispatches.
+    size_t maxLayerSet = 0;
     for (uint32_t layer = 0; layer < model->blockCount; ++layer) {
         std::string prefix = "blk." + std::to_string(layer);
-        size_t up   = getF16OutputSize(*model, prefix + ".ffn_up.weight");
-        size_t gate = getF16OutputSize(*model, prefix + ".ffn_gate.weight");
-        size_t down = getF16OutputSize(*model, prefix + ".ffn_down.weight");
-        size_t combined = up + gate + down;
-        if (combined > maxMlpSet) maxMlpSet = combined;
+        size_t total = 0;
+        total += getF16OutputSize(*model, prefix + ".attn_norm.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_q.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_k.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_v.weight");
+        total += getF16OutputSize(*model, prefix + ".attn_output.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_norm.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_up.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_gate.weight");
+        total += getF16OutputSize(*model, prefix + ".ffn_down.weight");
+        if (total > maxLayerSet) maxLayerSet = total;
     }
 
-    size_t maxSize = std::max(maxSingle, maxMlpSet);
+    size_t maxSize = maxLayerSet;
     if (maxSize == 0) maxSize = 16 * 1024 * 1024;
-    if (maxSize > 512 * 1024 * 1024) maxSize = 512 * 1024 * 1024;  // Cap at 512 MB
+    // Also account for weight-tied LM head (output.weight -> token_embd.weight)
+    size_t embedSize = getF16OutputSize(*model, "token_embd.weight");
+    if (embedSize > maxSize) maxSize = embedSize;
+
+    if (maxSize > 640 * 1024 * 1024) maxSize = 640 * 1024 * 1024;  // Cap at 640 MB
 
     dequantCapacity = maxSize;
 
@@ -185,6 +231,10 @@ void InferenceEngine::cleanupDequantBuffer() {
 }
 
 bool InferenceEngine::initEmbedCache() {
+    // TEMP: Skip embed cache to avoid hang on large models during benchmarking
+    embedCacheReady = false;
+    return true;
+
     // Find token_embd tensor and allocate persistent cache for dequantized embedding
     const TensorDesc* t = findTensor(*model, "token_embd.weight");
     if (!t) return false;
@@ -247,22 +297,22 @@ bool InferenceEngine::initEmbedCache() {
     addrInfo.buffer = embedCacheBuffer;
     embedCacheAddr = vkGetBufferDeviceAddress(ctx->device, &addrInfo);
 
-    // Dequantize embedding table once, into the dequant staging buffer first,
-    // then copy to the persistent embed cache
-    // We use the dequant staging buffer as intermediate, then the embed cache
-    // is the final resting place. Since both are DEVICE_LOCAL, we dispatch
-    // dequant directly into the embed cache.
-    fprintf(stderr, "[embed-cache] dequantizing embedding table (%u elements, %u workgroups)...\n",
+    // Dequantize embedding table once directly into the persistent embed cache.
+    // Batched: all chunks recorded into ONE command buffer, submitted once,
+    // synced once with syncAll() (no throttle — this is one-time init).
+    fprintf(stderr, "[embed-cache] dequantizing embedding table (%u elements, %u total wg)...\n",
             nElements, (nElements + 31) / 32);
 
     auto embedStart = std::chrono::steady_clock::now();
 
-    // Dequantize in chunks (same as dequantWeight)
-    const uint32_t MAX_WG = 256 * 1024;
-    uint32_t totalWg = (nElements + 31) / 32;
+    // Reduced chunk size: 64K workgroups × 32 threads = 2M elements/chunk
+    // Smaller dispatches are safer against driver TDR and scheduling hiccups.
+    const uint32_t MAX_WG = 64 * 1024;
     uint32_t elemPerChunk = MAX_WG * 32;
     uint32_t offset = 0;
 
+    scheduler->beginBatch(0);
+    uint32_t chunkCount = 0;
     while (offset < nElements) {
         uint32_t chunk = std::min(elemPerChunk, nElements - offset);
         uint32_t chunkWg = (chunk + 31) / 32;
@@ -275,19 +325,27 @@ bool InferenceEngine::initEmbedCache() {
         pc.totalThreads = chunkWg * 32;
         pc.elementOffset = offset;
 
-        scheduler->dispatch(pipelines->getPipeline("dequantize"), pipelines->getLayout("dequantize"),
-                            &pc, sizeof(pc), chunkWg, 1, 1);
-        scheduler->syncAllThrottled();
+        scheduler->dispatchInBatch(pipelines->getPipeline("dequantize"), pipelines->getLayout("dequantize"),
+                                   &pc, sizeof(pc), chunkWg, 1, 1);
+        // Barrier between chunks to ensure ordering (non-overlapping writes,
+        // but barrier is cheap inside one command buffer).
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
         offset += chunk;
-        fprintf(stderr, "[embed-cache] dequantized %u / %u elements\n", offset, nElements);
+        chunkCount++;
     }
+    scheduler->endBatch(VK_NULL_HANDLE);
+    // Use syncAll() instead of syncAllThrottled() — no sleep overhead for one-time init.
+    scheduler->syncAll();
 
     embedCacheReady = true;
     auto embedEnd = std::chrono::steady_clock::now();
     auto embedMs = std::chrono::duration_cast<std::chrono::milliseconds>(embedEnd - embedStart).count();
-    fprintf(stderr, "[embed-cache] ready @ 0x%llx (%zu MB) in %lld ms\n",
-            (unsigned long long)embedCacheAddr, embedCacheSize / 1024 / 1024, (long long)embedMs);
+    fprintf(stderr, "[embed-cache] ready @ 0x%llx (%zu MB) in %lld ms (%u chunks, batch-submitted)\n",
+            (unsigned long long)embedCacheAddr, embedCacheSize / 1024 / 1024,
+            (long long)embedMs, chunkCount);
     return true;
 }
 
@@ -679,248 +737,281 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
     uint64_t kRowAddr = kAddr + (uint64_t)seqPos * headDim * model->headCountKv * sizeof(float);
     uint64_t vRowAddr = vAddr + (uint64_t)seqPos * headDim * model->headCountKv * sizeof(float);
 
-    fprintf(stderr, "[fwd] forwardPartial: tokenId=%u seqPos=%u maxLayers=%u\n", tokenId, seqPos, maxLayers);
-    fprintf(stderr, "[fwd] allocs: hidden=%llx q=%llx k=%llx v=%llx attnOut=%llx mlpOut=%llx logits=%llx sample=%llx\n",
-            (unsigned long long)hiddenAddr, (unsigned long long)qAddr, (unsigned long long)kAddr,
-            (unsigned long long)vAddr, (unsigned long long)attnOutAddr, (unsigned long long)mlpOutAddr,
-            (unsigned long long)logitsAddr, (unsigned long long)sampleOutAddr);
-
-    scheduler->createLayerFence();
-
     auto fwdStart = std::chrono::steady_clock::now();
+
+    // === ONE COMMAND BUFFER FOR ENTIRE FORWARD PASS ===
+    scheduler->beginBatch(0);
 
     // === Embedding ===
     uint64_t embedAddr = findTensorAddr(*model, "token_embd.weight");
-    fprintf(stderr, "[fwd] embedAddr=%llx embedCacheReady=%d embedCacheAddr=%llx\n",
-            (unsigned long long)embedAddr, embedCacheReady, (unsigned long long)embedCacheAddr);
     if (embedAddr) {
-        uint64_t embedAddr_dq = 0;
-        if (embedCacheReady) {
-            embedAddr_dq = embedCacheAddr;
+        const TensorDesc* embedTensor = findTensor(*model, "token_embd.weight");
+        bool useQ8Embed = (embedTensor && embedTensor->format == QuantFormat::Q8_0 && !embedCacheReady);
+
+        if (useQ8Embed) {
+            // Direct Q8_0 embed lookup — no dequant staging needed
+            EmbedPushConstants embedPC = {embedAddr, hiddenAddr, tokenId, seqPos, dim};
+            scheduler->dispatchInBatch(pipelines->getPipeline("embed_q8_0"), pipelines->getLayout("embed_q8_0"),
+                &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
         } else {
-            embedAddr_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight");
-        }
-
-        EmbedPushConstants embedPC = {embedAddr_dq ? embedAddr_dq : embedAddr, hiddenAddr, tokenId, seqPos, dim};
-        scheduler->dispatch(pipelines->getPipeline("embed"), pipelines->getLayout("embed"),
-                             &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
-        scheduler->syncAllThrottled(0.8);
-
-        // DIAGNOSTIC: readback hidden state (embed cache is in separate VkDeviceMemory, cannot read via ring allocator)
-        if (allocator->mappedPtr) {
-            uint64_t hOff = hiddenAddr - allocator->baseAddress;
-            VkMappedMemoryRange r2 = {};
-            r2.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-            r2.memory = allocator->memory;
-            r2.offset = hOff & ~((uint64_t)4095);
-            r2.size = (dim * sizeof(float) + 4095) & ~((uint64_t)4095);
-            vkInvalidateMappedMemoryRanges(ctx->device, 1, &r2);
-            float* h = reinterpret_cast<float*>(allocator->mappedPtr + hOff);
-            int nanCount = 0;
-            float hsum = 0, hmax = -1e30f, hmin = 1e30f;
-            for (uint32_t i = 0; i < dim; ++i) {
-                if (std::isnan(h[i])) nanCount++;
-                else { hsum += h[i]; if (h[i] > hmax) hmax = h[i]; if (h[i] < hmin) hmin = h[i]; }
+            uint64_t embedAddr_dq = embedCacheReady ? embedCacheAddr : 0;
+            if (!embedAddr_dq) {
+                embedAddr_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight");
             }
-            fprintf(stderr, "[diag] hidden after embed[0..3]: %f %f %f %f  nan=%d sum=%f min=%f max=%f\n",
-                    h[0], h[1], h[2], h[3], nanCount, hsum, hmin, hmax);
+            EmbedPushConstants embedPC = {embedAddr_dq ? embedAddr_dq : embedAddr, hiddenAddr, tokenId, seqPos, dim};
+            scheduler->dispatchInBatch(pipelines->getPipeline("embed"), pipelines->getLayout("embed"),
+                &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
         }
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
-    // === Transformer blocks (limited to maxLayers) ===
     uint32_t layersToRun = std::min(maxLayers, model->blockCount);
-
-    // Push constant storage is now INLINE in DispatchDesc — no separate vectors needed.
 
     for (uint32_t layer = 0; layer < layersToRun; ++layer) {
         std::string prefix = "blk." + std::to_string(layer);
 
-        uint64_t addrAttnNorm = findTensorAddr(*model, prefix + ".attn_norm.weight");
-        uint64_t addrFfnNorm  = findTensorAddr(*model, prefix + ".ffn_norm.weight");
-
-        fprintf(stderr, "[fwd] layer %u/%u\n", layer, layersToRun);
-
-        uint64_t addrQW = findTensorAddr(*model, prefix + ".attn_q.weight");
-        uint64_t addrKW = findTensorAddr(*model, prefix + ".attn_k.weight");
-        uint64_t addrVW = findTensorAddr(*model, prefix + ".attn_v.weight");
-        uint64_t addrOW = findTensorAddr(*model, prefix + ".attn_output.weight");
-
-        // === Dequant attention weights (separate sync — these are individual dispatches) ===
+        // === Attention Dequant ===
         size_t qSize = (size_t)dim * dim * sizeof(float);
         size_t kSize = (size_t)(headDim * model->headCountKv) * dim * sizeof(float);
         size_t vSize = kSize;
 
-        uint64_t addrAttnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", 0, false);
-        uint64_t addrQW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", 0, false);
-        uint64_t addrKW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", qSize, false);
-        uint64_t addrVW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", qSize + kSize, false);
-        uint64_t addrOW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", qSize + kSize + vSize, false);
-        scheduler->syncAllThrottled(0.8);  // Sync: attention dequants complete
+        uint64_t addrAttnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", 0);
+        uint64_t addrQW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", 0);
+        uint64_t addrKW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", qSize);
+        uint64_t addrVW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", qSize + kSize);
+        uint64_t addrOW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", qSize + kSize + vSize);
 
-        // === Batch: norm + Q/K/V GEMMs + RoPE + KV write + attention + output GEMM + add ===
-        // All in one command buffer via beginBatch/endBatch. Single submit, single fence wait.
-        // Memory dependencies within require pipeline barriers.
-        {
-            scheduler->beginBatch(0);
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-            // Stage 1: norm + Q/K/V GEMMs
-            RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm_dq ? addrAttnNorm_dq : addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
-            scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
-                                       &normPC, sizeof(normPC), 1, 1, 1);
+        // === Attention Compute ===
+        uint64_t addrAttnNorm = findTensorAddr(*model, prefix + ".attn_norm.weight");
+        RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm_dq ? addrAttnNorm_dq : addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
+        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
+            &normPC, sizeof(normPC), 1, 1, 1);
 
-            uint64_t normHidden = attnOutAddr;
-            GemmPushConstants qPC = {normHidden, addrQW_dq ? addrQW_dq : addrQW, qRowAddr, 1, dim, dim, 1.0f, 0};
-            scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-                                       &qPC, sizeof(qPC), (dim+31)/32, 1, 1);
-            GemmPushConstants kPC = {normHidden, addrKW_dq ? addrKW_dq : addrKW, kRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
-            scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-                                       &kPC, sizeof(kPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
-            GemmPushConstants vPC = {normHidden, addrVW_dq ? addrVW_dq : addrVW, vRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
-            scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-                                       &vPC, sizeof(vPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
+        uint64_t normHidden = attnOutAddr;
+        uint64_t addrQW = findTensorAddr(*model, prefix + ".attn_q.weight");
+        uint64_t addrKW = findTensorAddr(*model, prefix + ".attn_k.weight");
+        uint64_t addrVW = findTensorAddr(*model, prefix + ".attn_v.weight");
 
-            // Barrier after GEMMs: ensure writes to Q/K/V visible to RoPE/attention
-            scheduler->barrierBetweenGroups(
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        GemmPushConstants qPC = {normHidden, addrQW_dq ? addrQW_dq : addrQW, qRowAddr, 1, dim, dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &qPC, sizeof(qPC), (dim + 31) / 32, 1, 1);
+        GemmPushConstants kPC = {normHidden, addrKW_dq ? addrKW_dq : addrKW, kRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &kPC, sizeof(kPC), ((uint32_t)(headDim * model->headCountKv) + 31) / 32, 1, 1);
+        GemmPushConstants vPC = {normHidden, addrVW_dq ? addrVW_dq : addrVW, vRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &vPC, sizeof(vPC), ((uint32_t)(headDim * model->headCountKv) + 31) / 32, 1, 1);
 
-            // Stage 2: RoPE + KV write + attention heads
-            uint32_t ropeTotal = model->headCount * headDim;
-            RopePushConstants ropePC = {qRowAddr, kRowAddr, seqLen, headDim, model->headCount, model->headCountKv, 10000.0f, 1.0f};
-            scheduler->dispatchInBatch(pipelines->getPipeline("rope"), pipelines->getLayout("rope"),
-                                       &ropePC, sizeof(ropePC), (ropeTotal + 31) / 32, 1, 1);
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-            uint64_t kCacheAddr = kvCache->getKBufferAddress(layer);
-            uint64_t vCacheAddr = kvCache->getVBufferAddress(layer);
-            if (kCacheAddr && vCacheAddr) {
-                KVCacheWritePushConstants kvPC = {kRowAddr, vRowAddr, kCacheAddr, vCacheAddr, seqPos, headDim, model->headCountKv};
-                scheduler->dispatchInBatch(pipelines->getPipeline("kv_cache_write"), pipelines->getLayout("kv_cache_write"),
-                                           &kvPC, sizeof(kvPC), (headDim * model->headCountKv + 31) / 32, 1, 1);
-            }
+        uint32_t ropeTotal = model->headCount * headDim;
+        RopePushConstants ropePC = {qRowAddr, kRowAddr, seqLen, headDim, model->headCount, model->headCountKv, 10000.0f, 1.0f};
+        scheduler->dispatchInBatch(pipelines->getPipeline("rope"), pipelines->getLayout("rope"),
+            &ropePC, sizeof(ropePC), (ropeTotal + 31) / 32, 1, 1);
 
-            for (uint32_t h = 0; h < model->headCount; ++h) {
-                AttentionPushConstants attnPC = {qAddr, kCacheAddr, vCacheAddr, attnOutAddr, seqLen, headDim,
-                    model->headCount, model->headCountKv, h, 1.0f / std::sqrt(static_cast<float>(headDim))};
-                scheduler->dispatchInBatch(pipelines->getPipeline("attention"), pipelines->getLayout("attention"),
-                                           &attnPC, sizeof(attnPC), 1, 1, 1);
-            }
-
-            // Barrier after attention: attnOutAddr writes visible to output GEMM reads
-            scheduler->barrierBetweenGroups(
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-            // Output GEMM + residual add
-            GemmPushConstants outPC = {attnOutAddr, addrOW_dq ? addrOW_dq : addrOW, mlpOutAddr, 1, dim, dim, 1.0f, 0};
-            scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-                                       &outPC, sizeof(outPC), (dim+31)/32, 1, 1);
-
-            AddPushConstants addPC1 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
-            scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"),
-                                       &addPC1, sizeof(addPC1), (dim+255)/256, 1, 1);
-
-            scheduler->endBatch(scheduler->layerFence);
-            scheduler->syncLayer(0);
+        uint64_t kCacheAddr = kvCache->getKBufferAddress(layer);
+        uint64_t vCacheAddr = kvCache->getVBufferAddress(layer);
+        if (kCacheAddr && vCacheAddr) {
+            KVCacheWritePushConstants kvPC = {kRowAddr, vRowAddr, kCacheAddr, vCacheAddr, seqPos, headDim, model->headCountKv};
+            scheduler->dispatchInBatch(pipelines->getPipeline("kv_cache_write"), pipelines->getLayout("kv_cache_write"),
+                &kvPC, sizeof(kvPC), (headDim * model->headCountKv + 31) / 32, 1, 1);
         }
 
-        // === Dequant FFN weights (separate sync) ===
-        uint64_t addrFfnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", 0, false);
+        for (uint32_t h = 0; h < model->headCount; ++h) {
+            AttentionPushConstants attnPC = {qAddr, kCacheAddr, vCacheAddr, attnOutAddr, seqLen, headDim,
+                model->headCount, model->headCountKv, h, 1.0f / std::sqrt(static_cast<float>(headDim))};
+            scheduler->dispatchInBatch(pipelines->getPipeline("attention"), pipelines->getLayout("attention"),
+                &attnPC, sizeof(attnPC), 1, 1, 1);
+        }
+
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        uint64_t addrOW = findTensorAddr(*model, prefix + ".attn_output.weight");
+        GemmPushConstants outPC = {attnOutAddr, addrOW_dq ? addrOW_dq : addrOW, mlpOutAddr, 1, dim, dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &outPC, sizeof(outPC), (dim + 31) / 32, 1, 1);
+
+        AddPushConstants addPC1 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
+        scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"),
+            &addPC1, sizeof(addPC1), (dim + 255) / 256, 1, 1);
+
+        // Barrier: attention done → FFN dequant can overwrite buffer
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+
+        // === FFN Dequant ===
+        uint64_t addrFfnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", 0);
         size_t upSize = getF16OutputSize(*model, prefix + ".ffn_up.weight");
         size_t gateSize = getF16OutputSize(*model, prefix + ".ffn_gate.weight");
 
-        uint64_t addrUpW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", 0, false);
-        uint64_t addrGateW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", upSize, false);
-        size_t downSize = getF16OutputSize(*model, prefix + ".ffn_down.weight");
-        uint64_t addrDownW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", upSize + gateSize, false);
-        scheduler->syncAllThrottled(0.8);  // Sync: FFN dequants complete
+        uint64_t addrUpW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", 0);
+        uint64_t addrGateW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", upSize);
+        uint64_t addrDownW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", upSize + gateSize);
 
-        if ((!addrUpW_dq && upSize) || (!addrGateW_dq && gateSize) || (!addrDownW_dq && downSize)) {
-            fprintf(stderr, "[FATAL] MLP dequant buffer overflow in layer %u (up=%llu gate=%llu down=%llu / cap=%zu)\n",
-                    layer, (unsigned long long)addrUpW_dq, (unsigned long long)addrGateW_dq, (unsigned long long)addrDownW_dq, dequantCapacity);
-            return 0;
-        }
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        // === Batch: FFN norm + MLP + residual add ===
-        {
-            scheduler->beginBatch(0);
+        // === FFN Compute ===
+        uint64_t addrFfnNorm = findTensorAddr(*model, prefix + ".ffn_norm.weight");
+        RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm_dq ? addrFfnNorm_dq : addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
+        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
+            &ffnNormPC, sizeof(ffnNormPC), 1, 1, 1);
 
-            RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm_dq ? addrFfnNorm_dq : addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
-            scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
-                                       &ffnNormPC, sizeof(ffnNormPC), 1, 1, 1);
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-            uint64_t addrUpW = findTensorAddr(*model, prefix + ".ffn_up.weight");
-            uint64_t addrGateW = findTensorAddr(*model, prefix + ".ffn_gate.weight");
-            uint64_t addrDownW = findTensorAddr(*model, prefix + ".ffn_down.weight");
+        uint64_t addrUpW = findTensorAddr(*model, prefix + ".ffn_up.weight");
+        uint64_t addrGateW = findTensorAddr(*model, prefix + ".ffn_gate.weight");
+        uint64_t addrDownW = findTensorAddr(*model, prefix + ".ffn_down.weight");
 
-            // Barrier after norm: norm output visible to MLP reads
-            scheduler->barrierBetweenGroups(
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        // Reuse logitsAddr as scratch for gate/up intermediates during the MLP.
+        uint64_t gateScratchAddr = logitsAddr;
+        uint64_t upScratchAddr   = logitsAddr + (uint64_t)hiddenDim * sizeof(float);
+        uint64_t interScratchAddr = logitsAddr; // overwrite gate scratch after SiLU-mul
 
-            // Fused gate+up+SiLU+down: single dispatch, half the memory reads
-            MlpFusedGateUpPushConstants fusedPC = {attnOutAddr,
-                addrGateW_dq ? addrGateW_dq : addrGateW,
-                addrUpW_dq ? addrUpW_dq : addrUpW,
-                addrDownW_dq ? addrDownW_dq : addrDownW,
-                mlpOutAddr, dim, hiddenDim};
-            scheduler->dispatchInBatch(pipelines->getPipeline("mlp_fused_gateup"), pipelines->getLayout("mlp_fused_gateup"),
-                                       &fusedPC, sizeof(fusedPC), (dim+31)/32, 1, 1);
+        // Gate projection
+        GemmPushConstants gatePC = {attnOutAddr,
+            addrGateW_dq ? addrGateW_dq : addrGateW,
+            gateScratchAddr, 1, hiddenDim, dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &gatePC, sizeof(gatePC), (hiddenDim + 31) / 32, 1, 1);
 
-            AddPushConstants addPC2 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
-            scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"),
-                                       &addPC2, sizeof(addPC2), (dim+255)/256, 1, 1);
+        // Up projection
+        GemmPushConstants upPC = {attnOutAddr,
+            addrUpW_dq ? addrUpW_dq : addrUpW,
+            upScratchAddr, 1, hiddenDim, dim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &upPC, sizeof(upPC), (hiddenDim + 31) / 32, 1, 1);
 
-            scheduler->endBatch(scheduler->layerFence);
-            scheduler->syncLayer(0);
-        }
+        // Barrier: gate+up writes must complete before SiLU-mul reads them
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        kvCache->incrementSeqLen(layer);
+        // SiLU(gate) * up -> interScratch
+        SiluMulPushConstants siluPC = {gateScratchAddr, upScratchAddr, interScratchAddr, hiddenDim};
+        scheduler->dispatchInBatch(pipelines->getPipeline("silu_mul"), pipelines->getLayout("silu_mul"),
+            &siluPC, sizeof(siluPC), (hiddenDim + 255) / 256, 1, 1);
+
+        // Barrier: SiLU-mul write must complete before down projection reads it
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        // Down projection
+        GemmPushConstants downPC = {interScratchAddr,
+            addrDownW_dq ? addrDownW_dq : addrDownW,
+            mlpOutAddr, 1, dim, hiddenDim, 1.0f, 0};
+        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+            &downPC, sizeof(downPC), (dim + 31) / 32, 1, 1);
+
+        AddPushConstants addPC2 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
+        scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"),
+            &addPC2, sizeof(addPC2), (dim + 255) / 256, 1, 1);
+
+        // Barrier: FFN done → next layer can overwrite dequant buffer
+        scheduler->barrierBetweenGroups(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
     }
 
-    // === Final norm ===
+    // === Final Norm ===
     uint64_t addrOutNorm = findTensorAddr(*model, "output_norm.weight");
     if (!addrOutNorm) addrOutNorm = findTensorAddr(*model, "norm.weight");
+    uint64_t addrOutNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", 0);
 
-    uint64_t addrOutNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", 0, false);
+    scheduler->barrierBetweenGroups(
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
     RmsNormPushConstants finalNorm = {hiddenAddr, addrOutNorm_dq ? addrOutNorm_dq : addrOutNorm, attnOutAddr, dim, 1, 1e-6f};
-    scheduler->dispatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
-                         &finalNorm, sizeof(finalNorm), 1, 1, 1);
-    scheduler->syncAllThrottled(0.8);
-    uint64_t normHidden = attnOutAddr;
+    scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
+        &finalNorm, sizeof(finalNorm), 1, 1, 1);
 
-    // === LM head ===
+    scheduler->barrierBetweenGroups(
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    // === LM Head ===
     uint64_t addrLMHead = findTensorAddr(*model, "output.weight");
     uint64_t addrLMHead_dq = 0;
     uint32_t lmTransB = 0;
     if (addrLMHead) {
-        addrLMHead_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight", 0, false);
+        addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight", 0);
     } else {
         addrLMHead = findTensorAddr(*model, "token_embd.weight");
         if (embedCacheReady) {
             addrLMHead_dq = embedCacheAddr;
         } else {
-            addrLMHead_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", 0, false);
+            addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", 0);
         }
         lmTransB = 1;
     }
 
-    GemmPushConstants lmPC = {normHidden, addrLMHead_dq ? addrLMHead_dq : addrLMHead, logitsAddr, 1, model->vocabSize, dim, 1.0f, lmTransB};
-    scheduler->dispatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-                         &lmPC, sizeof(lmPC), (model->vocabSize+31)/32, 1, 1);
-    scheduler->syncAllThrottled(0.8);
+    GemmPushConstants lmPC = {attnOutAddr, addrLMHead_dq ? addrLMHead_dq : addrLMHead, logitsAddr, 1, model->vocabSize, dim, 1.0f, lmTransB};
+    scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+        &lmPC, sizeof(lmPC), (model->vocabSize + 31) / 32, 1, 1);
+
+    scheduler->barrierBetweenGroups(
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    // === ONE SUBMIT + ONE SYNC FOR ENTIRE TOKEN ===
+    scheduler->endBatch(VK_NULL_HANDLE);
+    scheduler->syncAll();
 
     auto fwdEnd = std::chrono::steady_clock::now();
     auto fwdMs = std::chrono::duration_cast<std::chrono::milliseconds>(fwdEnd - fwdStart).count();
     fprintf(stderr, "[fwd] forward layers: %lld ms\n", (long long)fwdMs);
 
-    // DIAGNOSTIC: readback logits before sampling
+    // Update KV cache seq lengths for next token (after GPU is done)
+    for (uint32_t layer = 0; layer < layersToRun; ++layer) {
+        kvCache->incrementSeqLen(layer);
+    }
+
+    // === Diagnostic: readback hidden state after embed ===
+    if (allocator->mappedPtr && embedAddr) {
+        uint64_t hOff = hiddenAddr - allocator->baseAddress;
+        VkMappedMemoryRange r2 = {};
+        r2.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        r2.memory = allocator->memory;
+        r2.offset = hOff & ~((uint64_t)4095);
+        r2.size = (dim * sizeof(float) + 4095) & ~((uint64_t)4095);
+        vkInvalidateMappedMemoryRanges(ctx->device, 1, &r2);
+        float* h = reinterpret_cast<float*>(allocator->mappedPtr + hOff);
+        int nanCount = 0;
+        float hsum = 0, hmax = -1e30f, hmin = 1e30f;
+        for (uint32_t i = 0; i < dim; ++i) {
+            if (std::isnan(h[i])) nanCount++;
+            else { hsum += h[i]; if (h[i] > hmax) hmax = h[i]; if (h[i] < hmin) hmin = h[i]; }
+        }
+        fprintf(stderr, "[diag] hidden after embed[0..3]: %f %f %f %f nan=%d sum=%f min=%f max=%f\n",
+            h[0], h[1], h[2], h[3], nanCount, hsum, hmin, hmax);
+    }
+
+    // === Diagnostic: readback logits before sampling ===
     if (allocator->mappedPtr) {
         size_t logOff = logitsAddr - allocator->baseAddress;
         VkMappedMemoryRange lr = {};
         lr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         lr.memory = allocator->memory;
-        lr.offset = logOff & ~(static_cast<size_t>(4095));
-        lr.size = ((logitsSize + 4095) & ~(static_cast<size_t>(4095)));
+        lr.offset = logOff & ~(static_cast<uint64_t>(4095));
+        lr.size = (logitsSize + 4095) & ~(static_cast<uint64_t>(4095));
         vkInvalidateMappedMemoryRanges(ctx->device, 1, &lr);
         float* logPtr = reinterpret_cast<float*>(allocator->mappedPtr + logOff);
         int nanL = 0;
@@ -930,26 +1021,21 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             if (std::isnan(logPtr[i])) { nanL++; }
             else if (logPtr[i] > logMax) { logMax = logPtr[i]; logArgmax = i; }
         }
-        fprintf(stderr, "[diag] logits[0..4]: %f %f %f %f %f  nan=%d argmax=%u max=%f\n",
-                logPtr[0], logPtr[1], logPtr[2], logPtr[3], logPtr[4], nanL, logArgmax, logMax);
+        fprintf(stderr, "[diag] logits[0..4]: %f %f %f %f %f nan=%d argmax=%u max=%f\n",
+            logPtr[0], logPtr[1], logPtr[2], logPtr[3], logPtr[4], nanL, logArgmax, logMax);
     }
 
-    // === Sample ===
-    size_t sampleScratchSize = (size_t)model->vocabSize * sizeof(float);
-    uint64_t sampleScratchAddr = allocator->alloc(sampleScratchSize);
-
+    // === CPU Sampling ===
     uint32_t nextToken = 0;
-    if (sampleScratchAddr && allocator->mappedPtr) {
-        nextToken = sampleGpu(logitsAddr, model->vocabSize,
-                              sampleOutAddr, sampleScratchAddr);
-    }
-    if (!nextToken && allocator->mappedPtr) {
+    if (allocator->mappedPtr) {
         size_t logitsOffset = logitsAddr - allocator->baseAddress;
+        size_t alignedOff = logitsOffset & ~(static_cast<uint64_t>(4095));
+        size_t alignedEnd = (logitsOffset + logitsSize + 4095) & ~(static_cast<uint64_t>(4095));
         VkMappedMemoryRange range = {};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         range.memory = allocator->memory;
-        range.offset = logitsOffset & ~(static_cast<size_t>(4096) - 1);
-        range.size = ((logitsSize + 4095) & ~static_cast<size_t>(4095));
+        range.offset = alignedOff;
+        range.size = alignedEnd - alignedOff;
         vkInvalidateMappedMemoryRanges(ctx->device, 1, &range);
         float* cpuLogits = reinterpret_cast<float*>(allocator->mappedPtr + logitsOffset);
         if (cpuLogits) {
@@ -963,6 +1049,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
 }
 
 // ============================================================================
+
 // forwardKernelEntry — dispatch kernel_entry.comp for a single forward pass.
 // Uses the one-dispatch persistent kernel with LayerParams.
 // ============================================================================

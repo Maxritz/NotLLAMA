@@ -1,0 +1,374 @@
+--- a/src/host/inference_engine.cpp
++++ b/src/host/inference_engine.cpp
+@@ -180,6 +180,112 @@
+     return true;
+ }
+
++// ============================================================================
++// PHASE 2B: Pre-dequantize ALL weights at load time (ONE time, not per token)
++// ============================================================================
++bool InferenceEngine::initWeightBuffer() {
++    if (!model) return false;
++
++    size_t totalBytes = 0;
++    for (auto& t : model->tensors) {
++        if (t.format == QuantFormat::F16 || t.format == QuantFormat::F32) continue;
++        uint32_t nElements = 1;
++        for (auto d : t.shape) nElements *= d;
++        totalBytes += (size_t)nElements * sizeof(float);
++    }
++
++    if (totalBytes == 0) {
++        fprintf(stderr, "[weight-buffer] All weights already F16/F32, skipping pre-dequant.\n");
++        weightBufferSize = 0;
++        weightBufferAddr = 0;
++        return true;
++    }
++
++    fprintf(stderr, "[weight-buffer] allocating %zu MB for pre-dequantized weights\n",
++        totalBytes / 1024 / 1024);
++
++    VkBufferCreateInfo bufInfo = {};
++    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++    bufInfo.size = totalBytes;
++    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++    VkResult r = vkCreateBuffer(ctx->device, &bufInfo, nullptr, &weightBuffer);
++    if (r != VK_SUCCESS) { fprintf(stderr, "[weight-buffer] vkCreateBuffer failed: %d\n", r); return false; }
++
++    VkMemoryRequirements memReq;
++    vkGetBufferMemoryRequirements(ctx->device, weightBuffer, &memReq);
++
++    VkPhysicalDeviceMemoryProperties memProps;
++    vkGetPhysicalDeviceMemoryProperties(ctx->physicalDevice, &memProps);
++
++    uint32_t memTypeIndex = UINT32_MAX;
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
++        if ((memReq.memoryTypeBits & (1 << i)) &&
++            (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++            memTypeIndex = i; break;
++        }
++    }
++    if (memTypeIndex == UINT32_MAX) return false;
++
++    VkMemoryAllocateFlagsInfo flagsInfo = {};
++    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
++    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++
++    VkMemoryAllocateInfo allocInfo = {};
++    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    allocInfo.allocationSize = memReq.size;
++    allocInfo.memoryTypeIndex = memTypeIndex;
++    allocInfo.pNext = &flagsInfo;
++
++    r = vkAllocateMemory(ctx->device, &allocInfo, nullptr, &weightMemory);
++    if (r != VK_SUCCESS) return false;
++
++    vkBindBufferMemory(ctx->device, weightBuffer, weightMemory, 0);
++
++    VkBufferDeviceAddressInfo addrInfo = {};
++    addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
++    addrInfo.buffer = weightBuffer;
++    weightBufferAddr = vkGetBufferDeviceAddress(ctx->device, &addrInfo);
++
++    fprintf(stderr, "[weight-buffer] dequantizing %zu tensors...\n", model->tensors.size());
++    auto dqStart = std::chrono::steady_clock::now();
++
++    scheduler->beginBatch(0);
++    size_t offset = 0;
++    for (auto& t : model->tensors) {
++        if (t.format == QuantFormat::F16 || t.format == QuantFormat::F32) {
++            weightAddrs[t.name] = t.gpuAddress;
++            continue;
++        }
++        uint32_t nElements = 1;
++        for (auto d : t.shape) nElements *= d;
++        uint32_t elemPerChunk = 256 * 1024 * 32;
++        uint32_t elemOff = 0;
++        while (elemOff < nElements) {
++            uint32_t chunk = std::min(elemPerChunk, nElements - elemOff);
++            uint32_t chunkWg = (chunk + 31) / 32;
++            DequantizePushConstants pc = {};
++            pc.addrQuant = t.gpuAddress;
++            pc.addrOut = weightBufferAddr + offset + (uint64_t)elemOff * sizeof(float);
++            pc.nElements = chunk;
++            pc.quantFormat = static_cast<uint32_t>(t.format);
++            pc.totalThreads = chunkWg * 32;
++            pc.elementOffset = elemOff;
++            scheduler->dispatchInBatch(
++                pipelines->getPipeline("dequantize"),
++                pipelines->getLayout("dequantize"),
++                &pc, sizeof(pc), chunkWg, 1, 1);
++            elemOff += chunk;
++        }
++        weightAddrs[t.name] = weightBufferAddr + offset;
++        offset += (size_t)nElements * sizeof(float);
++    }
++    scheduler->endBatch(VK_NULL_HANDLE);
++    scheduler->syncAll();
++
++    auto dqEnd = std::chrono::steady_clock::now();
++    auto dqMs = std::chrono::duration_cast<std::chrono::milliseconds>(dqEnd - dqStart).count();
++    fprintf(stderr, "[weight-buffer] ready @ 0x%llx (%zu MB) in %lld ms\n",
++        (unsigned long long)weightBufferAddr, totalBytes / 1024 / 1024, (long long)dqMs);
++    weightBufferSize = totalBytes;
++    return true;
++}
++
+ uint32_t InferenceEngine::forward(uint32_t tokenId, uint32_t seqPos) {
+     if (kernelEntryReady && weightBufferAddr != 0) {
+         return forwardKernelEntry(tokenId, seqPos);
+@@ -187,6 +293,14 @@
+     return forwardPartial(tokenId, seqPos, model->blockCount);
+ }
+
++// ============================================================================
++// PHASE 2A: Single VkCommandBuffer for ENTIRE forward pass.
++// All dispatches recorded into one cmd buffer with vkCmdPipelineBarrier between
++// dependent operations. ONE vkQueueSubmit per token. ONE vkWaitForFences.
++//
++// CRITICAL: For single-token generation, seqLen = seqPos + 1 for ALL layers.
++// This is because each layer writes its own KV cache independently.
++// ============================================================================
+ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint32_t maxLayers) {
+     uint32_t dim = model->embeddingLength;
+     uint32_t hiddenDim = model->feedForwardLength;
+@@ -194,7 +308,7 @@
+     uint32_t headDim = dim / model->headCount;
+     uint32_t seqLen = seqPos + 1;  // All layers see the same seqLen for this token
+
+-    // Allocate activation buffers from ring allocator
++    // Allocate activation buffers
+     uint64_t attnOutAddr = allocator->alloc(dim * sizeof(float), 256);
+     uint64_t qRowAddr = allocator->alloc(dim * sizeof(float), 256);
+     uint64_t kRowAddr = allocator->alloc(headDim * model->headCountKv * sizeof(float), 256);
+@@ -213,234 +327,120 @@
+     uint64_t hiddenAddr = hiddenStateAddr + (uint64_t)seqPos * dim * sizeof(float);
+     uint64_t lastLogitsAddr = logitsAddr + (uint64_t)lastLogitsOffset * model->vocabSize * sizeof(float);
+
++    // === RECORD ENTIRE FORWARD PASS INTO ONE COMMAND BUFFER ===
++    scheduler->beginBatch(0);
++
+     // === Embedding ===
+     uint64_t embedAddr = findTensorAddr(*model, "token_embd.weight");
+     if (embedAddr) {
+-        uint64_t embedAddr_dq = 0;
+-        if (embedCacheReady) {
+-            embedAddr_dq = embedCacheAddr;
+-        } else {
+-            embedAddr_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", 0, false);
+-        }
++        uint64_t embedAddr_dq = embedCacheReady ? embedCacheAddr : weightAddrs["token_embd.weight"];
++        if (!embedAddr_dq) embedAddr_dq = embedAddr;
+         EmbedPushConstants embedPC = {embedAddr_dq ? embedAddr_dq : embedAddr, hiddenAddr, tokenId, seqPos, dim};
+-        scheduler->dispatch(pipelines->getPipeline("embed"), pipelines->getLayout("embed"),
++        scheduler->dispatchInBatch(pipelines->getPipeline("embed"), pipelines->getLayout("embed"),
+             &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
+-        scheduler->syncAllThrottled(0.8);
++        scheduler->barrierBetweenGroups(
++            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+     }
+
+     uint32_t layersToRun = std::min(maxLayers, model->blockCount);
+
+     for (uint32_t layer = 0; layer < layersToRun; ++layer) {
+         std::string prefix = "blk." + std::to_string(layer);
+
+-        uint64_t addrAttnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", 0, false);
+-        uint64_t addrQW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", 0, false);
+-        uint64_t addrKW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", qSize, false);
+-        uint64_t addrVW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", qSize + kSize, false);
+-        uint64_t addrOW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", qSize + kSize + vSize, false);
+-        scheduler->syncAllThrottled(0.8);
++        // === Attention (all in same cmd buffer) ===
++        uint64_t addrAttnNorm = weightAddrs[prefix + ".attn_norm.weight"];
++        if (!addrAttnNorm) addrAttnNorm = findTensorAddr(*model, prefix + ".attn_norm.weight");
+
+-        uint64_t addrAttnNorm = findTensorAddr(*model, prefix + ".attn_norm.weight");
+-        uint64_t addrQW = findTensorAddr(*model, prefix + ".attn_q.weight");
+-        uint64_t addrKW = findTensorAddr(*model, prefix + ".attn_k.weight");
+-        uint64_t addrVW = findTensorAddr(*model, prefix + ".attn_v.weight");
+-        uint64_t addrOW = findTensorAddr(*model, prefix + ".attn_output.weight");
++        RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
++        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
++            &normPC, sizeof(normPC), 1, 1, 1);
+
+-        scheduler->beginBatch(0);
+-        RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm_dq ? addrAttnNorm_dq : addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"), &normPC, sizeof(normPC), 1, 1, 1);
++        uint64_t addrQW = weightAddrs[prefix + ".attn_q.weight"];
++        uint64_t addrKW = weightAddrs[prefix + ".attn_k.weight"];
++        uint64_t addrVW = weightAddrs[prefix + ".attn_v.weight"];
++        if (!addrQW) addrQW = findTensorAddr(*model, prefix + ".attn_q.weight");
++        if (!addrKW) addrKW = findTensorAddr(*model, prefix + ".attn_k.weight");
++        if (!addrVW) addrVW = findTensorAddr(*model, prefix + ".attn_v.weight");
+
+         uint64_t normHidden = attnOutAddr;
+-        GemmPushConstants qPC = {normHidden, addrQW_dq ? addrQW_dq : addrQW, qRowAddr, 1, dim, dim, 1.0f, 0};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &qPC, sizeof(qPC), (dim+31)/32, 1, 1);
+-        GemmPushConstants kPC = {normHidden, addrKW_dq ? addrKW_dq : addrKW, kRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &kPC, sizeof(kPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
+-        GemmPushConstants vPC = {normHidden, addrVW_dq ? addrVW_dq : addrVW, vRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &vPC, sizeof(vPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
++        GemmPushConstants qPC = {normHidden, addrQW, qRowAddr, 1, dim, dim, 1.0f, 0};
++        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
++            &qPC, sizeof(qPC), (dim+31)/32, 1, 1);
++        GemmPushConstants kPC = {normHidden, addrKW, kRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
++        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
++            &kPC, sizeof(kPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
++        GemmPushConstants vPC = {normHidden, addrVW, vRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
++        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
++            &vPC, sizeof(vPC), ((uint32_t)(headDim*model->headCountKv)+31)/32, 1, 1);
+
+         scheduler->barrierBetweenGroups(
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+         uint32_t ropeTotal = model->headCount * headDim;
+-        RopePushConstants ropePC = {qRowAddr, kRowAddr, seqLen, headDim, model->headCount, model->headCountKv, 10000.0f, 1.0f};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("rope"), pipelines->getLayout("rope"), &ropePC, sizeof(ropePC), (ropeTotal + 31) / 32, 1, 1);
++        RopePushConstants ropePC = {qRowAddr, kRowAddr, seqLen, headDim, model->headCount, model->headCountKv, 10000.0f, 1.0f};
++        scheduler->dispatchInBatch(pipelines->getPipeline("rope"), pipelines->getLayout("rope"),
++            &ropePC, sizeof(ropePC), (ropeTotal + 31) / 32, 1, 1);
+
+         uint64_t kCacheAddr = kvCache->getKBufferAddress(layer);
+         uint64_t vCacheAddr = kvCache->getVBufferAddress(layer);
+         if (kCacheAddr && vCacheAddr) {
+-            KVCacheWritePushConstants kvPC = {kRowAddr, vRowAddr, kCacheAddr, vCacheAddr, seqPos, headDim, model->headCountKv};
+-            scheduler->dispatchInBatch(pipelines->getPipeline("kv_cache_write"), pipelines->getLayout("kv_cache_write"), &kvPC, sizeof(kvPC), (headDim * model->headCountKv + 31) / 32, 1, 1);
++            KVCacheWritePushConstants kvPC = {kRowAddr, vRowAddr, kCacheAddr, vCacheAddr, seqPos, headDim, model->headCountKv};
++            scheduler->dispatchInBatch(pipelines->getPipeline("kv_cache_write"), pipelines->getLayout("kv_cache_write"),
++                &kvPC, sizeof(kvPC), (headDim * model->headCountKv + 31) / 32, 1, 1);
+         }
+
+         for (uint32_t h = 0; h < model->headCount; ++h) {
+-            AttentionPushConstants attnPC = {qAddr, kCacheAddr, vCacheAddr, attnOutAddr, seqLen, headDim, model->headCount, model->headCountKv, h, 1.0f / std::sqrt(static_cast<float>(headDim))};
+-            scheduler->dispatchInBatch(pipelines->getPipeline("attention"), pipelines->getLayout("attention"), &attnPC, sizeof(attnPC), 1, 1, 1);
++            AttentionPushConstants attnPC = {qAddr, kCacheAddr, vCacheAddr, attnOutAddr, seqLen, headDim, model->headCount, model->headCountKv, h, 1.0f / std::sqrt(static_cast<float>(headDim))};
++            scheduler->dispatchInBatch(pipelines->getPipeline("attention"), pipelines->getLayout("attention"),
++                &attnPC, sizeof(attnPC), 1, 1, 1);
+         }
+
+         scheduler->barrierBetweenGroups(
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+-        GemmPushConstants outPC = {attnOutAddr, addrOW_dq ? addrOW_dq : addrOW, mlpOutAddr, 1, dim, dim, 1.0f, 0};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &outPC, sizeof(outPC), (dim+31)/32, 1, 1);
++        uint64_t addrOW = weightAddrs[prefix + ".attn_output.weight"];
++        if (!addrOW) addrOW = findTensorAddr(*model, prefix + ".attn_output.weight");
++        GemmPushConstants outPC = {attnOutAddr, addrOW, mlpOutAddr, 1, dim, dim, 1.0f, 0};
++        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
++            &outPC, sizeof(outPC), (dim+31)/32, 1, 1);
+
+         AddPushConstants addPC1 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
+         scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"), &addPC1, sizeof(addPC1), (dim+255)/256, 1, 1);
+
+-        scheduler->endBatch(VK_NULL_HANDLE);
+-        scheduler->syncAll();
+-
+-        uint64_t addrFfnNorm = findTensorAddr(*model, prefix + ".ffn_norm.weight");
+-        uint64_t addrFfnNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", 0, false);
+-
+-        size_t upSize = getF16OutputSize(*model, prefix + ".ffn_up.weight");
+-        size_t gateSize = getF16OutputSize(*model, prefix + ".ffn_gate.weight");
+-
+-        uint64_t addrUpW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", 0, false);
+-        uint64_t addrGateW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", upSize, false);
+-        uint64_t addrDownW_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", upSize + gateSize, false);
+-        scheduler->syncAllThrottled(0.8);
++        scheduler->barrierBetweenGroups(
++            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+-        scheduler->beginBatch(0);
+-        RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm_dq ? addrFfnNorm_dq : addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"), &ffnNormPC, sizeof(ffnNormPC), 1, 1, 1);
++        // === FFN ===
++        uint64_t addrFfnNorm = weightAddrs[prefix + ".ffn_norm.weight"];
++        if (!addrFfnNorm) addrFfnNorm = findTensorAddr(*model, prefix + ".ffn_norm.weight");
++        RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
++        scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
++            &ffnNormPC, sizeof(ffnNormPC), 1, 1, 1);
+
+-        scheduler->barrierBetweenGroups(
+-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
++        uint64_t addrUpW = weightAddrs[prefix + ".ffn_up.weight"];
++        uint64_t addrGateW = weightAddrs[prefix + ".ffn_gate.weight"];
++        uint64_t addrDownW = weightAddrs[prefix + ".ffn_down.weight"];
++        if (!addrUpW) addrUpW = findTensorAddr(*model, prefix + ".ffn_up.weight");
++        if (!addrGateW) addrGateW = findTensorAddr(*model, prefix + ".ffn_gate.weight");
++        if (!addrDownW) addrDownW = findTensorAddr(*model, prefix + ".ffn_down.weight");
+
+-        uint64_t addrUpW = findTensorAddr(*model, prefix + ".ffn_up.weight");
+-        uint64_t addrGateW = findTensorAddr(*model, prefix + ".ffn_gate.weight");
+-        uint64_t addrDownW = findTensorAddr(*model, prefix + ".ffn_down.weight");
+-
+-        MlpFusedGateUpPushConstants fusedPC = {attnOutAddr, addrGateW_dq ? addrGateW_dq : addrGateW, addrUpW_dq ? addrUpW_dq : addrUpW, addrDownW_dq ? addrDownW_dq : addrDownW, mlpOutAddr, dim, hiddenDim};
+-        scheduler->dispatchInBatch(pipelines->getPipeline("mlp_fused_gateup"), pipelines->getLayout("mlp_fused_gateup"), &fusedPC, sizeof(fusedPC), (dim+31)/32, 1, 1);
++        MlpFusedGateUpPushConstants fusedPC = {attnOutAddr, addrGateW, addrUpW, addrDownW, mlpOutAddr, dim, hiddenDim};
++        scheduler->dispatchInBatch(pipelines->getPipeline("mlp_fused_gateup"), pipelines->getLayout("mlp_fused_gateup"),
++            &fusedPC, sizeof(fusedPC), (dim+31)/32, 1, 1);
+
+         AddPushConstants addPC2 = {hiddenAddr, mlpOutAddr, hiddenAddr, dim};
+         scheduler->dispatchInBatch(pipelines->getPipeline("add"), pipelines->getLayout("add"), &addPC2, sizeof(addPC2), (dim+255)/256, 1, 1);
+
+-        scheduler->endBatch(VK_NULL_HANDLE);
+-        scheduler->syncAll();
++        scheduler->barrierBetweenGroups(
++            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+-        kvCache->incrementSeqLen(layer);
++        // NO SYNC HERE — next layer continues in same cmd buffer
+     }
+
++    // === Final Norm + LM Head + Sampling ===
+     uint64_t addrOutNorm = findTensorAddr(*model, "output_norm.weight");
+-    uint64_t addrOutNorm_dq = dequantWeight(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", 0, false);
++    uint64_t addrOutNorm_dq = weightAddrs["output_norm.weight"];
++    if (!addrOutNorm_dq) addrOutNorm_dq = findTensorAddr(*model, "output_norm.weight");
+
+-    scheduler->beginBatch(0);
+     RmsNormPushConstants outNormPC = {hiddenAddr, addrOutNorm_dq ? addrOutNorm_dq : addrOutNorm, attnOutAddr, dim, 1, 1e-6f};
+-    scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"), &outNormPC, sizeof(outNormPC), 1, 1, 1);
++    scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
++        &outNormPC, sizeof(outNormPC), 1, 1, 1);
+
+     scheduler->barrierBetweenGroups(
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+     uint64_t addrLMHead = findTensorAddr(*model, "output.weight");
+-    GemmPushConstants lmPC = {attnOutAddr, addrLMHead, lastLogitsAddr, 1, model->vocabSize, dim, 1.0f, 0};
+-    scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"), &lmPC, sizeof(lmPC), (model->vocabSize + 31) / 32, 1, 1);
++    GemmPushConstants lmPC = {attnOutAddr, addrLMHead, lastLogitsAddr, 1, model->vocabSize, dim, 1.0f, 0};
++    scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
++        &lmPC, sizeof(lmPC), (model->vocabSize + 31) / 32, 1, 1);
+
+     scheduler->barrierBetweenGroups(
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+     uint32_t seed = static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+-    TopKPushConstants topkPC = {lastLogitsAddr, outputTokenAddr, scratchAddr, model->vocabSize, 1.0f, 40, 0.9f, seed};
+-    scheduler->dispatchInBatch(pipelines->getPipeline("topk"), pipelines->getLayout("topk"), &topkPC, sizeof(topkPC), 1, 1, 1);
++    TopKPushConstants topkPC = {lastLogitsAddr, outputTokenAddr, scratchAddr, model->vocabSize, 1.0f, 40, 0.9f, seed};
++    scheduler->dispatchInBatch(pipelines->getPipeline("topk"), pipelines->getLayout("topk"),
++        &topkPC, sizeof(topkPC), 1, 1, 1);
+
++    // === ONE SUBMIT + ONE SYNC FOR ENTIRE FORWARD PASS ===
+     scheduler->endBatch(VK_NULL_HANDLE);
+     scheduler->syncAll();
+
++    // Increment KV cache seq lens AFTER GPU is done (for next token)
++    for (uint32_t layer = 0; layer < layersToRun; ++layer) {
++        kvCache->incrementSeqLen(layer);
++    }
++
+     // Read back sampled token
+     uint32_t sampledToken = 0;
+     if (logitsMapped) {

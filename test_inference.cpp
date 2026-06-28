@@ -123,8 +123,10 @@ int main(int argc, char** argv) {
     loadPipe("rope", sizeof(RopePushConstants));
     loadPipe("topk", sizeof(TopKPushConstants));
     loadPipe("add", sizeof(AddPushConstants));
+    loadPipe("silu_mul", sizeof(SiluMulPushConstants));
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
+    loadPipe("embed_q8_0", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
     loadPipe("dequantize", sizeof(DequantizePushConstants));
     loadPipe("kernel_entry", sizeof(KernelEntryPushConstants));

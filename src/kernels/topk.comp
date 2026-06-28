@@ -62,6 +62,13 @@ void main() {
     uint globalTid = gl_WorkGroupID.x * wgSize + tid;
     uint totalThreads = gl_NumWorkGroups.x * wgSize;
 
+    // Zero-initialize shared memory to avoid garbage on NaN/empty paths
+    s_val[tid] = 0.0;
+    s_idx[tid] = 0;
+    s_topk_idx[tid] = 0;
+    s_topk_prob[tid] = 0.0;
+    barrier();
+
     LogitsRef logits = LogitsRef(pc.addrLogits);
     OutputRef outBuf = OutputRef(pc.addrOutput);
     ScratchRef scratch = ScratchRef(pc.addrScratch);

@@ -196,7 +196,103 @@ class GGUFLoader:
         floats = [struct.unpack("<e", raw[i*2:(i+1)*2])[0] for i in range(num_elements)]
         return floats, shape
 
-    def dequantize_q6_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+    def dequantize_q4_1(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q4_1 — 32 elements/block, 20 bytes. d@0, dmin@2, qs@4."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        for _ in range((num_elements + 31) // 32):
+            delta = struct.unpack("<e", raw[pos:pos+2])[0]
+            delta_min = struct.unpack("<e", raw[pos+2:pos+4])[0]
+            pos += 4
+            qs = raw[pos:pos+16]
+            pos += 16
+            for i in range(32):
+                byte = qs[i // 2]
+                nibble = (byte >> 4) if (i % 2) else (byte & 0x0F)
+                result.append(delta * nibble + delta_min)
+        return result[:num_elements], shape
+
+    def dequantize_q5_0(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q5_0 — 32 elements/block, 22 bytes. d@0, qs@2."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        for _ in range((num_elements + 31) // 32):
+            delta = struct.unpack("<e", raw[pos:pos+2])[0]
+            pos += 2
+            qs = raw[pos:pos+20]
+            pos += 20
+            for i in range(32):
+                byte_idx = (i * 5) // 8
+                shift = (i * 5) % 8
+                # Read up to 2 bytes for 5-bit value that may span boundary
+                b0 = qs[byte_idx]
+                b1 = qs[byte_idx + 1] if byte_idx + 1 < 20 else 0
+                val = ((b0 | (b1 << 8)) >> shift) & 0x1F
+                result.append(delta * (float(val) - 16.0))
+        return result[:num_elements], shape
+
+    def dequantize_q5_1(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q5_1 — 32 elements/block, 24 bytes. d@0, dmin@2, qs@4."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        for _ in range((num_elements + 31) // 32):
+            delta = struct.unpack("<e", raw[pos:pos+2])[0]
+            delta_min = struct.unpack("<e", raw[pos+2:pos+4])[0]
+            pos += 4
+            qs = raw[pos:pos+20]
+            pos += 20
+            for i in range(32):
+                byte_idx = (i * 5) // 8
+                shift = (i * 5) % 8
+                b0 = qs[byte_idx]
+                b1 = qs[byte_idx + 1] if byte_idx + 1 < 20 else 0
+                val = ((b0 | (b1 << 8)) >> shift) & 0x1F
+                result.append(delta * float(val) + delta_min)
+        return result[:num_elements], shape
+
+    def dequantize_q8_1(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q8_1 — 32 elements/block, 36 bytes. d@0, dmin@2, qs@4."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        for _ in range((num_elements + 31) // 32):
+            delta = struct.unpack("<e", raw[pos:pos+2])[0]
+            delta_min = struct.unpack("<e", raw[pos+2:pos+4])[0]
+            pos += 4
+            qs = raw[pos:pos+32]
+            pos += 32
+            for q in qs:
+                # signed int8
+                q_signed = q if q < 128 else q - 256
+                result.append(delta * q_signed + delta_min)
+        return result[:num_elements], shape
+
+    def dequantize_q2_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q2_K — 256 elements/block, 84 bytes. d@0, dmin@2, scales@4, qs@20.
+        16 sub-blocks of 16 elements; each scale byte = low nibble (scale) + high nibble (min)."""
         info = self.tensors[name]
         raw = self.get_tensor_raw(name)
         shape = info.shape
@@ -206,37 +302,110 @@ class GGUFLoader:
         result = []
         pos = 0
         QK_K = 256
+        BLOCK_SIZE = 84
         for _ in range((num_elements + QK_K - 1) // QK_K):
             d = struct.unpack("<e", raw[pos:pos+2])[0]
-            pos += 2
-            scales = list(raw[pos:pos+16])
-            pos += 16
-            ql = raw[pos:pos+128]
-            pos += 128
-            qh = raw[pos:pos+64]
-            pos += 64
+            dmin = struct.unpack("<e", raw[pos+2:pos+4])[0]
+            scales = raw[pos+4:pos+20]   # 16 bytes
+            qs = raw[pos+20:pos+84]      # 64 bytes
+            pos += BLOCK_SIZE
 
-            for j in range(16):
-                sc = scales[j]
+            for j in range(16):          # 16 sub-blocks
+                sc = scales[j] & 0xF
+                m = scales[j] >> 4
                 for l in range(16):
-                    idx = j * 16 + l
-                    if idx >= QK_K:
-                        break
-                    q4_low = ql[(j * 16 + l) // 2]
-                    qh_byte = qh[(j * 16 + l) // 4]
+                    byte_idx = j * 4 + l // 4
                     shift = (l % 4) * 2
-                    val = ((q4_low & 0xF) | (((qh_byte >> shift) & 3) << 4)) - 32
-                    result.append(d * sc * val)
+                    q2 = (qs[byte_idx] >> shift) & 3
+                    result.append(d * sc * q2 - dmin * m)
+        return result[:num_elements], shape
+
+    def dequantize_q8_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q8_K — 256 elements/block, 290 bytes. d@0, scales@2, qs@34.
+        8 sub-blocks of 32 elements, each with an int8 scale."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        QK_K = 256
+        BLOCK_SIZE = 290
+        for _ in range((num_elements + QK_K - 1) // QK_K):
+            d = struct.unpack("<e", raw[pos:pos+2])[0]
+            scales = raw[pos+2:pos+34]   # 32 signed int8 scales
+            qs = raw[pos+34:pos+290]     # 256 signed int8 quants
+            pos += BLOCK_SIZE
+
+            for j in range(8):           # 8 sub-blocks of 32
+                sc = scales[j] if scales[j] < 128 else scales[j] - 256
+                for l in range(32):
+                    q = qs[j * 32 + l]
+                    q_signed = q if q < 128 else q - 256
+                    result.append(d * sc * q_signed)
+        return result[:num_elements], shape
+
+    def dequantize_q6_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
+        """Dequantize Q6_K — d-last layout: ql[128], qh[64], scales[16], d@208."""
+        info = self.tensors[name]
+        raw = self.get_tensor_raw(name)
+        shape = info.shape
+        num_elements = 1
+        for d in shape: num_elements *= d
+
+        result = []
+        pos = 0
+        QK_K = 256
+        BLOCK_SIZE = 210
+        for _ in range((num_elements + QK_K - 1) // QK_K):
+            # d-last layout per GGML/llama.cpp block_q6_K
+            ql = raw[pos:pos+128]
+            qh = raw[pos+128:pos+192]
+            scales = raw[pos+192:pos+208]
+            d = struct.unpack("<e", raw[pos+208:pos+210])[0]
+            pos += BLOCK_SIZE
+
+            for n in range(QK_K):
+                # ql: 128 bytes, 2 nibbles per byte
+                ql_byte = ql[n // 2]
+                q4 = (ql_byte & 0xF) if (n & 1) == 0 else ((ql_byte >> 4) & 0xF)
+
+                # qh: 64 bytes, 4× 2-bit values per byte
+                qh_byte = qh[n // 4]
+                qh_shift = (n & 3) * 2
+                qh_bits = (qh_byte >> qh_shift) & 3
+
+                # 6-bit value: low 4 bits from ql, high 2 bits from qh
+                val = int((q4 | (qh_bits << 4))) - 32
+
+                # scale: 16 scales for 256 elements = 1 scale per 16 elements
+                sc = scales[n // 16]
+                sc_signed = sc if sc < 128 else sc - 256
+                result.append(d * sc_signed * val)
         return result[:num_elements], shape
 
     def dequantize(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
         dtype = self.tensors[name].dtype
         if dtype == GGMLType.Q4_0:
             return self.dequantize_q4_0(name)
+        elif dtype == GGMLType.Q4_1:
+            return self.dequantize_q4_1(name)
+        elif dtype == GGMLType.Q5_0:
+            return self.dequantize_q5_0(name)
+        elif dtype == GGMLType.Q5_1:
+            return self.dequantize_q5_1(name)
         elif dtype == GGMLType.Q8_0:
             return self.dequantize_q8_0(name)
+        elif dtype == GGMLType.Q8_1:
+            return self.dequantize_q8_1(name)
+        elif dtype == GGMLType.Q2_K:
+            return self.dequantize_q2_k(name)
         elif dtype == GGMLType.Q6_K:
             return self.dequantize_q6_k(name)
+        elif dtype == GGMLType.Q8_K:
+            return self.dequantize_q8_k(name)
         elif dtype == GGMLType.F16:
             return self.dequantize_f16(name)
         elif dtype == GGMLType.F32:
@@ -247,7 +416,10 @@ class GGUFLoader:
             floats = [struct.unpack("<f", raw[i*4:(i+1)*4])[0] for i in range(num_elements)]
             return floats, shape
         else:
-            raise NotImplementedError(f"Dequantization for {dtype.name} not yet implemented")
+            raise NotImplementedError(
+                f"Dequantization for {dtype.name} not yet implemented "
+                f"(Q3_K, Q4_K, Q5_K and IQ formats require complex scale unpacking)"
+            )
 
     def build_buffer_descs(self) -> Dict[str, BufferDesc]:
         descs = {}

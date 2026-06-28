@@ -1,249 +1,151 @@
-# MiMo Task Assignment Round 2 — TurboQuant Host-Side + Validation
+# MiMo-task-round2.md — TurboQuant Round 2: Host Integration
 
-## Project Context
+## Why
+Round 1 delivered shaders + JSON schema + formats doc + enum. But nothing on the host side knows how to actually pack TurboQuant blocks or how the shaders receive their parameters. We need:
+1. Host-side block layout structs (so weight converter can emit valid bins)
+2. Push constant structs with compile-time size guards (so shaders can read them)
+3. Actual Python conversion functions that produce TurboQuant binaries
+4. A validation script that proves quantized accuracy is acceptable
 
-**NotLLAMA** is a Vulkan compute-only inference engine for LLMs, targeting AMD RX 9070 XT (RDNA4, 16GB VRAM). It is built on the philosophy: **"Many small units doing work together."** Weights stay quantized on GPU. Each layer dequantizes its own weights on-demand. No monolithic pre-dequantized buffers. Shaders are self-contained: dequantize → process → output.
+## Deadline
+Until Kimi finishes architecture scaffolding (est. 1 hour)
 
-### Architecture
-- **Host**: C++17, CMake, MSVC 19.44
-- **GPU**: 14 GLSL compute shaders compiled to SPIR-V via `glslc`
-- **Scheduler**: Batch-mode Vulkan queue submission with FencePool (64 fences)
-- **Inference**: Two paths — `forwardPartial()` (layer-by-layer, ring allocator) and `forwardKernelEntry()` (single-dispatch persistent mailbox kernel)
-- **Quantization**: 57 GGUF formats supported (Q1–Q8, IQ1–IQ6, Q2_K–Q8_K, F16, BF16, F32, MXFP4/6/8)
-- **Key rule**: No buffer > 1GB. No pre-dequantization at init time.
+## Task 1: include/rdna4_turboquant.hpp
+Create a new header with host-side TurboQuant block layouts.
 
-### Repository
-- Path: `C:\Users\rr\Desktop\Notllama-loc`
-- GitHub: https://github.com/Maxritz/NotLLAMA (master, LGPL-2.1)
-- Build: `cd build && cmake --build . --config Release`
-- Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
+Requirements:
+- `TQ4Block128` — 66 bytes: `uint16_t scale; uint8_t data[64];` — packed nibbles, 128 elements
+- `TQ3Block128` — 50 bytes: `uint16_t scale; uint8_t data[48];` — packed 3-bit values, 128 elements
+- `TQ6Block64` — 50 bytes: `uint16_t scale; uint8_t data[48];` — packed 6-bit values, 64 elements
+- `TQBlockHeader` — common header: `uint16_t scale; uint16_t reserved; uint32_t num_elements;`
+- `static_assert(sizeof(TQ4Block128) == 66, "...")` and same for others
+- Helper functions: `tq4_packed_size(int n)`, `tq3_packed_size(int n)`, `tq6_packed_size(int n)` — returns byte count for n elements
+- `tq4_num_blocks(int n)` — ceil(n / 128)
+- Comment: "For shader layouts, see dequant_turbo.comp / gemm_turbo.comp. This header is for host-side packing/unpacking only."
 
-## Your Assignment (Round 2)
+File: `include/rdna4_turboquant.hpp`
 
-You already delivered TurboQuant shaders, schema, docs, and enum extensions (Round 1 — COMPLETE). Now you will deliver **host-side support** so Claude can wire TurboQuant into the engine without reverse-engineering block layouts.
-
-### Deliverable 1: TurboQuant Host-Side Header Stub
-
-**File**: `include/rdna4_turboquant.hpp`
-
-Write a C++17 header stub that defines TurboQuant block layouts and host-side helpers. This is a declarations-only header — no `.cpp` implementation needed yet.
+## Task 2: include/rdna4_types.hpp append
+Append to the end of the existing file (before the last #endif guard):
 
 ```cpp
-#pragma once
-#include <cstdint>
-#include <cstddef>
-
-namespace rdna4 {
-
-// Block layout constants for each TurboQuant format
-struct TurboQuantBlockLayout {
-    uint32_t blockSize;      // Number of weights per block (64, 128, 256)
-    uint32_t bitsPerWeight;  // 3, 4, 5, 6
-    uint32_t scaleBits;      // 8 or 16
-    uint32_t bytesPerBlock;  // Total block size in bytes
-    uint32_t weightsOffset;  // Offset to packed weights (always 0)
-    uint32_t scalesOffset;   // Offset to scales (end of weights)
-    uint32_t zeroPointsOffset; // Offset to zero points (if enabled), or 0 if none
-    uint32_t alignment;      // Required buffer alignment (16, 32, 64, 128)
-};
-
-// Predefined layouts
-constexpr TurboQuantBlockLayout TQ4_128_LAYOUT = {
-    128, 4, 16,
-    66,   // 128*4/8 = 64 bytes weights + 2 bytes fp16 scale
-    0, 64, 0, 128
-};
-
-constexpr TurboQuantBlockLayout TQ3_128_LAYOUT = {
-    128, 3, 16,
-    50,   // ceil(128*3/8)=48 bytes weights + 2 bytes fp16 scale
-    0, 48, 0, 128
-};
-
-constexpr TurboQuantBlockLayout TQ6_64_LAYOUT = {
-    64, 6, 16,
-    50,   // 64*6/8 = 48 bytes weights + 2 bytes fp16 scale
-    0, 48, 0, 128
-};
-
-// Helper: compute total bytes for N weights in a given format
-size_t turboquantTensorBytes(uint64_t nWeights, const TurboQuantBlockLayout& layout);
-
-// Helper: compute number of blocks for N weights
-uint32_t turboquantBlockCount(uint64_t nWeights, uint32_t blockSize);
-
-// Push constants for dequant_turbo.comp (must match GLSL exactly)
+// ── TurboQuant push constants ─────────────────────────────────────
+// Matches layout in dequant_turbo.comp / gemm_turbo.comp.
+// static_assert guarantees <= 128 bytes per Vulkan spec.
 struct DequantTurboPushConstants {
-    uint64_t addrSrc;
-    uint64_t addrDst;
-    uint32_t n;
-    uint32_t blockSize;
-    uint32_t bits;
-    uint32_t scaleBits;
-    uint32_t zeroPoint;
-    float    scale;
-};
+    uint32_t  inputOffset;       // byte offset into input buffer
+    uint32_t  outputOffset;      // float16 offset into output buffer
+    uint32_t  elementOffset;     // first global element index
+    uint32_t  elementCount;      // total elements to dequantize
+    uint32_t  format;            // QuantFormat enum value
+    uint32_t  groupSize;         // elements per scale (1, 64, or 128)
+    uint32_t  reserved[6];       // future use
+}; // 12 × 4 = 48 bytes — well within 128
+static_assert(sizeof(DequantTurboPushConstants) <= 128,
+    "DequantTurboPushConstants must fit in 128 bytes");
 
-// Push constants for gemm_turbo.comp (must match GLSL exactly)
 struct GemmTurboPushConstants {
-    uint64_t addrA;
-    uint64_t addrB;
-    uint64_t addrC;
-    uint32_t M, K, N;
-    uint32_t blockSize;
-    uint32_t bits;
-    uint32_t scaleBits;
-    uint32_t zeroPoint;
-    float    alpha;
-};
-
-} // namespace rdna4
+    uint32_t M;                  // rows (always 1 for LLM)
+    uint32_t N;                  // cols (output features)
+    uint32_t K;                  // input features (hidden dim)
+    uint32_t inputOffset;        // byte offset into activation buffer
+    uint32_t weightOffset;       // byte offset into quantized weight buffer
+    uint32_t outputOffset;       // float16 offset into output buffer
+    uint32_t alpha;              // float16 scale (packed as uint)
+    uint32_t format;             // QuantFormat enum value
+    uint32_t KPerBlock;          // elements per quant block
+    uint32_t reserved[3];        // future use
+}; // 12 × 4 = 48 bytes
+static_assert(sizeof(GemmTurboPushConstants) <= 128,
+    "GemmTurboPushConstants must fit in 128 bytes");
 ```
 
-**Requirements**:
-- Use `#pragma once`
-- No Vulkan includes needed
-- Verify `sizeof(DequantTurboPushConstants) <= 128` bytes (Vulkan push constant minimum)
-- Verify `sizeof(GemmTurboPushConstants) <= 128` bytes
-- Add `static_assert(sizeof(...) <= 128, "Push constants too large");` for both structs
+Important: Check the current content of rdna4_types.hpp first. If the last #endif is preceded by the DequantPushConstants block, insert right before #endif.
 
-### Deliverable 2: Weight Converter Extension
+File: `include/rdna4_types.hpp` — append only
 
-**File**: `tools/weight_converter.py`
+## Task 3: tools/weight_converter.py extension
+Add three conversion functions to the existing weight_converter.py. Do NOT rewrite the file — append these functions at the end (after the `if __name__ == "__main__":` block).
 
-Extend the existing `weight_converter.py` to add TurboQuant conversion functions. You must read the existing file first to understand its structure, then append new functions.
+### convert_to_tq4(elements, scale)
+- Input: numpy float32 array, uint16 float16 scale
+- Output: bytes (66 bytes per block)
+- Block size: 128 elements
+- Process: divide each element by scale, clamp [-8,7], cast to int8, pack two int4 per byte (little-endian: low nibble first)
+- Pad last block with zeros if n % 128 != 0
+- Returns: raw bytes
 
-**Functions to add** (append to the file):
+### convert_to_tq3(elements, scale)
+- Input: numpy float32 array, uint16 float16 scale
+- Output: bytes (50 bytes per block)
+- Block size: 128 elements
+- Process: divide by scale, clamp [-4,3], cast to int8, pack four int3 per byte
+- 3-bit packing: byte[i] = v0 | (v1 << 3) | (v2 << 6) | (v3 << 1) -- wait, that's not clean 3-bit boundaries
+- Correct 3-bit packing: Use 42 values per 128-byte group (128 × 3 = 384 bits = 48 bytes exactly). Pack sequentially: bits [0:2] = val0, [3:5] = val1, etc. Every 8 elements = 3 bytes (8 × 3 = 24 bits = 3 bytes).
+- Returns: raw bytes
 
+### convert_to_tq6(elements, scale)
+- Input: numpy float32 array, uint16 float16 scale
+- Output: bytes (50 bytes per block)
+- Block size: 64 elements
+- Process: divide by scale, clamp [-32,31], cast to int8, pack two int6 per byte
+- 6-bit packing: byte[i] = v0 | (v1 << 6) -- wait, that's not clean either
+- Correct: 64 × 6 = 384 bits = 48 bytes. Pack: byte[i] = v0 | (v1 << 6) for even pairs. Actually: every 4 elements = 3 bytes (4 × 6 = 24 bits). Or simpler: 8 elements per 6 bytes (8 × 6 = 48 bits = 6 bytes).
+- Returns: raw bytes
+
+Also add a CLI entry:
 ```python
-def convert_to_tq4(weights: list[float], block_size: int = 128) -> tuple[bytes, list[float]]:
-    """Convert F32/F16 weights to TQ4_128 format.
-    
-    Returns:
-        quantized_bytes: packed quantized weights + scales
-        scales: list of per-block fp16 scales for validation
-    """
-    ...
-
-def convert_to_tq3(weights: list[float], block_size: int = 128) -> tuple[bytes, list[float]]:
-    """Convert F32/F16 weights to TQ3_128 format."""
-    ...
-
-def convert_to_tq6(weights: list[float], block_size: int = 64) -> tuple[bytes, list[float]]:
-    """Convert F32/F16 weights to TQ6_64 format."""
-    ...
+if __name__ == "__main__":
+    # ... existing code ...
+    # TurboQuant conversion test
+    # python weight_converter.py --tq-test <input.bin> <format: tq4|tq3|tq6>
 ```
 
-**Algorithm for each format**:
-1. Iterate weights in blocks of `block_size`
-2. For each block:
-   - Find `max_abs = max(|w|)`
-   - Compute scale: `scale = max_abs / ((1 << bits) - 1)` (for unsigned) or `max_abs / ((1 << (bits-1)) - 1)` (for signed). Use **signed** quantization: `q = int(round(w / scale))` clamped to `[-(2^(bits-1)), 2^(bits-1)-1]`.
-   - Write scale as little-endian fp16 (2 bytes) at end of block
-   - Pack quantized values tightly into bytes
-3. Return concatenated bytes + list of scales
+File: `tools/weight_converter.py` — append functions
 
-**Packing rules**:
-- TQ4: 2 weights per byte (low nibble first, then high nibble)
-- TQ3: 8 weights per 3 bytes. Layout: bits[0-2] in byte0[0-2], bits[3-5] in byte0[3-5], bits[6-7] in byte0[6-7] + byte1[0] ... (document the exact bit layout in comments)
-- TQ6: 4 weights per 3 bytes. Layout: bits[0-5] in byte0, bits[6-7] in byte0[6-7] + byte1[0-3], bits[8-13] in byte1[4-7] + byte2[0-1] ... (document exact layout)
+## Task 4: tools/validate_turboquant.py
+Create a standalone validation script that:
+1. Loads a GGUF model (any format)
+2. Extracts weight tensors
+3. For each TurboQuant format (TQ4_128, TQ3_128, TQ6_64):
+   a. Quantizes each weight tensor using the conversion functions
+   b. Dequantizes back to float32
+   c. Computes MSE, max absolute error, cosine similarity vs original
+4. Prints a comparison table:
+   ```
+   Format    | MSE        | MaxErr     | CosSim  | Size   | Ratio
+   TQ4_128   | 0.00123    | 0.0456     | 0.9987  | 66 B   | 0.25x
+   TQ3_128   | 0.00345    | 0.0891     | 0.9945  | 50 B   | 0.19x
+   TQ6_64    | 0.00045    | 0.0234     | 0.9998  | 50 B   | 0.19x
+   ```
+5. Tests on synthetic distributions: random uniform, random normal, structured (sin wave), sparse (mostly zeros)
+6. Exits 0 if all formats within acceptable thresholds (MSE < 0.01)
 
-**Guardrails**:
-- Do NOT modify existing functions in `weight_converter.py` unless they have bugs.
-- Append new functions at the end.
-- Include a `__main__` test block that generates random weights, converts to TQ4/TQ6, and verifies round-trip error < 5%.
+Requirements:
+- Uses numpy, struct (no gguf dependency — just reads raw binary)
+- Import weight_converter functions: `from weight_converter import convert_to_tq4, convert_to_tq3, convert_to_tq6`
+- Must be runnable standalone: `python validate_turboquant.py`
+- Add a `--model <path>` flag to test on real model weights
 
-### Deliverable 3: TurboQuant Validation Script
+File: `tools/validate_turboquant.py`
 
-**File**: `tools/validate_turboquant.py`
+## Acceptance Criteria
+1. `glslc --target-env=vulkan1.3 src/kernels/dequant_turbo.comp` still compiles
+2. `glslc --target-env=vulkan1.3 src/kernels/gemm_turbo.comp` still compiles
+3. `python tools/validate_turboquant.py` exits 0 with table output
+4. `sizeof(DequantTurboPushConstants) == 48` (verifiable via static_assert)
+5. No existing files modified except rdna4_types.hpp (append only) and weight_converter.py (append only)
+6. Each deliverable has a one-line comment at the top: `// MiMo Round 2 — <purpose>`
 
-Write a standalone Python script that validates TurboQuant accuracy.
+## Verification
+```powershell
+# Shaders still compile
+glslc --target-env=vulkan1.3 src/kernels/dequant_turbo.comp
+glslc --target-env=vulkan1.3 src/kernels/gemm_turbo.comp
 
-**Requirements**:
-- Generate synthetic weights: random uniform, Gaussian, and a "spiky" distribution (99% small, 1% outliers)
-- For each distribution, convert to TQ4_128, TQ3_128, TQ6_64 using the functions from `weight_converter.py`
-- Dequantize back to F32 using a pure-Python reference dequant function
-- Compute max absolute error and mean squared error
-- Print a Markdown table:
-  ```
-  | Format | Distribution | Max Abs Error | MSE | Compression |
-  |--------|-------------|---------------|-----|-------------|
-  | TQ4_128 | uniform     | 0.0012        | ... | 8.00x       |
-  ```
-- Compression ratio = sizeof(float32) / bits_per_weight
-- Exit code 0 if all MSE < 0.01, else exit 1
+# Validation script works
+python tools/validate_turboquant.py
 
-**Guardrails**:
-- Pure Python, no numpy required (but use it if available)
-- Self-contained: can run with `python tools/validate_turboquant.py`
-
-### Deliverable 4: Update `include/rdna4_types.hpp` Push Constants
-
-**File**: `include/rdna4_types.hpp`
-
-Read the existing file. Add `DequantTurboPushConstants` and `GemmTurboPushConstants` structs in the same style as existing push constant structs (e.g., `DequantizePushConstants`, `GemmPushConstants`).
-
-**Requirements**:
-- Match the GLSL push constant layouts from `dequant_turbo.comp` and `gemm_turbo.comp`
-- Use `uint32_t`, `uint64_t`, `float` only
-- Add at the end of the file, before any closing namespace brace
-- Do NOT modify existing structs
-
-## Guardrails (What You Must NOT Do)
-
-1. **Do NOT modify `src/host/inference_engine.cpp`, `src/host/scheduler.cpp`, or `main.cpp`.**
-   - You may add comments showing integration points, but do not change existing logic.
-   - Claude will wire your code into the engine after delivery.
-
-2. **Do NOT change existing enum values or struct layouts.**
-   - Append new types only. Do not renumber.
-
-3. **Do NOT allocate > 1GB for any single buffer in shaders or host logic.**
-   - If your design needs more, tile it or document the limitation.
-
-4. **Do NOT write inline implementations in headers (except trivial constexpr getters).**
-   - `include/*.hpp` = declarations + constexpr data. `src/host/*.cpp` = implementations.
-   - Exception: `turboquantTensorBytes` and `turboquantBlockCount` can be `inline` in the header since they're simple math.
-
-5. **Do NOT break the build.**
-   - Every new file must be added to `CMakeLists.txt`.
-   - Every new shader must compile with `glslc`.
-
-6. **Do NOT introduce heavy Python dependencies.**
-   - No `torch`, `tensorflow`, `transformers` unless absolutely necessary.
-   - Prefer stdlib + optional `numpy`.
-
-## Verification Checklist
-
-Before declaring done, verify:
-
-- [ ] `include/rdna4_turboquant.hpp` compiles as C++17 (no errors with `cl /c /std:c++17 include/rdna4_turboquant.hpp` or equivalent)
-- [ ] `sizeof(DequantTurboPushConstants) <= 128`
-- [ ] `sizeof(GemmTurboPushConstants) <= 128`
-- [ ] `tools/weight_converter.py` append works: `python -c "import weight_converter; w = [0.1]*256; b, s = weight_converter.convert_to_tq4(w); print(len(b), len(s))"`
-- [ ] `tools/validate_turboquant.py` runs and prints the Markdown table
-- [ ] `include/rdna4_types.hpp` still compiles (no broken existing structs)
-- [ ] No existing source files were modified except `include/rdna4_types.hpp` (append only)
-
-## Context Files You Should Read First
-
-1. `include/rdna4_types.hpp` — See existing push constant structs
-2. `tools/weight_converter.py` — Understand existing structure before appending
-3. `src/kernels/dequant_turbo.comp` — Match push constants to GLSL
-4. `src/kernels/gemm_turbo.comp` — Match push constants to GLSL
-5. `AGENTS.md` (root) — Understand DOX framework
-
-## Questions?
-
-If you are unsure about:
-- **C++ struct layout / padding**: Ask Kimi.
-- **Python bit-packing logic**: Ask Kimi.
-- **Project-specific conventions (DOX, AGENTS.md)**: Read the root `AGENTS.md` again.
-- **Whether a change violates a guardrail**: Stop and ask Kimi before proceeding.
-
-## Expected Time
-- `rdna4_turboquant.hpp`: 30 min
-- `weight_converter.py` extension: 2-3 hours
-- `validate_turboquant.py`: 1 hour
-- `rdna4_types.hpp` push constants: 30 min
-- Total: ~4-5 hours
+# Types header compiles (quick smoke test with a test .cpp)
+# Include rdna4_turboquant.hpp and rdna4_types.hpp in a test file
+```

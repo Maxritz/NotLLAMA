@@ -98,6 +98,9 @@ void main() {
         }
     }
 
+    m = subgroupBroadcastFirst(m);
+    l = subgroupBroadcastFirst(l);
+
     for (uint d = 0; d < hdPerThread; ++d) {
         uint idx = tid * hdPerThread + d;
         if (idx >= hd) break;

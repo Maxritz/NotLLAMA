@@ -16,7 +16,7 @@ class WeightConverter:
         self.loader = GGUFLoader(gguf_path)
 
     def validate_q6_k(self):
-        """Scan Q6_K tensors — NaN deltas are normal (~2-3% of blocks)."""
+        """Scan Q6_K tensors — d-last layout (d at offset 208 in 210-byte block)."""
         for name, info in self.loader.tensors.items():
             if info.dtype != GGMLType.Q6_K:
                 continue
@@ -24,14 +24,16 @@ class WeightConverter:
             num_elements = 1
             for d in info.shape: num_elements *= d
             QK_K = 256
+            BLOCK_SIZE = 210
             n_blocks = (num_elements + QK_K - 1) // QK_K
             nan_count = 0
             for b in range(n_blocks):
-                pos = b * 210
-                d = struct.unpack("<e", raw[pos:pos+2])[0]
+                pos = b * BLOCK_SIZE
+                # Q6_K is d-last: ql[128]@0, qh[64]@128, scales[16]@192, d@208
+                d = struct.unpack("<e", raw[pos+208:pos+210])[0]
                 if d != d: nan_count += 1
             pct = 100.0 * nan_count / max(n_blocks, 1)
-            status = "OK" if pct < 10.0 else "SUSPICIOUS"
+            status = "OK" if pct < 5.0 else "SUSPICIOUS"
             print(f"{name}: {n_blocks} blocks, NaN={nan_count} ({pct:.1f}%) [{status}]")
         return True
 

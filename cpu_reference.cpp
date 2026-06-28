@@ -55,22 +55,23 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             result[i] = readF16(data, i * 2);
         }
     } else if (format == QuantFormat::Q6_K) {
+        // d-last layout: ql[128]@0, qh[64]@128, scales[16]@192, d@208
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 256;
             uint32_t eleInBlock = i % 256;
             uint32_t bs = blockIdx * 210;
 
-            float d = readF16(data, bs + 0);
+            float d = readF16(data, bs + 208);
 
             uint32_t subBlock = eleInBlock / 16;
-            int sc = (int8_t)data[bs + 2 + subBlock];
+            int sc = (int8_t)data[bs + 192 + subBlock];
 
             uint32_t qlByteIdx = eleInBlock / 2;
-            uint8_t q4raw = data[bs + 18 + qlByteIdx];
+            uint8_t q4raw = data[bs + 0 + qlByteIdx];
             uint32_t q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0xFu) : (q4raw >> 4);
 
             uint32_t qhByteIdx = eleInBlock / 4;
-            uint8_t qhByte = data[bs + 146 + qhByteIdx];
+            uint8_t qhByte = data[bs + 128 + qhByteIdx];
             uint32_t qhShift = (eleInBlock & 3u) * 2;
 
             int val = (int)(q4 | (((qhByte >> qhShift) & 3) << 4)) - 32;
@@ -355,6 +356,11 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
     for (uint32_t d = 0; d < dim; ++d) {
         hidden[d] = tokenEmbD.data[tokenId * dim + d];
     }
+    fprintf(stderr, "[cpu-diag] embed[0..3]: %f %f %f %f sum=%f min=%f max=%f\n",
+        hidden[0], hidden[1], hidden[2], hidden[3],
+        std::accumulate(hidden.begin(), hidden.end(), 0.0f),
+        *std::min_element(hidden.begin(), hidden.end()),
+        *std::max_element(hidden.begin(), hidden.end()));
 
     std::vector<float> kCache(nKvHeads * headDim);
     std::vector<float> vCache(nKvHeads * headDim);
@@ -513,6 +519,12 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
     }
 
     // Final RMS norm
+    fprintf(stderr, "[cpu-diag] hidden after layers[0..3]: %f %f %f %f sum=%f min=%f max=%f\n",
+        hidden[0], hidden[1], hidden[2], hidden[3],
+        std::accumulate(hidden.begin(), hidden.end(), 0.0f),
+        *std::min_element(hidden.begin(), hidden.end()),
+        *std::max_element(hidden.begin(), hidden.end()));
+
     float sumSq = 0.0f;
     for (uint32_t d = 0; d < dim; ++d) {
         sumSq += hidden[d] * hidden[d];
@@ -525,6 +537,10 @@ std::vector<float> CpuReference::forward(uint32_t tokenId) {
 
     // LM head GEMM: output.weight is shape [dim, vocabSize], row-major
     // logits[col] = sum_k normed[k] * W[k * vocabSize + col]
+    fprintf(stderr, "[cpu-diag] normed[0..3]: %f %f %f %f sum=%f\n",
+        normed[0], normed[1], normed[2], normed[3],
+        std::accumulate(normed.begin(), normed.end(), 0.0f));
+
     std::vector<float> logits(vocabSize);
     for (uint32_t col = 0; col < vocabSize; ++col) {
         float acc = 0.0f;

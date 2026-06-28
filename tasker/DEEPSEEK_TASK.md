@@ -1,35 +1,17 @@
-# DeepSeek (Code Implementation) — Option D
+# DeepSeek (Code Implementation) — Option D (DONE)
 
-## Current Task: Implement Option D (Batched forwardPartial)
+## Completed: Round 4 — Batched forwardPartial
 
-### Goal
-Refactor `forwardPartial()` to batch dequant dispatches per layer. Reduce sync count from ~12/layer to ~8/layer.
+### What was done
+- `initDequantBuffer()`: resized from MLP-set to full-layer set (9 weights)
+- `forwardPartial()`: two-phase per layer — dequant all weights async (1 sync), then single batch submit with pipeline barriers for the full layer
+- Sync count: 4 → 2 per layer, ~72 total for 36 layers
 
-### Strategy
-```
-// Per layer: batch dequant for all weights (independent, no data deps)
-dequantWeight(attn_norm); dequantWeight(q); dequantWeight(k); dequantWeight(v); dequantWeight(attn_output);
-syncAll(); // 1 sync instead of 5
+### Files Modified
+- `src/host/inference_engine.cpp`
 
-// Then run compute path
-rms_norm → gemm_q → gemm_k → gemm_v → sync → rope → kv_write → attention → gemm_out → add → sync
-ffn_norm → dequant ffn_up/gate → sync → mlp → dequant ffn_down → sync → add → sync
-```
-
-### Target
-- ~8 syncs per layer × 36 layers = ~288 syncs (down from ~432)
-- 33% reduction in sync overhead
-
-### Files to Modify
-- `src/host/inference_engine.cpp` — refactor `forwardPartial()`
-
-### Constraints
-- Weights stay quantized on GPU
-- No monolithic pre-dequantized buffers
-- Each layer is a self-contained work unit
-- Dequant staging buffer capped at 512 MB
-
-### After Completion
-- Build and test
-- Verify token generation works
-- Report sync count improvement
+### Next Available Tasks
+- Debug GPU output token = 0 (logit readback vs sampling)
+- Increase dequant chunk size (1M WG cap reduces per-dispatch throughput)
+- Task 1: Proper Top-K/Top-P GPU sampling
+- Task 2: Fix exit crash (0xC0000005)

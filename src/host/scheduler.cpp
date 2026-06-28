@@ -32,10 +32,6 @@ void Scheduler::cleanup() {
             cmdPools[i] = VK_NULL_HANDLE;
         }
     }
-    if (layerFence) {
-        vkDestroyFence(device, layerFence, nullptr);
-        layerFence = VK_NULL_HANDLE;
-    }
 }
 
 VkCommandBuffer Scheduler::allocateCmd(int aceIndex) {
@@ -355,28 +351,6 @@ void Scheduler::syncAllThrottled(double targetUtilization) {
     }
 }
 
-void Scheduler::createLayerFence() {
-    if (layerFence) return;
-    VkFenceCreateInfo fi = {};
-    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vkCreateFence(device, &fi, nullptr, &layerFence);
-}
-
-void Scheduler::syncLayer(int aceIndex) {
-    if (!layerFence) return;
-    auto t0 = std::chrono::steady_clock::now();
-    vkWaitForFences(device, 1, &layerFence, VK_TRUE, UINT64_MAX);
-    auto t1 = std::chrono::steady_clock::now();
-    vkResetFences(device, 1, &layerFence);
-    vkResetCommandPool(device, cmdPools[aceIndex], 0);
-    auto t2 = std::chrono::steady_clock::now();
-    auto waitMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    auto resetMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    if (waitMs > 10.0) {
-        fprintf(stderr, "[sync-layer] q%d wait=%.1fms reset=%.1fms\n", aceIndex, waitMs, resetMs);
-    }
-}
-
 void Scheduler::dispatchBatchBarriers(const std::vector<DispatchDesc>& dispatches,
                                         const std::vector<uint32_t>& groupEnds,
                                         const std::vector<PipelineBarrier>& barriers,
@@ -510,7 +484,7 @@ void Scheduler::endBatch(VkFence fence) {
         fprintf(stderr, "[Scheduler] endBatch: vkQueueSubmit failed: %d\n", submitResult);
         vkFreeCommandBuffers(device, cmdPools[batchAceIndex], 1, &batchCmdBuffer);
         if (ownsFence) fencePool->release(fence);
-    } else {
+    } else if (ownsFence) {
         queueFences_[batchAceIndex].push_back(fence);
     }
 

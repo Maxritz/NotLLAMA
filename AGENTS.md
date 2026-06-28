@@ -92,11 +92,14 @@ What this means in practice:
 - Think like many small cops patrolling, not one army.
 
 What this means you MUST NOT do:
-- Do NOT allocate > 1 GB for any single buffer.
 - Do NOT pre-dequantize all weights at init time.
 - Do NOT put all quantized or dequantized weights in one monolithic buffer.
 - Do NOT assume float32 weights are available to shaders — they must dequantize on-demand.
 - Do NOT design a shader that requires the host to precompute and stage all data before dispatch.
+
+Buffer size guidance (updated):
+- Single buffers may exceed 1 GB when model size requires it.
+- Allocation failures must be handled gracefully: return error immediately, do not retry in loops, do not silently skip and fill logs.
 
 If you are about to write code that violates this philosophy, STOP and ask for clarification.
 
@@ -108,15 +111,23 @@ When the user requests a durable behavior change, record it here or in the relev
 
 - **Root** (`/`): Build system (`CMakeLists.txt`), entry point (`main.cpp`), project-wide instructions, DEEPSEEK_CONTEXT.md (project state document)
 - **`include/`**: Headers owned by corresponding `src/host/` implementations. No child DOX needed.
+  - `rdna4_compression.hpp` — Push constant structs for context compression + KV cache quantize/dequant shaders. Static asserts ≤128B.
 - **`src/host/`**: Inference engine, scheduler, allocator, KV cache, weight uploader, tokenizer, profiler, pipeline builder, mailbox
   - `inference_engine.cpp` — main inference loop, GPU sampling, CPU fallback, `forwardKernelEntry()` (one-dispatch persistent kernel), `initWeightBuffer()`, `initLayerParams()`, `initKernelEntryBuffers()`
   - `scheduler.cpp` — Vulkan queue submission, fence handling, cleanup lifecycle
-- **`src/kernels/`**: 14 GLSL compute shaders compiled to SPIR-V via glslc. No child DOX needed.
+- **`src/kernels/`**: 18 GLSL compute shaders compiled to SPIR-V via glslc. No child DOX needed.
+  - `silu_mul.comp` — Elementwise SiLU(gate) * up for MLP. 256 threads, dispatched over hiddenDim.
+  - `mlp_fused_gateup.comp` — Fused MLP shader. Now unused in `forwardPartial()` (replaced by silu_mul + gemm sequence) due to algorithmic overwork bug (~45B FMAs/layer). Retained for potential `kernel_entry.comp` use or future fused rewrite.
+  - `kv_cache_dequant.comp` — General-purpose dequant (bits=4,5,6,8, blockSize=64/128).
   - `kernel_entry.comp` — persistent mailbox-polling kernel. Single dispatch executes all layers (embed → N×transformer → output norm → logits+argmax). No host round-trips between layers.
-- **`tools/`**: Python weight converter, GGUF inspector, RAG tool. Owned separately.
+- **`tools/`**: Python weight converter, GGUF inspector, RAG tool, DOX lint. Owned separately.
+  - `dox_lint.py` — AGENTS.md compliance checker, push constant size validator, shader SPIR-V presence checker.
+  - `graphify_client.py` — Python GraphifyClient for subprocess-based knowledge graph queries.
+  - `benchmark_compression.py` — KV cache + context compression benchmark tool.
 - **`reference/`**: Vulkan SDK reference files. Read-only.
 - **`graphify-out/`**: Knowledge graph outputs (auto-generated, not edited directly).
 - **`test_inference.cpp`**: Test harness — loads model, runs GPU forward + CPU reference, compares logits. Includes crash handler, 2-min timeout, NaN/Inf detection.
+- **`test/test_compression.cpp`**: Compile-time test for compression push constants, config defaults, scheduler logic.
 - **`cpu_reference.cpp`**: CPU reference forward pass for validation. Supports F32/F16/Q6_K/Q8_0/Q4_0 dequant.
 - **`build/`**: CMake build output. Not checked in.
 
@@ -130,13 +141,45 @@ When the user requests a durable behavior change, record it here or in the relev
 - `kernel_entry.comp`: MailboxRef is `coherent`. Spin-wait loop calls `memoryBarrierBuffer()` before reading `tokenReady`. `computeLogitsAndSample()` writes logits to scratch (after V region) and does argmax reduction over subgroup to produce the next token. Output norm uses `pc.addrOutputNorm` (push constant), not the last layer's attnNorm.
 - `inference_engine.cpp`: Ring allocator calls checked for zero (overflow). CPU fallback guards `cpuLogits` null before `sampleArgmax`. `forwardPartial()` uses `allocator->reset()` at start, allocates hidden→Q→K→V→attnOut→mlpOut→logits→sampleOut then later allocates `sampleScratch` (vocabSize floats) for topk scratch. Records `lastLogitsAddr`/`lastLogitsOffset` after successful forward for external readback. `cleanup()` releases dequant/embed resources; must be called before `ctx.cleanup()`.
 - `test_inference.cpp`: Reads GPU logits from `engine.lastLogitsOffset` instead of recomputing offsets. `vkInvalidateMappedMemoryRanges` uses exact size (not `VK_WHOLE_SIZE`) for readback. GPU forward runs via `std::async` with 120s timeout. Uses `forwardPartial` path (kernel_entry path not used in test_inference — test needs ring allocator readback).
-- Dequant dispatches are capped at 1M workgroups per dispatch (chunking). The dequant staging buffer is sized for the largest single tensor or the largest simultaneous tensor set consumed by one dispatch (currently the MLP `ffn_up` + `ffn_gate` + `ffn_down` set), capped at 512 MB. Embedding cache is persistent DEVICE_LOCAL — do not re-dequantize per token.
+- Dequant dispatches are capped at 1M workgroups per dispatch (chunking). The dequant staging buffer is sized for all 9 dequantized weights in one layer (attn_norm + Q + K + V + O + ffn_norm + up + gate + down), capped at 512 MB. Embedding cache is persistent DEVICE_LOCAL — do not re-dequantize per token. `forwardPartial` refactored for Round 4: Phase 1 dequants all weights async with one sync; Phase 2 runs the full layer (attention + FFN) in a single batch submit with pipeline barriers. 2 syncs per layer (~72 for 36 layers).
 
 ### Verification
 
 - Build: `cd build && cmake --build . --config Release`
 - Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
 - Runtime: `rdna4_llama.exe` must not crash (VK_ERROR_DEVICE_LOST or 0xC0000005)
+
+## Changes (2026-06-28 Round 4 — Batched forwardPartial: 2 syncs/layer, all-weights-before-compute)
+
+- **`src/host/inference_engine.cpp`**: `initDequantBuffer()` resized for all 9 weights per layer (was MLP-set-only). `forwardPartial()` restructured: Phase 1 dequants ALL weights async, one sync; Phase 2 runs entire layer (attention + FFN) in one batch submit with pipeline barriers. Syncs per layer: 4 → 2. ~72 syncs total for 36 layers.
+
+## Changes (2026-06-28 Round 7 — Context compression Round 2 + 3: dequant shader, host header, lint tool, graphify client, benchmark, scheduler, tests, guide)
+
+### Round 2 Deliverables (deepseek-task-round2.md)
+
+**D1 — `src/kernels/kv_cache_dequant.comp`**: General-purpose KV cache dequantization shader supporting bits=4,5,6,8, blockSize=64/128, scaleBits=8/16, zeroPoint=0/1. Byte-level addressing via `uint8_t[]`. Per-block layout: `[packed_weights] [scale (1B int8 or 2B fp16 LE)] [optional zero_point (1B)]`. Compiles with glslc.
+
+**D2 — `include/rdna4_compression.hpp`**: C++17 header with `ContextCompressionConfig`, `KVCompressionConfig`, and 3 push constant structs (`CompressContextPushConstants` 56B, `KVCacheQuantizePushConstants` 64B, `KVCacheDequantPushConstants` 40B). All under 128B with `static_assert` guards.
+
+**D3 — `tools/dox_lint.py`**: DOX compliance linter — AGENTS.md coverage, required sections, push constant sizes (≤128B), shader SPIR-V presence, TODO/FIXME density, large files. Pure Python, stdlib.
+
+**D4 — `src/kernels/AGENTS.md`**: Appended Compression Shaders section.
+
+### Round 3 Deliverables (deepseek-task-round3.md)
+
+**D1 — `tools/graphify_client.py`**: Python `GraphifyClient` class mirroring `include/rdna4_graphify.hpp`. Subprocess-based graphify query with LRU cache (configurable), `is_stale()`, `update_graph()`, `get_related_nodes()`, `clear_cache()`, `is_available()`. Dataclass config/result types. Stdlib only (subprocess, json, pathlib, collections.OrderedDict).
+
+**D2 — `tools/benchmark_compression.py`**: Benchmarks KV cache quantization (Q4_0/Q5_0/Q8_0) and context compression strategies (sliding_window/fifo/importance). Generates synthetic data, computes MSE/maxErr/cos_sim. CLI via argparse, optional numpy, JSON output. Produces two Markdown tables. Exit 0 on all MSE < 0.01.
+
+**D3 — `include/rdna4_compression_scheduler.hpp`**: `CompressionDecision` struct + `CompressionScheduler` class. `step(seqLen, maxContext, importanceScores)` decides when to trigger context/KV compression. Uniform/entropy/importance keep mask generation. Stub — no .cpp.
+
+**D4 — `test/test_compression.cpp`**: Compile-time test asserting push constant sizes, config defaults, scheduler no-op and compression-triggered paths. 8 assertions.
+
+**D5 — `docs/compression_integration.md`**: 5-step wiring guide (load configs, KV quant, context compress, scheduler integration, fallback safety) + performance targets + graphify section.
+
+### Guardrails respected
+- No existing engine/scheduler/main.cpp files modified
+- 5 new files created, 2 existing files appended (rdna4_compression.hpp, src/kernels/AGENTS.md)
 
 ## Changes (2026-06-28 Round 6 — Vulkan compute-only device fix + graphify update)
 

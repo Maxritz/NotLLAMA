@@ -1,205 +1,256 @@
-# MiMo Task Assignment Round 3 — TurboQuant Benchmarking + Integration Guide + Test Stubs
+# MiMo-task-round3.md — TurboQuant Round 3: Benchmarking, Conversion, and Docs
 
-## Project Context
+## Why
+Round 1: Shaders + schema + enum. Round 2: Host types + Python validators. Round 3 bridges everything to real models:
+- Benchmark on actual model weights (not synthetic) to prove TurboQuant is competitive with GGUF
+- Standalone converter so users can convert any GGUF → TurboQuant without touching the engine
+- C++ test stub so future host-side code has a compile-time safety net
+- Integration doc so Claude (Kimi, Laguna M.1) can wire TurboQuant into the engine without re-reading all MiMo files
 
-**NotLLAMA** is a Vulkan compute-only inference engine for LLMs, targeting AMD RX 9070 XT (RDNA4, 16GB VRAM). It is built on the philosophy: **Many small units doing work together.** Weights stay quantized on GPU. Each layer dequantizes its own weights on-demand. No monolithic pre-dequantized buffers. Shaders are self-contained: dequantize → process → output.
+## Deadline
+Until Claude/Kimi finishes Round 2 + Kimi's architecture scaffolding
 
-### Architecture
-- **Host**: C++17, CMake, MSVC 19.44
-- **GPU**: 14 GLSL compute shaders compiled to SPIR-V via glslc
-- **Scheduler**: Batch-mode Vulkan queue submission with FencePool (64 fences)
-- **Inference**: Two paths — forwardPartial() (layer-by-layer, ring allocator) and forwardKernelEntry() (single-dispatch persistent mailbox kernel)
-- **Quantization**: 57 GGUF formats supported (Q1–Q8, IQ1–IQ6, Q2_K–Q8_K, F16, BF16, F32, MXFP4/6/8)
-- **Key rule**: No buffer > 1GB. No pre-dequantization at init time.
+## Task 1: tools/benchmark_turboquant.py
+Create a benchmarking script that:
+1. Loads GGUF model weights from disk (binary format: num_tensors × [name_len, name, dtype, ndim, shape, data])
+2. For each weight tensor:
+   a. Record original size (bytes)
+   b. Quantize to TQ4_128, TQ3_128, TQ6_64 using convert_to_tq4/tq3/tq6 from weight_converter
+   c. Dequantize back to float32
+   d. Compute MSE, max absolute error, cosine similarity, L1 norm
+3. Prints two tables:
 
-### Repository
-- Path: C:\Users\rr\Desktop\Notllama-loc
-- GitHub: https://github.com/Maxritz/NotLLAMA (master, LGPL-2.1)
-- Build: cd build && cmake --build . --config Release
-- Shader copy: Copy-Item build\shaders\*.spv build\Release\shaders\
+**Per-layer table:**
+```
+Layer              | Format  | Orig KB  | TQ KB  | Ratio | MSE       | CosSim
+token_embd.weight  | TQ4_128 | 768.0    | 192.0  | 0.25x | 0.00123   | 0.9987
+blk.0.attn_q.weight| TQ6_64 | 512.0    | 128.0  | 0.25x | 0.00045   | 0.9998
+...
+```
 
-## Your Assignment (Round 3)
+**Summary table:**
+```
+Format    | Total MB | Compressed MB | Ratio | Avg MSE  | Avg CosSim | Max MSE
+TQ4_128   | 3610.0   | 902.5         | 0.25x | 0.00123  | 0.9987     | 0.00456
+TQ3_128   | 3610.0   | 686.0         | 0.19x | 0.00345  | 0.9945     | 0.01234
+TQ6_64    | 3610.0   | 686.0         | 0.19x | 0.00045  | 0.9998     | 0.00123
+Q8_0      | 3610.0   | 3610.0        | 1.00x | 0.00000  | 1.0000     | 0.00000
+```
 
-You have delivered TurboQuant shaders, schema, docs, host-side structs, weight converter extension, and validation script (Rounds 1–2 — COMPLETE). Now you will deliver benchmarking tools, integration documentation, and C++ test stubs so Claude can validate TurboQuant end-to-end without guessing.
+4. Also prints timing: quantize_time, dequantize_time, throughput (MB/s)
 
-### Deliverable 1: TurboQuant Benchmarking Harness
+Requirements:
+- Uses weight_converter functions for quantization/dequantization
+- `--model <dir>` flag: reads Q8_0 .bin + .json from directory
+- `--compare-gguf` flag: also loads original GGUF (via gguf python library if available) for reference
+- Prints memory savings vs Q8_0 baseline
+- `--output <file>` flag: writes results to JSON for Claude to analyze
 
-**File**: tools/benchmark_turboquant.py
+File: `tools/benchmark_turboquant.py`
 
-Write a Python script that benchmarks TurboQuant against existing GGUF formats on real weight data extracted from GGUF files.
+## Task 2: tools/convert_gguf_to_turboquant.py
+Create a standalone GGUF → TurboQuant converter:
+1. Reads a GGUF model (binary format from weight_converter.py)
+2. Converts ALL weight tensors to a specified TurboQuant format
+3. Outputs:
+   - `<model_name>_tq4_128.weights.bin` — packed TurboQuant binary
+   - `<model_name>_tq4_128.json` — model metadata (same as GGUF JSON but with format="TQ4_128")
+4. Also supports TQ3_128 and TQ6_64
 
-**Requirements**:
-- Read a GGUF file (use existing tools/gguf_loader.py — import it, do not copy its logic)
-- For each weight tensor in the model:
-  - Convert to TQ4_128, TQ3_128, TQ6_64 using weight_converter.py
-  - Also keep the original GGUF quantization (Q4_0, Q8_0, etc.) if present
-  - Dequantize all formats back to F32
-  - Compute per-tensor metrics:
-    - Max absolute error vs original F32
-    - Mean squared error (MSE)
-    - Signal-to-noise ratio (SNR) in dB: 10 * log10(sum(original^2) / sum((original - dequant)^2))
-    - Compression ratio vs F32
-- Print aggregate Markdown table:
-  | Model | Tensor | Format | MSE | SNR (dB) | Compression | Speedup (theoretical) |
-  |-------|--------|--------|-----|----------|-------------|----------------------|
-- Theoretical speedup = (F32 bytes read) / (quantized bytes read + dequant overhead). Assume dequant overhead = 2x quant bytes for memory bandwidth bound.
-- Save full results to benchmark_turboquant_results.json in the working directory
+CLI:
+```bash
+python convert_gguf_to_turboquant.py \
+    --input model_q8_0.bin \
+    --format tq4_128 \
+    --output-dir ./converted/
+```
 
-**Guardrails**:
-- Do NOT require torch or transformers. Use stdlib + optional numpy.
-- If numpy is not available, fall back to pure Python lists.
-- Skip tensors > 100MB dequantized to avoid memory issues.
-- Print progress every 10 tensors.
+Output JSON format (for engine consumption):
+```json
+{
+    "model": {
+        "name": "model_tq4_128",
+        "architecture": "qwen2",
+        "format": "TQ4_128",
+        "num_layers": 36,
+        "hidden_dim": 2048,
+        "num_heads": 32,
+        "head_dim": 64,
+        "vocab_size": 151936,
+        "max_seq_len": 4096
+    },
+    "tensor_offsets": {
+        "token_embd.weight": {"offset": 0, "size": 12582912, "dtype": "TQ4_128"},
+        "blk.0.attn_q.weight": {"offset": 12582912, "size": 33554432, "dtype": "TQ4_128"},
+        ...
+    },
+    "block_layout": {
+        "format": "TQ4_128",
+        "block_bytes": 66,
+        "elements_per_block": 128,
+        "scale_bytes": 2,
+        "data_bytes": 64
+    }
+}
+```
 
-### Deliverable 2: GGUF-to-TurboQuant Standalone Converter
+Requirements:
+- Uses weight_converter functions for actual quantization
+- Validates all converted tensors: check packed size matches expected
+- Prints per-tensor progress and final summary
+- Handles all QuantFormat types (Q6_K, Q8_0, F16, etc.) — but only TQ4/TQ3/TQ6 are new
+- Fallback: if tensor dtype is already TQ format, skip conversion
 
-**File**: tools/convert_gguf_to_turboquant.py
+File: `tools/convert_gguf_to_turboquant.py`
 
-Write a Python script that reads a GGUF file and outputs a TurboQuant-compatible model package (JSON metadata + binary weights).
-
-**Requirements**:
-- Input: path to .gguf file
-- Output: two files in the same directory:
-  - <model>_tq4.json — metadata with format: TQ4_128, tensor list with shapes, offsets, block sizes
-  - <model>_tq4.bin — concatenated quantized tensor data
-- For each F16/F32 tensor in the GGUF:
-  - Convert to TQ4_128 (default). Allow --format tq3 or --format tq6 via argparse.
-  - Write tensor entry to JSON with name, shape, format, blockSize, bits, offset, size
-  - Append quantized bytes to .bin file
-- For already-quantized tensors (Q4_0, Q8_0, etc.):
-  - Dequantize to F32 first using gguf_loader.py dequant functions
-  - Then re-quantize to TurboQuant format
-- Print summary: total original size, total TurboQuant size, compression ratio
-
-**Guardrails**:
-- Use argparse for CLI: python convert_gguf_to_turboquant.py model.gguf --format tq4 --output-dir ./tq_models/
-- Do NOT load entire model into RAM at once. Process tensors one at a time.
-- Validate that output .bin size matches sum of all tensor size fields.
-
-### Deliverable 3: TurboQuant C++ Test Stub
-
-**File**: test/test_turboquant.cpp
-
-Write a C++ test stub that validates include/rdna4_turboquant.hpp without needing a GPU.
-
-**Requirements**:
+## Task 3: test/test_turboquant.cpp
+Create a C++ compile-time test stub:
 ```cpp
+// MiMo Round 3 — TurboQuant host-side compile test
+// Compiles as: cl /EHsc /I ../include test_turboquant.cpp
+
 #include "rdna4_turboquant.hpp"
+#include "rdna4_types.hpp"
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 
 int main() {
-    using namespace rdna4;
+    printf("TurboQuant compile-time tests...\n");
 
-    // Test 1: Block layout constants
-    static_assert(TQ4_128_LAYOUT.blockSize == 128, "");
-    static_assert(TQ4_128_LAYOUT.bitsPerWeight == 4, "");
-    static_assert(TQ4_128_LAYOUT.bytesPerBlock == 66, "");
+    // Test block sizes
+    static_assert(sizeof(TQ4Block128) == 66, "TQ4Block128 must be 66 bytes");
+    static_assert(sizeof(TQ3Block128) == 50, "TQ3Block128 must be 50 bytes");
+    static_assert(sizeof(TQ6Block64) == 50, "TQ6Block64 must be 50 bytes");
 
-    // Test 2: Size helpers
-    assert(turboquantBlockCount(256, 128) == 2);
-    assert(turboquantBlockCount(300, 128) == 3);
-    assert(turboquantTensorBytes(256, TQ4_128_LAYOUT) == 2 * 66);
+    // Test packed size helpers
+    assert(tq4_packed_size(128) == 66);    // exactly 1 block
+    assert(tq4_packed_size(129) == 132);   // 2 blocks
+    assert(tq3_packed_size(128) == 50);    // exactly 1 block
+    assert(tq3_packed_size(256) == 100);   // 2 blocks
+    assert(tq6_packed_size(64) == 50);     // exactly 1 block
+    assert(tq6_packed_size(65) == 100);    // 2 blocks
 
-    // Test 3: Push constant size limits
-    static_assert(sizeof(DequantTurboPushConstants) <= 128, "");
-    static_assert(sizeof(GemmTurboPushConstants) <= 128, "");
+    // Test push constant sizes
+    static_assert(sizeof(DequantTurboPushConstants) <= 128, "DequantTurboPushConstants too large");
+    static_assert(sizeof(GemmTurboPushConstants) <= 128, "GemmTurboPushConstants too large");
+    assert(sizeof(DequantTurboPushConstants) == 48);
+    assert(sizeof(GemmTurboPushConstants) == 48);
 
-    // Test 4: Alignment
-    assert(TQ4_128_LAYOUT.alignment == 128);
-    assert(TQ6_64_LAYOUT.alignment == 128);
+    // Test TQ4 block packing (manual)
+    TQ4Block128 block;
+    memset(&block, 0, sizeof(block));
+    block.scale = 0x3C00; // 1.0 in float16
+    // Pack element 0 = 5: data[0] |= 5 (low nibble)
+    // Pack element 1 = -3: data[0] |= (0x0D << 4) (high nibble, -3 & 0xF = 0xD)
+    block.data[0] = 0xD5;
+    assert((block.data[0] & 0x0F) == 5);      // element 0
+    assert(((block.data[0] >> 4) & 0x0F) == 0xD); // element 1 (0xD = -3 mod 16)
 
-    printf("All TurboQuant tests passed.\n");
+    printf("All compile-time tests PASSED\n");
     return 0;
 }
 ```
 
-**Guardrails**:
-- Do NOT include Vulkan headers.
-- Do NOT modify existing test files (test_inference.cpp, test_cpu_ref.cpp).
-- Must compile with: cl /std:c++17 /I include test/test_turboquant.cpp
+Requirements:
+- This is a STUB — just compile-time checks, no runtime GPU tests
+- Must compile with both MSVC and GCC/Clang
+- Include rdna4_turboquant.hpp and rdna4_types.hpp
 
-### Deliverable 4: TurboQuant Integration Guide
+File: `test/test_turboquant.cpp`
 
-**File**: docs/turboquant_integration.md
+## Task 4: docs/turboquant_integration.md
+Create an integration guide for Claude (Kimi, Laguna M.1) to wire TurboQuant into the engine:
 
-Write a Markdown guide for Claude explaining exactly how to wire TurboQuant into the engine.
+Structure:
+```
+# TurboQuant Integration Guide
 
-**Required sections**:
-1. **Overview**: What TurboQuant is and why it exists (faster than GGUF on RDNA4, blockwise uniform quantization)
-2. **Block Layouts**: Byte-level diagrams for TQ4_128, TQ3_128, TQ6_64 showing weights offset, scale offset, alignment padding
-3. **Shader Dispatch Guide**: For each shader (dequant_turbo.comp, gemm_turbo.comp):
-   - Required workgroup size (local_size_x)
-   - Push constant fields and their meanings
-   - Buffer bindings (set/binding numbers)
-   - Example dispatch call (number of workgroups)
-4. **Host Wiring Checklist**: Step-by-step for Claude:
-   - [ ] Add TQ4_128/TQ3_128/TQ6_64 cases to weight uploader
-   - [ ] Allocate dequant staging buffer with turboquantTensorBytes()
-   - [ ] Dispatch dequant_turbo.comp before GEMM
-   - [ ] Dispatch gemm_turbo.comp with GemmTurboPushConstants
-   - [ ] Add format string to model metadata JSON
-5. **Performance Notes**: Expected memory bandwidth savings vs Q4_0, vs Q8_0. Expected dequant overhead.
-6. **Fallback Strategy**: If TurboQuant shader fails to compile or produces wrong results, fall back to Q4_0 or Q8_0.
+## Overview
+Brief explanation of TurboQuant and why it matters.
 
-**Guardrails**:
-- Keep under 200 lines.
-- Use ASCII art for byte layout diagrams.
-- Do not assume Claude knows TurboQuant internals — explain everything.
+## Block Layouts (for weight_converter.py)
+Byte diagrams for TQ4_128, TQ3_128, TQ6_64:
+- TQ4_128: [scale:2][data:64] = 66 bytes/block, 128 elements
+- TQ3_128: [scale:2][data:48] = 50 bytes/block, 128 elements  
+- TQ6_64:  [scale:2][data:48] = 50 bytes/block, 64 elements
 
-## Guardrails (What You Must NOT Do)
+Include bit-packing diagrams:
+```
+TQ4 nibble layout:
+byte[0] = [elem0:4bits][elem1:4bits]
+byte[1] = [elem2:4bits][elem3:4bits]
+...
 
-1. Do NOT modify src/host/inference_engine.cpp, src/host/scheduler.cpp, or main.cpp.
-   - You may add comments showing integration points, but do not change existing logic.
-   - Claude will wire your code into the engine after delivery.
+TQ6 packing (8 elements → 6 bytes):
+byte[0] = [elem0:6][elem1低2位:2]
+byte[1] = [elem1高4位:4][elem2:6低2位:2]  -- NO, too complex
 
-2. Do NOT change existing enum values or struct layouts.
-   - Append new types only. Do not renumber.
+Simpler: Use sequential bit packing
+TQ4: bit[0:4]=elem0, bit[4:8]=elem1, ...
+TQ3: bit[0:3]=elem0, bit[3:6]=elem1, ...
+TQ6: bit[0:6]=elem0, bit[6:12]=elem1, ...
+```
 
-3. Do NOT allocate > 1GB for any single buffer in shaders or host logic.
-   - If your design needs more, tile it or document the limitation.
+## Engine Wiring Checklist
 
-4. Do NOT write inline implementations in headers (except trivial constexpr getters).
-   - include/*.hpp = declarations + constexpr data. src/host/*.cpp = implementations.
+### Step 1: Weight Loading (inference_engine.cpp)
+- [ ] Add case for TQ4_128, TQ3_128, TQ6_64 in weight loading
+- [ ] Use tq4_packed_size/tq3_packed_size/tq6_64_packed_size for buffer allocation
+- [ ] Store block_size and format in weight metadata
 
-5. Do NOT break the build.
-   - Every new file must be added to CMakeLists.txt.
-   - Every new shader must compile with glslc.
+### Step 2: Dequant Shader (dequant_turbo.comp)
+- [ ] Already implemented by MiMo
+- [ ] Wire DequantTurboPushConstants in scheduler
+- [ ] Test with embed weights first
 
-6. Do NOT introduce heavy Python dependencies.
-   - No torch, tensorflow, transformers unless absolutely necessary.
-   - Prefer stdlib + optional numpy.
+### Step 3: Fused GEMM (gemm_turbo.comp)
+- [ ] Already implemented by MiMo
+- [ ] Wire GemmTurboPushConstants in scheduler
+- [ ] Test MLP gate_up first
 
-## Verification Checklist
+### Step 4: Scheduler Integration
+- [ ] Add dequant_turbo and gemm_turbo to PipelineBuilder
+- [ ] Push constants: sizeof must be <= 128 bytes (verified by static_assert)
 
-Before declaring done, verify:
+### Step 5: Fallback
+- [ ] If tensor format is not TQ4/TQ3/TQ6, use existing dequantize.comp path
+- [ ] If tensor format is TQ, use dequant_turbo.comp or gemm_turbo.comp
 
-- [ ] tools/benchmark_turboquant.py runs on a real GGUF file and produces benchmark_turboquant_results.json
-- [ ] tools/convert_gguf_to_turboquant.py runs and produces valid .json + .bin files
-- [ ] test/test_turboquant.cpp compiles and prints All TurboQuant tests passed.
-- [ ] docs/turboquant_integration.md is under 200 lines and contains all 6 required sections
-- [ ] No existing source files were modified except appends to weight_converter.py (already done in Round 2)
+## Performance Targets
+- TQ4_128: <0.1% MSE vs Q8_0, 4x compression
+- TQ3_128: <0.5% MSE vs Q8_0, 5x compression
+- TQ6_64: <0.01% MSE vs Q8_0, 5x compression
 
-## Context Files You Should Read First
+## Files Modified by MiMo
+- include/rdna4.hpp (enum)
+- include/rdna4_turboquant.hpp (new)
+- include/rdna4_types.hpp (append)
+- src/kernels/dequant_turbo.comp (new)
+- src/kernels/gemm_turbo.comp (new)
+- src/kernels/AGENTS.md (new)
+- docs/turboquant_schema.json (new)
+- docs/turboquant_formats.md (new)
+```
 
-1. include/rdna4_turboquant.hpp — Your Round 2 deliverable
-2. tools/weight_converter.py — Your Round 2 extension
-3. tools/gguf_loader.py — For importing dequant functions
-4. src/kernels/dequant_turbo.comp — Shader to document
-5. src/kernels/gemm_turbo.comp — Shader to document
-6. AGENTS.md (root) — Understand DOX framework
+File: `docs/turboquant_integration.md`
 
-## Questions?
+## Acceptance Criteria
+1. `python tools/benchmark_turboquant.py --model model/` produces summary table
+2. `python tools/convert_gguf_to_turboquant.py --input model/q8_0.bin --format tq4_128` produces .bin + .json
+3. `test/test_turboquant.cpp` compiles with MSVC: `cl /EHsc /I include test/test_turboquant.cpp`
+4. `docs/turboquant_integration.md` covers all 5 wiring steps
+5. No existing files modified except new files created
+6. Each deliverable has a one-line comment at the top: `// MiMo Round 3 — <purpose>`
 
-If you are unsure about:
-- Python GGUF parsing / tensor iteration: Ask Kimi.
-- C++ static_assert / constexpr math: Ask Kimi.
-- Project-specific conventions (DOX, AGENTS.md): Read the root AGENTS.md again.
-- Whether a change violates a guardrail: Stop and ask Kimi before proceeding.
+## Verification
+```powershell
+# Benchmark works
+python tools/benchmark_turboquant.py --model model/
 
-## Expected Time
-- benchmark_turboquant.py: 2-3 hours
-- convert_gguf_to_turboquant.py: 2 hours
-- test/test_turboquant.cpp: 30 min
-- docs/turboquant_integration.md: 1 hour
-- Total: ~5-6 hours
+# Converter works
+python tools/convert_gguf_to_turboquant.py --input model/q8_0.bin --format tq4_128 --output-dir ./converted/
+
+# C++ test compiles
+cl /EHsc /I include test/test_turboquant.cpp /Fe:test_turboquant.exe
+```

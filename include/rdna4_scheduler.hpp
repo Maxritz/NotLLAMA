@@ -101,11 +101,6 @@ public:
     // targetUtilization: 0.0-1.0, default 0.8
     void syncAllThrottled(double targetUtilization = 0.8);
 
-    // Fence-based per-layer sync: wait on the layerFence, reset it, reset the
-    // command pool for the given ACE.  Must call createLayerFence() first.
-    void createLayerFence();
-    void syncLayer(int aceIndex = 0);
-
     // Must be called before VkDevice is destroyed. Waits for idle, destroys
     // command pools, and nulls handles so the destructor is safe to run after.
     void cleanup();
@@ -113,8 +108,6 @@ public:
     void speculativeDecode(const std::vector<uint32_t>& draftTokens,
                            VkPipeline verifyPipeline, VkPipelineLayout verifyLayout,
                            const void* verifyPC, size_t verifyPCSize);
-
-    VkFence layerFence = VK_NULL_HANDLE;
 
     // Per-queue fence tracking for syncAll/syncAllThrottled.
     // Each submit pushes its fence to the per-queue vector.

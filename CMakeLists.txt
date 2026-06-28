@@ -57,9 +57,11 @@ set(KERNELS
     src/kernels/add.comp
     src/kernels/rms_norm.comp
     src/kernels/embed.comp
+    src/kernels/embed_q8_0.comp
     src/kernels/kv_cache_write.comp
     src/kernels/dequantize.comp
     src/kernels/mlp_fused_gateup.comp
+    src/kernels/silu_mul.comp
     src/kernels/bda_test.comp
 )
 

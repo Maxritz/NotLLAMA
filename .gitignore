@@ -24,6 +24,8 @@ Release/
 MinSizeRel/
 RelWithDebInfo/
 
+# Reference implementations
+VindexLLM/
 reference/
 
 stderr.txt

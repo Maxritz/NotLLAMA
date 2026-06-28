@@ -4,69 +4,115 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
-// kv_cache_dequant.comp — Matches kv_cache_quantize.comp Q4_0 layout exactly.
-// Reverse of storeQ40() layout:
-//   - Packed data: uint[] where each uint holds 4 bytes × 2 nibbles/byte = 8 elements
-//   - Per-block scales in separate F16 buffer
-// Dispatch one thread per element (tokens × nHeads × headDim).
+// kv_cache_dequant.comp — General-purpose KV cache dequantization shader.
+// Matches byte layout of kv_cache_quantize.comp:
+//   Per block: [packed_weights (bytes)] [scale (1B if int8, 2B if fp16 LE)] [zero_point (1B, optional)]
+// Packing: bits=4 → 2 elements per byte; bits=5→6→8 → mask/shift per element.
+// Dispatch one thread per element (tokens * nHeads * headDim).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer UintRef {
-    uint data[];
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Uint8Ref {
+    uint8_t data[];
 };
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Float16OutRef {
     float16_t data[];
 };
 
-layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer F16ScaleRef {
-    float16_t data[];
-};
-
 layout(push_constant, scalar) uniform Params {
-    uint64_t addrSrc;     // Quantized KV cache (uint[])
-    uint64_t addrDst;     // F16 output buffer
-    uint64_t addrScales;  // F16 scales per block (per-head * nBlocks)
-    uint n;           // Total elements
-    uint blockSize;   // Elements per block (32 for Q4_0)
-    uint headDim;     // Elements per head (for per-block stride)
-    uint nHeads;      // Number of heads (for per-block stride)
-    uint nBlocks;     // Total blocks across all heads
+    uint64_t addrSrc;     // Quantized block data (uint8_t[])
+    uint64_t addrDst;     // F16 output (float16_t[])
+    uint n;               // Total elements
+    uint blockSize;       // Elements per block (64 or 128)
+    uint bits;            // 4, 5, 6, or 8
+    uint scaleBits;       // 8 (int8) or 16 (float16)
+    uint zeroPoint;       // 0 = no zero point, 1 = int8 zero point after scale
 } pc;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.n) return;
 
-    UintRef src = UintRef(pc.addrSrc);
+    Uint8Ref src = Uint8Ref(pc.addrSrc);
     Float16OutRef dst = Float16OutRef(pc.addrDst);
-    F16ScaleRef scales = F16ScaleRef(pc.addrScales);
 
-    // Compute block index and offset matching kv_cache_quantize.comp layout:
-    // Block = (head * nBlocks_per_head + block_within_head)
-    // nBlocks_per_head = (seqLen + blockSize - 1) / blockSize
-    // But n here = seqLen * nHeads * headDim, so block grows per-head
-    // Actually simpler: the quantized layout is per-head contiguous.
-    // n blocks = n / (blockSize * headDim) — each block covers blockSize tokens * headDim elements
-    uint elemsPerBlock = pc.blockSize * pc.headDim;
-    uint globalBlockIdx = idx / elemsPerBlock;
-    uint blockOff = idx % elemsPerBlock;
+    uint blockIdx = idx / pc.blockSize;
+    uint blockOff = idx % pc.blockSize;
 
-    // Word-level address matching storeQ40():
-    // elemsPerWord = 8 (4 bytes * 2 nibbles)
-    uint wordsPerBlock = elemsPerBlock / 8;
-    uint wordIdx = blockOff / 8;
-    uint byteOffInWord = (blockOff % 8) / 2;
-    uint nibbleOffInByte = (blockOff % 2) == 0 ? 0u : 4u;
+    // Compute byte offset to start of this block
+    uint elemsPerByte = 8 / pc.bits; // 2 for 4-bit, 1 for 8-bit, fractional for 5/6
+    uint packedBytesPerBlock;
+    if (pc.bits == 4) {
+        packedBytesPerBlock = pc.blockSize / 2;
+    } else if (pc.bits == 8) {
+        packedBytesPerBlock = pc.blockSize;
+    } else {
+        // bits=5 or 6: ceil(blockSize * bits / 8)
+        packedBytesPerBlock = (pc.blockSize * pc.bits + 7) / 8;
+    }
 
-    uint word = src.data[globalBlockIdx * wordsPerBlock + wordIdx];
-    uint byteVal = (word >> (byteOffInWord * 8)) & 0xFFu;
-    uint q = (byteVal >> nibbleOffInByte) & 0xFu;
+    uint scaleBytes = (pc.scaleBits == 16) ? 2 : 1;
+    uint zpBytes = (pc.zeroPoint == 1) ? 1 : 0;
+    uint blockBytes = packedBytesPerBlock + scaleBytes + zpBytes;
 
-    float scale = float(scales.data[globalBlockIdx]);
-    float deq = (float(q) - 8.0) * scale;
+    uint blockBase = blockIdx * blockBytes;
 
+    // Read quantization value
+    uint q;
+    if (pc.bits == 4) {
+        uint byteIdx = blockOff / 2;
+        uint nibbleOff = (blockOff % 2) == 0 ? 0u : 4u;
+        uint8_t byteVal = src.data[blockBase + byteIdx];
+        q = uint((byteVal >> nibbleOff) & 0xFu);
+    } else if (pc.bits == 8) {
+        q = uint(src.data[blockBase + blockOff]);
+    } else if (pc.bits == 5) {
+        // 5-bit: packed across byte boundaries
+        uint bitPos = blockOff * 5;
+        uint byteIdx = bitPos / 8;
+        uint bitOff = bitPos % 8;
+        uint8_t lo = src.data[blockBase + byteIdx];
+        uint8_t hi = src.data[blockBase + byteIdx + 1];
+        uint val = (uint(lo) >> bitOff) | (uint(hi) << (8 - bitOff));
+        q = val & 0x1Fu;
+    } else {
+        // bits == 6
+        uint bitPos = blockOff * 6;
+        uint byteIdx = bitPos / 8;
+        uint bitOff = bitPos % 8;
+        uint8_t lo = src.data[blockBase + byteIdx];
+        uint8_t hi = src.data[blockBase + byteIdx + 1];
+        uint val = (uint(lo) >> bitOff) | (uint(hi) << (8 - bitOff));
+        q = val & 0x3Fu;
+    }
+
+    // Read scale
+    float scale;
+    if (pc.scaleBits == 16) {
+        // Little-endian float16
+        uint scaleBase = blockBase + packedBytesPerBlock;
+        uint8_t lo = src.data[scaleBase];
+        uint8_t hi = src.data[scaleBase + 1];
+        uint16_t raw = uint16_t(lo) | (uint16_t(hi) << 8);
+        scale = float(float16_t(raw));
+    } else {
+        // int8 scale: treated as scale / 127.0
+        uint8_t raw = src.data[blockBase + packedBytesPerBlock];
+        int s = int(raw);
+        scale = float(s) / 127.0;
+    }
+
+    // Read zero point
+    float zp = 0.0;
+    if (pc.zeroPoint == 1) {
+        uint8_t raw = src.data[blockBase + packedBytesPerBlock + scaleBytes];
+        zp = float(int(raw));
+    }
+
+    float deq = (float(q) - zp) * scale;
     dst.data[idx] = float16_t(deq);
 }
