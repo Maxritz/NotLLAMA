@@ -49,22 +49,23 @@ void main() {
     uint gi = i + pc.elementOffset;
 
     // Q6_K (14) — 256 elements per block, 210 bytes
+    // Layout: ql[128] @0, qh[64] @128, scales[16] @192, d @208
     if (pc.quantFormat == 14) {
         uint blockIdx = gi / 256;
         uint eleInBlock = gi % 256;
         uint bs = blockIdx * 210;
 
-        float d = readF16(bs + 0);
+        float d = readF16(bs + 208);
         uint subBlock = eleInBlock / 16;
-        int sc = int(readByte(bs + 2 + subBlock));
+        int sc = int(readByte(bs + 192 + subBlock));
         if (sc >= 128) sc -= 256;
 
         uint qlByteIdx = eleInBlock / 2;
-        uint q4raw = readByte(bs + 18 + qlByteIdx);
+        uint q4raw = readByte(bs + 0 + qlByteIdx);
         uint q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0xFu) : (q4raw >> 4);
 
         uint qhByteIdx = eleInBlock / 4;
-        uint qhByte = readByte(bs + 146 + qhByteIdx);
+        uint qhByte = readByte(bs + 128 + qhByteIdx);
         uint qhShift = (eleInBlock & 3u) * 2;
 
         int val = int((q4 | (((qhByte >> qhShift) & 3) << 4))) - 32;

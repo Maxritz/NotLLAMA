@@ -138,6 +138,32 @@ When the user requests a durable behavior change, record it here or in the relev
 - Shader copy: `Copy-Item build\shaders\*.spv build\Release\shaders\`
 - Runtime: `rdna4_llama.exe` must not crash (VK_ERROR_DEVICE_LOST or 0xC0000005)
 
+## Changes (2026-06-28 Round 6 — Vulkan compute-only device fix + graphify update)
+
+### Task: AMD WDDM routes compute to 3D engine (Compute 0 flat at 0%)
+
+**Root cause**: `context.cpp` queried the full Vulkan 1.4 pNext chain (correct for signaling a modern app), but then passed **all queried features unmodified** to `vkCreateDevice`. This included graphics-only features:
+- `feat13.dynamicRendering = VK_TRUE` — **graphics-only**, forces AMD WDDM to classify the app as "graphics" and route ALL compute dispatches through the 3D engine
+- Base features: `geometryShader`, `tessellationShader`, `depthClamp`, `alphaToOne`, `multiViewport`, `samplerAnisotropy`, etc. — all left enabled if GPU supported them
+- Vulkan 1.1/1.2/1.3 graphics features (`multiview`, `drawIndirectCount`, `imagelessFramebuffer`, `shaderOutputViewportIndex`, `shaderTerminateInvocation`, etc.) — all left enabled
+
+The AMD WDDM driver profiles apps **statically at `vkCreateDevice` time** by feature requests, not by per-submit queue family usage. A compute-only queue family (family 1, no `GRAPHICS_BIT`) was correctly selected, but the driver had already permanently tagged the app as "graphics-capable" and routed compute through the Graphics Command Processor.
+
+**Fix** (`src/host/context.cpp`):
+- After querying with `vkGetPhysicalDeviceFeatures2`, explicitly **zero every feature struct** and enable **only** compute-relevant features before passing to `vkCreateDevice`
+- Base features: only `shaderInt64` + `shaderInt16` enabled
+- Vulkan 1.1: only `storageBuffer16BitAccess`
+- Vulkan 1.2: `bufferDeviceAddress`, `shaderFloat16`, `shaderInt8`, `storageBuffer8BitAccess`, `uniformAndStorageBuffer8BitAccess`, `scalarBlockLayout`, `timelineSemaphore`
+- Vulkan 1.3: `synchronization2`, `maintenance4`; **`dynamicRendering = VK_FALSE`** (critical)
+- Vulkan 1.4: zeroed entirely as defensive measure
+- Cooperative matrix features preserved if available
+
+**Graphify update**: Pruned 5 deleted files, rebuilt to **1458 nodes, 2032 edges, 127 communities**.
+
+**Build**: All 3 targets (`rdna4_llama.exe`, `test_inference.exe`, `test_cpu_ref.exe`) compile cleanly.
+
+---
+
 ## Changes (2026-06-28 Round 5 — Crash 0xE06D7363 fix: weight uploader input validation)
 
 ### Task C: Crash 0xE06D7363 — Root cause & fix
@@ -198,10 +224,10 @@ When the user requests a durable behavior change, record it here or in the relev
 |------|------|--------|-------|
 | 1 | `src/host/inference_engine.cpp` | ✅ DONE | Batch mode integrated: forwardPartial() uses beginBatch/dispatchInBatch/barrierBetweenGroups/endBatch for attention and FFN batches. No more vector allocs per layer. |
 | 2 | `src/host/inference_engine.cpp` | ✅ DONE | VK_WHOLE_SIZE → exact aligned size for logits readback |
-| 3 | `src/host/inference_engine.cpp` | ❌ PENDING | Overflow check for addrDownW_dq |
+| 3 | `src/host/inference_engine.cpp` | ✅ DONE | Overflow check for addrDownW_dq: lines 837-841 null-check all three MLP dequant addresses against sizes |
 | 4 | `src/host/scheduler.cpp` | ✅ DONE | vkBeginCommandBuffer errors checked in beginBatch/dispatchBatch/dispatchBatchBarriers |
 | 5 | `src/host/scheduler.cpp` | ✅ DONE | vkEndCommandBuffer error checks added to all 5 call sites (dispatch, dispatchTimed, dispatchBatch, dispatchBatchBarriers, endBatch) |
-| 6 | `src/host/scheduler.cpp` | ⚠️ NOT DONE | vkQueueSubmit error check missing in dispatch() — fixed in dispatch(), but check dispatchBatch too |
+| 6 | `src/host/scheduler.cpp` | ✅ DONE | vkQueueSubmit error checks added to all 5 call sites (dispatch, dispatchTimed, dispatchBatch, dispatchBatchBarriers, endBatch) |
 | 7 | `src/kernels/mlp.comp` | ✅ DONE | mlp.comp deleted (replaced by mlp_fused_gateup.comp). MlpPushConstants removed from rdna4_types.hpp. Dead loadPipe("mlp", ...) removed from main.cpp and test_inference.cpp. |
 
 

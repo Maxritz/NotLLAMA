@@ -202,7 +202,12 @@ int main(int argc, char** argv) {
         bufInfo.size = testBytes;
         bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(ctx.device, &bufInfo, nullptr, &testBuf);
+        VkResult r = vkCreateBuffer(ctx.device, &bufInfo, nullptr, &testBuf);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[BDA_TEST] vkCreateBuffer failed: %d\n", r);
+            log("BDA test: FAILED (vkCreateBuffer)");
+            goto bda_test_done;
+        }
 
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(ctx.device, testBuf, &memReq);
@@ -228,6 +233,12 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        if (memTypeIdx == UINT32_MAX) {
+            fprintf(stderr, "[BDA_TEST] No suitable memory type found\n");
+            vkDestroyBuffer(ctx.device, testBuf, nullptr);
+            log("BDA test: FAILED (no memory type)");
+            goto bda_test_done;
+        }
 
         VkMemoryAllocateFlagsInfo flagsInfo = {};
         flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
@@ -238,8 +249,21 @@ int main(int argc, char** argv) {
         allocInfo.allocationSize = memReq.size;
         allocInfo.memoryTypeIndex = memTypeIdx;
         allocInfo.pNext = &flagsInfo;
-        vkAllocateMemory(ctx.device, &allocInfo, nullptr, &testMem);
-        vkBindBufferMemory(ctx.device, testBuf, testMem, 0);
+        r = vkAllocateMemory(ctx.device, &allocInfo, nullptr, &testMem);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[BDA_TEST] vkAllocateMemory failed: %d\n", r);
+            vkDestroyBuffer(ctx.device, testBuf, nullptr);
+            log("BDA test: FAILED (vkAllocateMemory)");
+            goto bda_test_done;
+        }
+        r = vkBindBufferMemory(ctx.device, testBuf, testMem, 0);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[BDA_TEST] vkBindBufferMemory failed: %d\n", r);
+            vkFreeMemory(ctx.device, testMem, nullptr);
+            vkDestroyBuffer(ctx.device, testBuf, nullptr);
+            log("BDA test: FAILED (vkBindBufferMemory)");
+            goto bda_test_done;
+        }
 
         VkBufferDeviceAddressInfo addrInfo = {};
         addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
@@ -266,7 +290,14 @@ int main(int argc, char** argv) {
 
         // Read back
         void* mapped = nullptr;
-        vkMapMemory(ctx.device, testMem, 0, testBytes, 0, &mapped);
+        r = vkMapMemory(ctx.device, testMem, 0, testBytes, 0, &mapped);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[BDA_TEST] vkMapMemory failed: %d\n", r);
+            vkDestroyBuffer(ctx.device, testBuf, nullptr);
+            vkFreeMemory(ctx.device, testMem, nullptr);
+            log("BDA test: FAILED (vkMapMemory)");
+            goto bda_test_done;
+        }
         uint32_t* data = (uint32_t*)mapped;
         bool allZero = true;
         bool allCorrect = true;
@@ -292,6 +323,7 @@ int main(int argc, char** argv) {
         log("BDA test: done");
     }
     // === END BDA TEST ===
+bda_test_done:;
 
     log("creating engine");
     InferenceEngine engine(&ctx, &model, &kvCache, &pipelines, &tokenizer, &scheduler, &allocator);

@@ -140,15 +140,27 @@ void Context::createDevice() {
     std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
     vkGetPhysicalDeviceQueueFamilyProperties(physDevice_, &queueFamilyCount, queueFamilies.data());
 
-    // Find compute and transfer families
+    // Find compute-only families (no graphics) — route to ACE, not 3D engine
     std::vector<uint32_t> computeFamilies, transferFamily;
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+        if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
             computeFamilies.push_back(i);
         }
         if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
-            !(queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+            !(queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
             transferFamily.push_back(i);
+        }
+    }
+    // Fallback: if no pure compute family exists, use first compute-capable one
+    if (computeFamilies.empty()) {
+        std::cerr << "[WARN] No pure compute family; falling back to graphics+compute\n";
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                computeFamilies.push_back(i);
+                break;
+            }
         }
     }
     if (computeFamilies.empty())

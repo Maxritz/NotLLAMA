@@ -1,0 +1,111 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// compress_context.comp — Compacts the KV cache based on a keep_mask.
+// v1 limitation: seqLen <= 2048. Single workgroup with shared memory prefix sum.
+// For seqLen > 2048, a multi-workgroup two-pass approach is needed (v2).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Float16Ref {
+    float16_t data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) writeonly buffer Float16OutRef {
+    float16_t data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Uint8Ref {
+    uint data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrKSrc;
+    uint64_t addrVSrc;
+    uint64_t addrKDst;
+    uint64_t addrVDst;
+    uint64_t addrMask;
+    uint seqLen;
+    uint nHeads;
+    uint headDim;
+    uint targetLen;
+} pc;
+
+shared uint shPrefix[2048];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    Float16Ref KSrc = Float16Ref(pc.addrKSrc);
+    Float16Ref VSrc = Float16Ref(pc.addrVSrc);
+    Float16OutRef KDst = Float16OutRef(pc.addrKDst);
+    Float16OutRef VDst = Float16OutRef(pc.addrVDst);
+    Uint8Ref Mask = Uint8Ref(pc.addrMask);
+
+    uint seqLen = pc.seqLen;
+    uint nHeads = pc.nHeads;
+    uint headDim = pc.headDim;
+
+    // Step 1: compute prefix sum of keep_mask in shared memory
+    uint keep = 0;
+    if (tid < seqLen) {
+        uint byteVal = Mask.data[tid / 4];
+        uint shift = (tid % 4) * 8;
+        keep = (byteVal >> shift) & 0xFFu;
+    }
+    shPrefix[tid] = keep;
+
+    // Parallel prefix sum via subgroup scan + shared memory accumulation
+    uint laneInWarp = tid % 32;
+    uint warpIdx = tid / 32;
+    uint warpSum = subgroupInclusiveAdd(keep);
+
+    if (laneInWarp == 31) {
+        shPrefix[tid] = warpSum;
+    }
+    barrier();
+
+    // Accumulate warp-level sums
+    if (warpIdx > 0) {
+        uint prevWarpSum = shPrefix[warpIdx * 32 - 1];
+        warpSum += prevWarpSum;
+    }
+
+    // Write final prefix sum back
+    if (tid < seqLen) {
+        shPrefix[tid] = warpSum;
+    }
+    barrier();
+
+    // Step 2: copy kept tokens to destination
+    // Each thread handles one head position element
+    uint totalElements = seqLen * nHeads * headDim;
+    uint threads = gl_NumWorkGroups.x * 128;
+
+    for (uint i = gid; i < totalElements; i += threads) {
+        uint pos = i / (nHeads * headDim);
+        uint headOffset = i % (nHeads * headDim);
+
+        if (pos >= seqLen) break;
+
+        uint byteVal = Mask.data[pos / 4];
+        uint shift = (pos % 4) * 8;
+        uint keepMask = (byteVal >> shift) & 0xFFu;
+        if (keepMask == 0) continue;
+
+        // Destination position is (prefix_sum(pos) - 1) since prefix sum is inclusive
+        uint dstPos = shPrefix[pos] - 1;
+        uint dstIdx = dstPos * nHeads * headDim + headOffset;
+
+        uint srcIdx = pos * nHeads * headDim + headOffset;
+        KDst.data[dstIdx] = KSrc.data[srcIdx];
+        VDst.data[dstIdx] = VSrc.data[srcIdx];
+    }
+}
