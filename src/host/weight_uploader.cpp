@@ -325,16 +325,10 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     fflush(stderr);
 
     // Create staging buffer — one buffer, reused for all tensors
-    // Size for worst-case: quantized tensor dequantized to F32 (up to 4× raw size)
+    // Staging buffer copies raw compressed bytes to GPU; dequant happens on GPU shaders
     VkDeviceSize maxTensorSize = 0;
     for (auto& t : j["tensors"]) {
         VkDeviceSize s = t.value("bin_size", 0);
-        QuantFormat fmt = ggmlToQuantFormat(t.value("dtype_id", 0));
-        if (isQuantized(fmt)) {
-            // F32 output: nElements * 4. nElements = size_bytes / bytes_per_element_approx
-            // Safe upper bound: bin_size * 4 (Q4_0 is 18 bytes per 32 elements = 0.56 B/elem -> F32 = 4 B/elem -> 7.1×)
-            s = s * 8;
-        }
         if (s > maxTensorSize) maxTensorSize = s;
     }
     fprintf(stderr, "[uploader] Max tensor: %zu MB\n", (size_t)(maxTensorSize / 1024 / 1024));
@@ -442,28 +436,9 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
             continue;
         }
 
-        // CPU pre-dequant: if quantized, dequantize to F32 before GPU upload
+        // Upload raw bytes — GPU dequant shaders handle format conversion
         const uint8_t* uploadData = binData.data() + desc.binOffset;
         size_t uploadSize = desc.binSize;
-        std::vector<float> dequantF32;
-
-        if (isQuantized(desc.format)) {
-            uint32_t nElements = 1;
-            for (auto d : desc.shape) nElements *= d;
-            fprintf(stderr, "  [dequant] CPU pre-dequant %s (%u elements, format=%u)...\n",
-                    desc.name.c_str(), nElements, (uint32_t)desc.format); fflush(stderr);
-            if (cpuDequantToFloat(binData.data() + desc.binOffset, desc.binSize,
-                                  desc.format, desc.blockSize, desc.blockElements,
-                                  nElements, dequantF32)) {
-                uploadData = reinterpret_cast<const uint8_t*>(dequantF32.data());
-                uploadSize = dequantF32.size() * sizeof(float);
-                fprintf(stderr, "  [dequant] -> F32 (%zu bytes)\n", uploadSize); fflush(stderr);
-                desc.format = QuantFormat::F32;
-                desc.sizeBytes = uploadSize;
-            } else {
-                fprintf(stderr, "  [dequant] FAILED, uploading raw bytes\n"); fflush(stderr);
-            }
-        }
 
         fprintf(stderr, "  [1] createGpuBuffer (%zu bytes)...\n", uploadSize); fflush(stderr);
         VkDeviceAddress addr = 0;
