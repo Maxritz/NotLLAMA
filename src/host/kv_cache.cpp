@@ -12,7 +12,7 @@ KVCacheManager::KVCacheManager(VkDevice dev, VkPhysicalDevice pdev,
 }
 
 bool KVCacheManager::allocate() {
-    size_t layerBytes = static_cast<size_t>(maxSeqLen) * nKvHeads * headDim * sizeof(uint16_t);
+    size_t layerBytes = static_cast<size_t>(maxSeqLen) * nKvHeads * headDim * sizeof(float);
 
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
@@ -113,7 +113,7 @@ void KVCacheManager::append(uint32_t layer, const void* kData, const void* vData
     if (layer >= layers.size()) return;
     auto& l = layers[layer];
 
-    size_t rowBytes = static_cast<size_t>(nKvHeads) * headDim * sizeof(uint16_t);
+    size_t rowBytes = static_cast<size_t>(nKvHeads) * headDim * sizeof(float);
     size_t kOffset = static_cast<size_t>(l.currentSeqLen) * rowBytes;
 
     VkPhysicalDeviceProperties physProps;

@@ -11,7 +11,8 @@
 // =============================================================================
 // RMS NORM — y = x / sqrt(mean(x^2) + eps) * weight
 // =============================================================================
-// One workgroup per row. Subgroup reduction for sum of squares.
+// One workgroup per row. Shared-memory reduction for sum of squares.
+// Works for any subgroup size; avoids undefined out-of-range shuffle reads.
 // =============================================================================
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -35,6 +36,8 @@ layout(push_constant, scalar) uniform PushConstants {
     float eps;
 } pc;
 
+shared float sumShared[32];
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.x;
@@ -53,16 +56,18 @@ void main() {
         float v = In.data[base + i];
         sumSq += v * v;
     }
+    sumShared[tid] = sumSq;
+    barrier();
 
-    // Subgroup reduction
-    sumSq += subgroupShuffleDown(sumSq, 16);
-    sumSq += subgroupShuffleDown(sumSq, 8);
-    sumSq += subgroupShuffleDown(sumSq, 4);
-    sumSq += subgroupShuffleDown(sumSq, 2);
-    sumSq += subgroupShuffleDown(sumSq, 1);
-    sumSq = subgroupBroadcastFirst(sumSq);
+    // Shared-memory reduction: 32 -> 16 -> 8 -> 4 -> 2 -> 1
+    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sumShared[tid] += sumShared[tid + stride];
+        }
+        barrier();
+    }
 
-    float invRms = 1.0 / sqrt(sumSq / float(pc.rowSize) + pc.eps);
+    float invRms = 1.0 / sqrt(sumShared[0] / float(pc.rowSize) + pc.eps);
 
     // Normalize and scale by weight
     for (uint i = tid; i < pc.rowSize; i += 32) {

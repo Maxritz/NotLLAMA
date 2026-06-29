@@ -181,27 +181,22 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             result[i] = d * (float)(int8_t)sc * (float)(int)(nibble - 8) - dmin;
         }
     } else if (format == QuantFormat::Q4_K) {
+        // Layout: d(fp16)@0, dmin(fp16)@2, scales_int8(12)@4, qs(128)@16
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 256;
             uint32_t eleInBlock = i % 256;
             uint32_t bs = blockIdx * 144;
+
             float d = readF16(data, bs);
-            float dmin = fp16ToFloat(*(uint16_t*)(data + bs + 2));
+            float dmin = readF16(data, bs + 2);
             uint32_t subBlock = eleInBlock / 32;
             uint32_t subEle = eleInBlock % 32;
-            uint32_t scOffset = bs + 132 + subBlock * 2;
-            float sc = readF16(data, scOffset);
-            uint32_t byteIdx = bs + 4 + subBlock * 16 + subEle / 2;
-            uint8_t bval = data[byteIdx];
+            uint8_t sc = data[bs + 4 + subBlock];
+            uint32_t qsOffset = bs + 16 + (eleInBlock / 2);
+            uint8_t bval = data[qsOffset];
             uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
-            uint32_t hiByte = 0;
-            if (subBlock < 4) {
-                uint32_t hiByteIdx = bs + 4 + 64 + subBlock * 8 + subEle / 2;
-                hiByte = data[hiByteIdx];
-                uint32_t hiNibble = (subEle % 2 == 0) ? (hiByte & 0x0F) : ((hiByte >> 4) & 0x0F);
-                nibble |= hiNibble << 4;
-            }
-            result[i] = sc * ((float)(int)(nibble - 16)) * d - dmin;
+
+            result[i] = d * (float)sc * ((float)nibble - 8.0f) + dmin;
         }
     } else if (format == QuantFormat::Q5_K) {
         for (uint32_t i = 0; i < nElements; ++i) {

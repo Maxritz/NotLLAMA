@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Fused Q8_0 matvec — no staging buffer.
+// Block layout: 34 bytes per 32 elements
+//   d       @ 0  — float16 scale (2 bytes)
+//   qs[32]  @ 2  — int8 quantized values (32 bytes)
+// Dequant: value = d * qs[i]
+//
+// 64 threads, each computes one output element independently.
+// Input tile loaded cooperatively into shared memory.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ByteRef {
+    uint8_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer FloatRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) writeonly buffer FloatOutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrWeight;
+    uint64_t addrInput;
+    uint64_t addrOutput;
+    uint inDim;
+    uint outDim;
+    uint transB;
+} pc;
+
+#define TILE_K 256
+shared float inputTile[TILE_K];
+
+float readF16(uint64_t addr, uint off) {
+    ByteRef w = ByteRef(addr);
+    uint raw = uint(w.data[off]) | (uint(w.data[off + 1u]) << 8);
+    return unpackHalf2x16(raw).x;
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.outDim) return;
+
+    FloatRef In = FloatRef(pc.addrInput);
+    FloatOutRef Out = FloatOutRef(pc.addrOutput);
+    ByteRef W = ByteRef(pc.addrWeight);
+
+    float acc = 0.0;
+
+    for (uint tileStart = 0u; tileStart < pc.inDim; tileStart += TILE_K) {
+        uint tileEnd = min(tileStart + TILE_K, pc.inDim);
+        uint tileSize = tileEnd - tileStart;
+
+        for (uint i = gl_LocalInvocationID.x; i < tileSize; i += 64u) {
+            inputTile[i] = In.data[tileStart + i];
+        }
+        barrier();
+
+        for (uint k = 0u; k < tileSize; ++k) {
+            uint globalK = tileStart + k;
+            uint idx = (pc.transB != 0u)
+                ? col * pc.inDim + globalK
+                : globalK * pc.outDim + col;
+
+            uint blockIdx = idx / 32u;
+            uint eib = idx % 32u;
+            uint bs = blockIdx * 34u;
+
+            uint raw = uint(W.data[bs]) | (uint(W.data[bs + 1u]) << 8);
+            float d = unpackHalf2x16(raw).x;
+            int q = int(int8_t(W.data[bs + 2u + eib]));
+
+            acc += inputTile[k] * d * float(q);
+        }
+        barrier();
+    }
+
+    Out.data[col] = acc;
+}

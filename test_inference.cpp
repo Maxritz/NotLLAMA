@@ -118,23 +118,12 @@ int main(int argc, char** argv) {
 
     loadPipe("gemm", sizeof(GemmPushConstants));
     loadPipe("attention", sizeof(AttentionPushConstants));
-    loadPipe("flash_attention", sizeof(FlashAttentionPushConstants));
-    loadPipe("mlp_fused_gateup", sizeof(MlpFusedGateUpPushConstants));
     loadPipe("rope", sizeof(RopePushConstants));
-    loadPipe("topk", sizeof(TopKPushConstants));
     loadPipe("add", sizeof(AddPushConstants));
     loadPipe("silu_mul", sizeof(SiluMulPushConstants));
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
-    loadPipe("embed_q8_0", sizeof(EmbedPushConstants));
-    loadPipe("embed_q6_k", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
-    loadPipe("dequantize", sizeof(DequantizePushConstants));
-    loadPipe("dequantize_test", sizeof(DequantizePushConstants));
-    loadPipe("kernel_entry", sizeof(KernelEntryPushConstants));
-    loadPipe("matvec_q6_k", sizeof(MatVecPushConstants));
-    loadPipe("matvec_q8_0", sizeof(MatVecPushConstants));
-    loadPipe("matvec_q4_0", sizeof(MatVecPushConstants));
 
     Scheduler scheduler(ctx.device, ctx.queues, ctx.queueFamilyIndex);
     FencePool fencePool(ctx.device);
@@ -142,14 +131,6 @@ int main(int argc, char** argv) {
 
     InferenceEngine engine(&ctx, &model, &kvCache, &pipelines, &tokenizer,
                            &scheduler, &allocator);
-    if (!engine.initDequantBuffer()) {
-        fprintf(stderr, "Failed to allocate dequant staging buffer\n");
-        scheduler.cleanup();
-        pipelines.cleanup();
-        kvCache.free();
-        ctx.cleanup();
-        return 1;
-    }
 
     uint32_t tokenId = 1;
     uint32_t seqPos = 0;
@@ -161,9 +142,6 @@ int main(int argc, char** argv) {
     auto startTime = std::chrono::steady_clock::now();
     auto gpuFuture = std::async(std::launch::async, [&]() {
         try {
-            if (!engine.initEmbedCache()) {
-                fprintf(stderr, "Warning: embedding cache initialization failed, continuing without cache\n");
-            }
             return engine.forward(tokenId, seqPos);
         } catch (...) {
             return 0u;
@@ -205,12 +183,9 @@ int main(int argc, char** argv) {
     bool pass = false;
     std::vector<float> gpuLogitsCopy;
 
-    // Determine logits source: kernel_entry path uses logitsMapped, forwardPartial uses ring allocator
+    // Read logits from ring allocator (all weights are F32, no kernel_entry path)
     const float* gpuLogits = nullptr;
-    if (engine.logitsMapped) {
-        gpuLogits = engine.logitsMapped;
-        fprintf(stderr, "[readback] using kernel_entry logits buffer\n");
-    } else if (allocator.mappedPtr && engine.lastLogitsOffset != 0) {
+    if (allocator.mappedPtr && engine.lastLogitsOffset != 0) {
         size_t logitsSize = (size_t)model.vocabSize * sizeof(float);
         size_t logitsOff = engine.lastLogitsOffset;
         VkMappedMemoryRange range = {};
@@ -220,7 +195,7 @@ int main(int argc, char** argv) {
         range.size = ((logitsSize + 4095) & ~static_cast<size_t>(4095));
         vkInvalidateMappedMemoryRanges(ctx.device, 1, &range);
         gpuLogits = reinterpret_cast<float*>(allocator.mappedPtr + logitsOff);
-        fprintf(stderr, "[readback] using ring allocator logits at offset %zu\n", logitsOff);
+        fprintf(stderr, "[readback] ring allocator logits at offset %zu\n", logitsOff);
     }
 
     if (!gpuLogits) {

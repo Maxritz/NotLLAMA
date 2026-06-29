@@ -4,6 +4,9 @@
 #include <iostream>
 #include <cstring>
 #include <new>
+#include <cmath>
+#include <vector>
+#include <cstdint>
 
 namespace rdna4 {
 
@@ -24,6 +27,244 @@ static QuantFormat ggmlToQuantFormat(int ggmlType) {
         case 15: return QuantFormat::Q8_K;
         default: return QuantFormat::F32;
     }
+}
+
+static bool isQuantized(QuantFormat fmt) {
+    return fmt != QuantFormat::F32 && fmt != QuantFormat::F16;
+}
+
+static float fp16ToFloatCpu(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1;
+    uint32_t exponent = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+    if (exponent == 0) {
+        if (mantissa == 0) return sign ? -0.0f : 0.0f;
+        while (!(mantissa & 0x400)) { mantissa <<= 1; exponent--; }
+        exponent++;
+        mantissa &= 0x3FF;
+    } else if (exponent == 31) {
+        if (mantissa == 0) return sign ? -INFINITY : INFINITY;
+        return NAN;
+    }
+    exponent += 127 - 15;
+    uint32_t raw = (sign << 31) | (exponent << 23) | (mantissa << 13);
+    float result;
+    memcpy(&result, &raw, sizeof(result));
+    return result;
+}
+
+static float readF16Cpu(const uint8_t* data, size_t offset) {
+    uint16_t raw = data[offset] | ((uint16_t)data[offset + 1] << 8);
+    return fp16ToFloatCpu(raw);
+}
+
+static bool cpuDequantToFloat(const uint8_t* srcData, size_t srcSize,
+                               QuantFormat format, uint32_t blockSize,
+                               uint32_t blockElements, uint32_t nElements,
+                               std::vector<float>& out) {
+    out.resize(nElements, 0.0f);
+
+    if (format == QuantFormat::F32) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t raw;
+            memcpy(&raw, srcData + i * 4, 4);
+            memcpy(&out[i], &raw, 4);
+        }
+        return true;
+    }
+    if (format == QuantFormat::F16) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            out[i] = readF16Cpu(srcData, i * 2);
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q8_0) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 34;
+            if (bs + 2 + eleInBlock >= srcSize) continue;
+            float delta = readF16Cpu(srcData, bs);
+            int q = (int8_t)srcData[bs + 2 + eleInBlock];
+            out[i] = delta * (float)q;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q4_0) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 18;
+            if (bs + 2 + (eleInBlock / 2) >= srcSize) continue;
+            float delta = readF16Cpu(srcData, bs);
+            uint8_t bval = srcData[bs + 2 + (eleInBlock / 2)];
+            uint32_t nibble = (eleInBlock % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            out[i] = delta * ((float)nibble - 8.0f);
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q6_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 210;
+            if (bs + 210 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs + 208);
+            uint32_t subBlock = eleInBlock / 16;
+            int sc = (int8_t)srcData[bs + 192 + subBlock];
+            uint32_t qlByteIdx = eleInBlock / 2;
+            uint8_t q4raw = srcData[bs + 0 + qlByteIdx];
+            uint32_t q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0xFu) : (q4raw >> 4);
+            uint32_t qhByteIdx = eleInBlock / 4;
+            uint8_t qhByte = srcData[bs + 128 + qhByteIdx];
+            uint32_t qhShift = (eleInBlock & 3u) * 2;
+            int val = (int)(q4 | (((qhByte >> qhShift) & 3) << 4)) - 32;
+            out[i] = d * (float)sc * (float)val;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q4_K) {
+        // Layout: d(fp16)@0, dmin(fp16)@2, scales_int8(12)@4, qs(128)@16
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 144;
+            if (bs + 144 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs);
+            float dmin = readF16Cpu(srcData, bs + 2);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            uint8_t sc = srcData[bs + 4 + subBlock];
+            uint32_t qsOffset = bs + 16 + (eleInBlock / 2);
+            if (qsOffset >= srcSize) continue;
+            uint8_t bval = srcData[qsOffset];
+            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            out[i] = d * (float)sc * ((float)nibble - 8.0f) + dmin;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q5_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 176;
+            if (bs + 176 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs);
+            float dmin = readF16Cpu(srcData, bs + 2);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            uint32_t scOffset = bs + 132 + subBlock * 2;
+            float sc = readF16Cpu(srcData, scOffset);
+            uint32_t byteIdx = bs + 4 + subBlock * 16 + subEle / 2;
+            if (byteIdx >= srcSize) continue;
+            uint8_t bval = srcData[byteIdx];
+            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            uint32_t hiByteIdx = bs + 4 + 64 + subBlock * 8 + subEle / 2;
+            uint32_t hi = 0;
+            if (hiByteIdx < srcSize) {
+                uint8_t hb = srcData[hiByteIdx];
+                hi = ((subEle % 2 == 0) ? (hb & 0x0F) : ((hb >> 4) & 0x0F)) << 4;
+            }
+            uint32_t qhIdx = bs + 4 + 64 + 32 + subBlock * 4 + subEle / 8;
+            uint32_t qh = 0;
+            if (qhIdx < srcSize) qh = (srcData[qhIdx] >> (subEle % 8)) & 1;
+            int val = (int)(nibble | hi | (qh << 5)) - 16;
+            out[i] = sc * (float)val + dmin;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q8_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 290;
+            if (bs + 290 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs);
+            uint32_t subBlock = eleInBlock / 32;
+            int sc = (int8_t)srcData[bs + 256 + subBlock];
+            uint32_t qIdx = bs + 2 + eleInBlock;
+            if (qIdx >= srcSize) continue;
+            int q = (int8_t)srcData[qIdx];
+            out[i] = d * (float)sc * (float)q;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q3_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 112;
+            if (bs + 112 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs);
+            float dmin = readF16Cpu(srcData, bs + 2);
+            uint32_t subBlock = eleInBlock / 32;
+            uint32_t subEle = eleInBlock % 32;
+            uint8_t sc = srcData[bs + 4 + subBlock];
+            uint32_t byteIdx = bs + 12 + subBlock * 24 + subEle / 2;
+            if (byteIdx >= srcSize) continue;
+            uint8_t bval = srcData[byteIdx];
+            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+            out[i] = d * (float)(int8_t)sc * (float)(int)(nibble - 8) - dmin;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q2_K) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 256;
+            uint32_t eleInBlock = i % 256;
+            uint32_t bs = blockIdx * 80;
+            if (bs + 80 > srcSize) continue;
+            float d = readF16Cpu(srcData, bs);
+            float dmin = readF16Cpu(srcData, bs + 2);
+            uint32_t subBlock = eleInBlock / 64;
+            uint32_t subEle = eleInBlock % 64;
+            uint8_t sc = srcData[bs + 4 + subBlock];
+            uint32_t byteIdx = bs + 8 + subBlock * 16 + subEle / 4;
+            if (byteIdx >= srcSize) continue;
+            uint8_t bval = srcData[byteIdx];
+            uint32_t shift = (subEle % 4) * 2;
+            uint32_t q2 = (bval >> shift) & 3;
+            out[i] = d * (float)sc * (float)(int)q2 + dmin;
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q5_0) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 22;
+            if (bs + 22 > srcSize) continue;
+            float delta = readF16Cpu(srcData, bs);
+            uint32_t byteIdx = bs + 2 + (eleInBlock * 5 / 8);
+            if (byteIdx >= srcSize) continue;
+            uint8_t bval = srcData[byteIdx];
+            uint32_t shift = (eleInBlock * 5) % 8;
+            uint32_t q5 = (bval >> shift) & 0x1F;
+            if (q5 > 15) q5 |= 0xE0;
+            out[i] = delta * ((float)(int)q5 - 16.0f);
+        }
+        return true;
+    }
+    if (format == QuantFormat::Q5_1) {
+        for (uint32_t i = 0; i < nElements; ++i) {
+            uint32_t blockIdx = i / 32;
+            uint32_t eleInBlock = i % 32;
+            uint32_t bs = blockIdx * 24;
+            if (bs + 24 > srcSize) continue;
+            float delta = readF16Cpu(srcData, bs);
+            float deltaMin = readF16Cpu(srcData, bs + 2);
+            uint32_t byteIdx = bs + 4 + (eleInBlock * 5 / 8);
+            if (byteIdx >= srcSize) continue;
+            uint8_t bval = srcData[byteIdx];
+            uint32_t shift = (eleInBlock * 5) % 8;
+            uint32_t q5 = (bval >> shift) & 0x1F;
+            out[i] = delta * (float)q5 + deltaMin;
+        }
+        return true;
+    }
+    // Unknown format — output zeros
+    fprintf(stderr, "[cpu-dequant] WARNING: unsupported format %u, outputting zeros\n", (uint32_t)format);
+    return false;
 }
 
 ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& binPath) {
@@ -84,9 +325,16 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     fflush(stderr);
 
     // Create staging buffer — one buffer, reused for all tensors
+    // Size for worst-case: quantized tensor dequantized to F32 (up to 4× raw size)
     VkDeviceSize maxTensorSize = 0;
     for (auto& t : j["tensors"]) {
         VkDeviceSize s = t.value("bin_size", 0);
+        QuantFormat fmt = ggmlToQuantFormat(t.value("dtype_id", 0));
+        if (isQuantized(fmt)) {
+            // F32 output: nElements * 4. nElements = size_bytes / bytes_per_element_approx
+            // Safe upper bound: bin_size * 4 (Q4_0 is 18 bytes per 32 elements = 0.56 B/elem -> F32 = 4 B/elem -> 7.1×)
+            s = s * 8;
+        }
         if (s > maxTensorSize) maxTensorSize = s;
     }
     fprintf(stderr, "[uploader] Max tensor: %zu MB\n", (size_t)(maxTensorSize / 1024 / 1024));
@@ -194,15 +442,38 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
             continue;
         }
 
-        fprintf(stderr, "  [1] createGpuBuffer...\n"); fflush(stderr);
+        // CPU pre-dequant: if quantized, dequantize to F32 before GPU upload
+        const uint8_t* uploadData = binData.data() + desc.binOffset;
+        size_t uploadSize = desc.binSize;
+        std::vector<float> dequantF32;
+
+        if (isQuantized(desc.format)) {
+            uint32_t nElements = 1;
+            for (auto d : desc.shape) nElements *= d;
+            fprintf(stderr, "  [dequant] CPU pre-dequant %s (%u elements, format=%u)...\n",
+                    desc.name.c_str(), nElements, (uint32_t)desc.format); fflush(stderr);
+            if (cpuDequantToFloat(binData.data() + desc.binOffset, desc.binSize,
+                                  desc.format, desc.blockSize, desc.blockElements,
+                                  nElements, dequantF32)) {
+                uploadData = reinterpret_cast<const uint8_t*>(dequantF32.data());
+                uploadSize = dequantF32.size() * sizeof(float);
+                fprintf(stderr, "  [dequant] -> F32 (%zu bytes)\n", uploadSize); fflush(stderr);
+                desc.format = QuantFormat::F32;
+                desc.sizeBytes = uploadSize;
+            } else {
+                fprintf(stderr, "  [dequant] FAILED, uploading raw bytes\n"); fflush(stderr);
+            }
+        }
+
+        fprintf(stderr, "  [1] createGpuBuffer (%zu bytes)...\n", uploadSize); fflush(stderr);
         VkDeviceAddress addr = 0;
         VkDeviceMemory bufMem = VK_NULL_HANDLE;
-        desc.buffer = createGpuBuffer(desc.binSize, &addr, &bufMem);
+        desc.buffer = createGpuBuffer(uploadSize, &addr, &bufMem);
         desc.gpuAddress = addr;
         desc.memory = bufMem;
 
         fprintf(stderr, "  [2] memcpy to staging...\n"); fflush(stderr);
-        std::memcpy(mapped, binData.data() + desc.binOffset, desc.binSize);
+        std::memcpy(mapped, uploadData, uploadSize);
 
         fprintf(stderr, "  [3] flush...\n"); fflush(stderr);
         VkMappedMemoryRange flushRange = {};
@@ -216,7 +487,7 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         VkBufferCopy copyRegion = {};
         copyRegion.srcOffset = 0;
         copyRegion.dstOffset = 0;
-        copyRegion.size = desc.binSize;
+        copyRegion.size = uploadSize;
         vkCmdCopyBuffer(uploadCmd, staging, desc.buffer, 1, &copyRegion);
 
         // Submit and WAIT after each tensor to prevent staging buffer overwrite.

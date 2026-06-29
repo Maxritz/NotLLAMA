@@ -6,7 +6,7 @@
 namespace rdna4 {
 
 // KV cache as flat buffers with buffer device address for shader access.
-// Each layer has K and V buffers: totalBytes = maxSeqLen * nKvHeads * headDim * sizeof(float16)
+// Each layer has K and V buffers: totalBytes = maxSeqLen * nKvHeads * headDim * sizeof(float)
 // Buffers use SHADER_DEVICE_ADDRESS_BIT so shaders access them via buffer_reference.
 
 struct KVCacheBuffer {

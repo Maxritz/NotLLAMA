@@ -48,28 +48,14 @@ else()
 endif()
 
 set(KERNELS
-    src/kernels/kernel_entry.comp
     src/kernels/gemm.comp
     src/kernels/attention.comp
-    src/kernels/flash_attention.comp
     src/kernels/rope.comp
-    src/kernels/topk.comp
     src/kernels/add.comp
     src/kernels/rms_norm.comp
     src/kernels/embed.comp
-    src/kernels/embed_q8_0.comp
-    src/kernels/embed_q6_k.comp
     src/kernels/kv_cache_write.comp
-    src/kernels/dequantize.comp
-    src/kernels/dequantize_test.comp
-    src/kernels/dequant_turbo.comp
-    src/kernels/gemm_turbo.comp
-    src/kernels/mlp_fused_gateup.comp
     src/kernels/silu_mul.comp
-    src/kernels/bda_test.comp
-    src/kernels/matvec_q6_k.comp
-    src/kernels/matvec_q8_0.comp
-    src/kernels/matvec_q4_0.comp
 )
 
 set(SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)

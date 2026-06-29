@@ -23,10 +23,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QRe
     float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KCacheRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VCacheRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
     float data[];
@@ -95,7 +95,7 @@ void main() {
             for (uint d = 0; d < hdPerThread; ++d) {
                 uint idx = tid * hdPerThread + d;
                 if (idx >= hd) break;
-                partialDot += myQ[d] * float(K.data[kBase + idx]);
+                partialDot += myQ[d] * K.data[kBase + idx];
             }
 
             // Reduce: thread 0 sums all 32 partials via shared memory
@@ -119,7 +119,7 @@ void main() {
             for (uint d = 0; d < hdPerThread; ++d) {
                 uint idx = tid * hdPerThread + d;
                 if (idx >= hd) break;
-                myAcc[d] = myAcc[d] * expScale + p * float(V.data[kBase + idx]);
+                myAcc[d] = myAcc[d] * expScale + p * V.data[kBase + idx];
             }
             l = l * expScale + p;
             m = mNew;

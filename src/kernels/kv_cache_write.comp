@@ -21,10 +21,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VIn
     float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer KCacheRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer VCacheRef {
-    float16_t data[];
+    float data[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -51,7 +51,7 @@ void main() {
     uint cacheOffset = pc.seqPos * nkv * hd;
 
     for (uint i = tid; i < totalElements; i += 32) {
-        KCache.data[cacheOffset + i] = float16_t(KIn.data[i]);
-        VCache.data[cacheOffset + i] = float16_t(VIn.data[i]);
+        KCache.data[cacheOffset + i] = KIn.data[i];
+        VCache.data[cacheOffset + i] = VIn.data[i];
     }
 }

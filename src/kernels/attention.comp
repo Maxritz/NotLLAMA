@@ -15,10 +15,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QRe
     float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KCacheRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VCacheRef {
-    float16_t data[];
+    float data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
     float data[];
@@ -37,23 +37,28 @@ layout(push_constant, scalar) uniform PushConstants {
     float invSqrtHeadDim;
 } pc;
 
+shared float dotShared[32];
+
 float dotQK(QRef Q, KCacheRef KCache, uint qBase, uint kOffset, uint hd) {
     uint tid = gl_LocalInvocationID.x;
     float partial = 0.0;
     
     // Each thread computes partial products for its stride
     for (uint d = tid; d < hd; d += 32) {
-        partial += Q.data[qBase + d] * float(KCache.data[kOffset + d]);
+        partial += Q.data[qBase + d] * KCache.data[kOffset + d];
     }
     
-    // Subgroup shuffle-down reduction
-    partial += subgroupShuffleDown(partial, 16);
-    partial += subgroupShuffleDown(partial, 8);
-    partial += subgroupShuffleDown(partial, 4);
-    partial += subgroupShuffleDown(partial, 2);
-    partial += subgroupShuffleDown(partial, 1);
+    // Shared-memory reduction: avoids undefined out-of-range subgroup shuffle reads.
+    dotShared[tid] = partial;
+    barrier();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            dotShared[tid] += dotShared[tid + stride];
+        }
+        barrier();
+    }
     
-    return subgroupBroadcastFirst(partial);
+    return dotShared[0];
 }
 
 void main() {
@@ -94,7 +99,7 @@ void main() {
         for (uint d = 0; d < hdPerThread; ++d) {
             uint idx = tid * hdPerThread + d;
             if (idx >= hd) break;
-            myAcc[d] = myAcc[d] * expDiff + exp(score - m) * float(VCache.data[vOffset + idx]);
+            myAcc[d] = myAcc[d] * expDiff + exp(score - m) * VCache.data[vOffset + idx];
         }
     }
 

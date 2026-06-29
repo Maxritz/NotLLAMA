@@ -39,7 +39,7 @@ void main() {
     KRef K = KRef(pc.addrK);
 
     float theta = pow(pc.ropeBase, -float(d & ~1u) / float(pc.headDim));
-    float angle = float(pc.seqLen) * theta * pc.ropeScale;
+    float angle = float(pc.seqLen - 1) * theta * pc.ropeScale;
     float cosA = cos(angle);
     float sinA = sin(angle);
 

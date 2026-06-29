@@ -1,0 +1,129 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer F16InRef {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
+    uint data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer F16OutRef {
+    float16_t data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrA;        // Input activations (F16, M x K)
+    uint64_t addrB;        // TurboQuant weights (K x N, packed)
+    uint64_t addrC;        // Output (F16, M x N)
+    uint M;
+    uint K;
+    uint N;
+    uint blockSize;
+    uint bits;
+    uint scaleBits;
+    uint zeroPoint;
+    float    alpha;
+} pc;
+
+shared float shA[4][32];
+
+uint readByte(uint addr) {
+    uint wordIdx = addr / 4;
+    uint byteInWord = addr % 4;
+    uint word = ByteRef(pc.addrB).data[wordIdx];
+    return (word >> (byteInWord * 8)) & 0xFF;
+}
+
+float readF16Scale(uint addr) {
+    uint lo = readByte(addr);
+    uint hi = readByte(addr + 1);
+    return unpackHalf2x16(lo | (hi << 8)).x;
+}
+
+float dequantWeight(uint flatIdx) {
+    uint blockIdx = flatIdx / pc.blockSize;
+    uint eleInBlock = flatIdx % pc.blockSize;
+
+    if (pc.bits == 4u) {
+        // TQ4: [scale(2B)] [weights(blockSize/2 B)] = (blockSize/2 + 2) bytes/block
+        uint bytesPerBlock = (pc.blockSize / 2) + 2;
+        uint bs = blockIdx * bytesPerBlock;
+        float s = readF16Scale(bs);
+        uint byteIdx = bs + 2 + (eleInBlock / 2);
+        uint bval = readByte(byteIdx);
+        uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+        float q = float(nibble) - 8.0;
+        if (pc.zeroPoint != 0u) q = float(nibble);
+        return q * s;
+    }
+    else if (pc.bits == 6u) {
+        // TQ6: [scale(2B)] [weights(blockSize*6/8 B)] = (blockSize*3/4 + 2) bytes/block
+        uint bytesPerBlock = (pc.blockSize * 3 / 4) + 2;
+        uint bs = blockIdx * bytesPerBlock;
+        float s = readF16Scale(bs);
+        uint bitOffset = eleInBlock * 6;
+        uint byteStart = bs + 2 + (bitOffset / 8);
+        uint bitInByte = bitOffset % 8;
+        uint b0 = readByte(byteStart);
+        uint b1 = readByte(byteStart + 1);
+        uint b2 = readByte(byteStart + 2);
+        uint bits = b0 | (b1 << 8) | (b2 << 16);
+        uint q6 = (bits >> bitInByte) & 0x3Fu;
+        float q = float(q6) - 32.0;
+        if (pc.zeroPoint != 0u) q = float(q6);
+        return q * s;
+    }
+
+    return 0.0;
+}
+
+void main() {
+    uint row = gl_LocalInvocationID.y;
+    uint col = gl_LocalInvocationID.x;
+    uint groupCol = gl_WorkGroupID.x * 32 + col;
+    uint groupRow = gl_WorkGroupID.y * 4 + row;
+
+    if (groupRow >= pc.M || groupCol >= pc.N) return;
+
+    F16InRef  A = F16InRef(pc.addrA);
+    F16OutRef C = F16OutRef(pc.addrC);
+
+    float acc = 0.0;
+
+    for (uint kBase = 0; kBase < pc.K; kBase += pc.blockSize) {
+        // Cooperatively load a tile of activations into shared memory
+        for (uint li = col; li < 32; li += 32) {
+            uint kIdx = kBase + li;
+            if (kIdx < pc.K) {
+                shA[row][li] = float(A.data[groupRow * pc.K + kIdx]);
+            } else {
+                shA[row][li] = 0.0;
+            }
+        }
+        memoryBarrierShared();
+        barrier();
+
+        // Each thread accumulates over the blockSize tile
+        uint tileEnd = min(kBase + pc.blockSize, pc.K);
+        for (uint k = kBase; k < tileEnd; ++k) {
+            float a = shA[row][k - kBase];
+
+            // Weight index: K row-major layout, weight at [k, groupCol]
+            uint weightIdx = k * pc.N + groupCol;
+            float b = dequantWeight(weightIdx);
+
+            acc += a * b;
+        }
+
+        memoryBarrierShared();
+        barrier();
+    }
+
+    C.data[groupRow * pc.N + groupCol] = float16_t(acc * pc.alpha);
+}
