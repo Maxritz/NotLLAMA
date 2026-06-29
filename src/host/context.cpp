@@ -246,89 +246,25 @@ bool VulkanContext::init() {
     // Query ALL supported features in ONE call — fills every boolean in the chain
     vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
 
-    // ====== AMD WDDM COMPUTE-ONLY ROUTING FIX ======
-    // The AMD WDDM driver profiles apps by the features they request at
-    // vkCreateDevice time. Enabling graphics-only features (even if never
-    // used) signals "this is a graphics app" and causes the driver to route
-    // ALL compute dispatches through the 3D engine instead of Async Compute
-    // Engines (Compute 0/1/2). llama.cpp avoids this by never enabling
-    // graphics features on compute-only devices.
+    // ====== LLAMA.CPP FEATURE PATTERN: PRESERVE ALL QUERIED FEATURES ======
+    // llama.cpp queries the full pNext chain with vkGetPhysicalDeviceFeatures2,
+    // then passes the SAME populated chain to vkCreateDevice unchanged.
+    // The only modification: zero pipelineCacheUUID from feat13 (not a feature).
     //
-    // Target: Vulkan 1.4.35 (SDK 1.4.350.0). We query the FULL pNext chain
-    // to signal "modern capable app", then explicitly ZERO every feature
-    // struct and enable ONLY compute-relevant features before passing to
-    // vkCreateDevice. This prevents ANY graphics feature from accidentally
-    // triggering the 3D-engine routing heuristic.
+    // This signals "modern capable app" to the AMD WDDM driver and prevents
+    // it from classifying our app as "legacy" and routing compute through
+    // the 3D engine. On RDNA4 the graphics queue family is actually ~56%
+    // faster for compute, and this pattern ensures the driver sees a mature
+    // Vulkan 1.4 application capable of running on any queue family.
+    //
+    // The queue family selection above determines WHERE work runs (ACE or
+    // 3D engine); the feature chain determines HOW the driver classifies us.
     // ==================================================
 
-    // --- Base features (VkPhysicalDeviceFeatures) ---
-    // Zero everything, then enable only what compute shaders require.
-    VkPhysicalDeviceFeatures baseCompute = {};
-    baseCompute.shaderInt64               = VK_TRUE;  // BDA: 64-bit buffer addresses in shaders
-    baseCompute.shaderInt16               = VK_TRUE;  // fp16 / int8 pack/unpack helpers
-    baseCompute.shaderFloat64             = VK_FALSE; // Not used by any shader
-    features2.features = baseCompute;
-
-    // --- Vulkan 1.1 features ---
-    // Only storageBuffer16BitAccess is needed for fp16 buffers.
-    // All other 1.1 features (multiview, shaderDrawParameters, etc.) are
-    // graphics-related and must stay disabled.
-    // CRITICAL: preserve pNext so the chain stays intact.
-    {
-        void* saved_pNext = feat11.pNext;
-        feat11 = {};
-        feat11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-        feat11.pNext = saved_pNext;
-        feat11.storageBuffer16BitAccess = VK_TRUE;
-    }
-
-    // --- Vulkan 1.2 features ---
-    // Enable only compute-critical features. Explicitly zero graphics ones
-    // (drawIndirectCount, imagelessFramebuffer, separateDepthStencilLayouts,
-    // shaderOutputViewportIndex, shaderOutputLayer, etc.).
-    {
-        void* saved_pNext = feat12.pNext;
-        feat12 = {};
-        feat12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        feat12.pNext = saved_pNext;
-        feat12.bufferDeviceAddress               = VK_TRUE;  // Required for BDA
-        feat12.shaderFloat16                     = VK_TRUE;  // FP16 GEMM / attention
-        feat12.shaderInt8                        = VK_TRUE;  // Q8_0 / Q8_1 quantization
-        feat12.storageBuffer8BitAccess           = VK_TRUE;  // 8-bit weight buffers
-        feat12.uniformAndStorageBuffer8BitAccess = VK_TRUE;  // 8-bit uniform access
-        feat12.scalarBlockLayout                 = VK_TRUE;  // Allows scalar block layout in shaders
-        feat12.timelineSemaphore                 = VK_TRUE;  // Used by async compute paths
-    }
-
-    // --- Vulkan 1.3 features ---
-    // dynamicRendering is GRAPHICS-ONLY. It MUST be VK_FALSE or the AMD
-    // WDDM driver routes ALL compute to the 3D engine. synchronization2
-    // and maintenance4 are general-purpose and safe to keep.
-    {
-        void* saved_pNext = feat13.pNext;
-        feat13 = {};
-        feat13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-        feat13.pNext = saved_pNext;
-        feat13.dynamicRendering   = VK_FALSE;  // GRAPHICS — disable for Compute 0 routing
-        feat13.synchronization2   = VK_TRUE;   // Sync2 barriers / semaphore ops
-        feat13.maintenance4       = VK_TRUE;   // Maintenance4 misc fixes
-    }
-
-    // --- Vulkan 1.4 features ---
-    // As of Vulkan 1.4.35, no 1.4-core features are required for compute.
-    // Zero the struct to avoid accidentally enabling anything that could
-    // be classified as graphics by future driver heuristics.
-    {
-        void* saved_pNext = feat14.pNext;
-        feat14 = {};
-        feat14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
-        feat14.pNext = saved_pNext;
-    }
-
-    if (hasCoopMat) {
-        coopFeatures.cooperativeMatrix = VK_TRUE;
-        coopFeatures.cooperativeMatrixRobustBufferAccess = VK_FALSE;
-    }
+    // All queried features from the FULL vkGetPhysicalDeviceFeatures2 chain
+    // are already populated in features2/feat14/feat13/feat12/feat11/coopFeatures.
+    // Pass them through as-is to vkCreateDevice (llama.cpp pattern).
+    // No feature zeroing — the driver sees the app as it truly is.
 
     // Build extension list
     std::vector<const char*> enabledExts;

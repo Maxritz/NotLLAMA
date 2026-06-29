@@ -1,0 +1,93 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Fused Q4_0 matvec — no staging buffer.
+// Block layout: 18 bytes per 32 elements
+//
+//   d         @ 0  — float16 scale (2 bytes)
+//   nibbles   @ 2  — 16 bytes, 2 nibbles per byte
+//
+// Element i (0..31): nibble at byte 2 + i/2, low if i%2==0 else high
+// Dequant: value = d * (int(nibble) - 8)
+//
+// Uses 256 threads with shared memory (VindexLLM pattern).
+//
+// transB=0: weight[inDim][outDim], flat = k * outDim + col
+// transB=1: weight[outDim][inDim], flat = col * inDim + k
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ByteRef {
+    uint8_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer FloatRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer FloatOutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrWeight;
+    uint64_t addrInput;
+    uint64_t addrOutput;
+    uint inDim;
+    uint outDim;
+    uint transB;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint col = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (col >= pc.outDim) return;
+
+    ByteRef W = ByteRef(pc.addrWeight);
+    FloatRef In = FloatRef(pc.addrInput);
+    FloatOutRef Out = FloatOutRef(pc.addrOutput);
+
+    float acc = 0.0;
+
+    for (uint elem = tid; elem < pc.inDim; elem += 256u) {
+        uint idx = (pc.transB != 0u)
+            ? col * pc.inDim + elem
+            : elem * pc.outDim + col;
+
+        uint blockIdx = idx / 32u;
+        uint eib = idx % 32u;
+        uint bs = blockIdx * 18u;
+
+        float d = unpackFloat2x16(
+            uint(W.data[bs]) |
+            (uint(W.data[bs + 1u]) << 8)
+        ).x;
+
+        uint byteOff = eib / 2u;
+        uint bval = uint(W.data[bs + 2u + byteOff]);
+        uint nibble = (eib & 1u) == 0u ? (bval & 0x0Fu) : (bval >> 4u);
+
+        acc += d * (float(int(nibble)) - 8.0f) * In.data[elem];
+    }
+
+    partial[tid] = acc;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        Out.data[col] = partial[0];
+    }
+}

@@ -180,10 +180,14 @@ int main(int argc, char** argv) {
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
     loadPipe("embed_q8_0", sizeof(EmbedPushConstants));
+    loadPipe("embed_q6_k", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
     loadPipe("dequant_turbo", sizeof(DequantizePushConstants));
     loadPipe("gemm_turbo", sizeof(GemmPushConstants));
     loadPipe("dequantize", sizeof(DequantizePushConstants));
+    loadPipe("matvec_q6_k", sizeof(MatVecPushConstants));
+    loadPipe("matvec_q8_0", sizeof(MatVecPushConstants));
+    loadPipe("matvec_q4_0", sizeof(MatVecPushConstants));
 
     log("all pipelines OK");
     std::cout << "Pipelines loaded (including Flash Attention)\n";

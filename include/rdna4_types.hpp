@@ -111,6 +111,22 @@ struct BdaTestPushConstants {
     uint32_t nElements;
 };
 
+// Fused matvec push constants — no separate dequant dispatch.
+// Quantized weights are read directly by the shader.
+// Must match GLSL scalar layout exactly (uint64_t@8B align, uint32_t@4B align).
+// Padded to 40 bytes (multiple of 8 = max member alignment).
+struct MatVecPushConstants {
+    uint64_t addrWeight;   // quantized weight bytes (Q4_0/Q8_0/Q6_K block layout)
+    uint64_t addrInput;    // F32 input vector (length inDim)
+    uint64_t addrOutput;   // F32 output vector (length outDim)
+    uint32_t inDim;        // K — inner dimension
+    uint32_t outDim;       // N — output dimension
+    uint32_t transB;       // 0=B[inDim][outDim], 1=B[outDim][inDim] (weight tying)
+    uint32_t _pad;         // explicit pad to 40 bytes (GLSL scalar layout rounds to alignof(max))
+};
+static_assert(sizeof(MatVecPushConstants) == 40, "MatVecPushConstants must match GLSL scalar layout (40 bytes)");
+static_assert(sizeof(MatVecPushConstants) <= 128, "Push constants must not exceed 128 bytes");
+
 struct DequantizePushConstants {
     uint64_t addrQuant;
     uint64_t addrOut;

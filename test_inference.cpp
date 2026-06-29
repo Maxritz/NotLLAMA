@@ -127,10 +127,14 @@ int main(int argc, char** argv) {
     loadPipe("rms_norm", sizeof(RmsNormPushConstants));
     loadPipe("embed", sizeof(EmbedPushConstants));
     loadPipe("embed_q8_0", sizeof(EmbedPushConstants));
+    loadPipe("embed_q6_k", sizeof(EmbedPushConstants));
     loadPipe("kv_cache_write", sizeof(KVCacheWritePushConstants));
     loadPipe("dequantize", sizeof(DequantizePushConstants));
     loadPipe("dequantize_test", sizeof(DequantizePushConstants));
     loadPipe("kernel_entry", sizeof(KernelEntryPushConstants));
+    loadPipe("matvec_q6_k", sizeof(MatVecPushConstants));
+    loadPipe("matvec_q8_0", sizeof(MatVecPushConstants));
+    loadPipe("matvec_q4_0", sizeof(MatVecPushConstants));
 
     Scheduler scheduler(ctx.device, ctx.queues, ctx.queueFamilyIndex);
     FencePool fencePool(ctx.device);

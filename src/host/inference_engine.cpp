@@ -12,6 +12,11 @@
 
 namespace rdna4 {
 
+// Temporary GPU utilization throttle target. This is a safety cap to avoid
+// sustained 100% GPU load / WDDM TDR hangs while debugging large models.
+// TODO: Remove once fused matvec + per-layer batching is proven stable.
+constexpr double kGpuUtilizationTarget = 0.8;
+
 static uint64_t findTensorAddr(const ModelDesc& model, const std::string& name) {
     for (const auto& t : model.tensors) {
         if (t.name == name) return t.gpuAddress;
@@ -49,7 +54,11 @@ static uint64_t dequantWeight(Scheduler* sched, PipelineBuilder* pipes,
     for (auto d : t->shape) nElements *= d;
 
     size_t outBytes = (size_t)nElements * sizeof(float);
-    if (outOffset + outBytes > dequantBufSize) return 0;
+    if (outOffset + outBytes > dequantBufSize) {
+        fprintf(stderr, "[FATAL] Tensor '%s' needs %zu bytes at offset %zu, buffer=%zu\n",
+                name.c_str(), outBytes, outOffset, dequantBufSize);
+        return 0;
+    }
 
     const uint32_t MAX_WG_PER_DISPATCH = 65535;  // Vulkan min maxComputeWorkGroupCount[0]
     uint32_t totalWorkgroups = (nElements + 63) / 64;
@@ -75,7 +84,7 @@ static uint64_t dequantWeight(Scheduler* sched, PipelineBuilder* pipes,
 
         offset += chunkSize;
     }
-    if (sync) sched->syncAllThrottled();
+    if (sync) sched->syncAllThrottled(kGpuUtilizationTarget);
 
     return dequantBufAddr + outOffset;
 }
@@ -98,7 +107,11 @@ static uint64_t dequantWeightInBatch(Scheduler* sched, PipelineBuilder* pipes,
     for (auto d : t->shape) nElements *= d;
 
     size_t outBytes = (size_t)nElements * sizeof(float);
-    if (outOffset + outBytes > dequantBufSize) return 0;
+    if (outOffset + outBytes > dequantBufSize) {
+        fprintf(stderr, "[FATAL] Tensor '%s' needs %zu bytes at offset %zu, buffer=%zu\n",
+                name.c_str(), outBytes, outOffset, dequantBufSize);
+        return 0;
+    }
 
     const uint32_t MAX_WG_PER_DISPATCH = 65535;  // Vulkan min maxComputeWorkGroupCount[0]
     uint32_t elementsPerChunk = MAX_WG_PER_DISPATCH * 64;
@@ -162,7 +175,9 @@ bool InferenceEngine::initDequantBuffer() {
     size_t embedSize = getF16OutputSize(*model, "token_embd.weight");
     if (embedSize > maxSize) maxSize = embedSize;
 
-    if (maxSize > 640 * 1024 * 1024) maxSize = 640 * 1024 * 1024;  // Hard cap at 640 MB
+    // Add 10% safety margin for alignment / format overhead. The 80% VRAM cap
+    // below still protects against OOM.
+    maxSize = (size_t)(maxSize * 1.1);
 
     // Cap at 80% of total GPU VRAM — query memProps once
     {
@@ -731,6 +746,48 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
     uint32_t headDim = dim / model->headCount;
     uint32_t hiddenDim = model->feedForwardLength;
 
+    // Fused matvec shader selector — returns shader name for quant format, or nullptr for F32/F16.
+    auto fusedShader = [](QuantFormat fmt) -> const char* {
+        switch (fmt) {
+            case QuantFormat::Q6_K: return "matvec_q6_k";
+            case QuantFormat::Q8_0: return "matvec_q8_0";
+            case QuantFormat::Q4_0: return "matvec_q4_0";
+            default: return nullptr;
+        }
+    };
+
+    // Dispatch a fused matvec (quantized) or fallback gemm (F32/F16) inside active batch.
+    auto dispatchFusedOrGemm = [&](const std::string& tensorName,
+                                    uint64_t addrInput, uint64_t addrOutput,
+                                    uint32_t inDim, uint32_t outDim, uint32_t transB) {
+        uint64_t addrW = findTensorAddr(*model, tensorName);
+        const TensorDesc* td = findTensor(*model, tensorName);
+        const char* sh = (td && addrW) ? fusedShader(td->format) : nullptr;
+        if (sh && addrW && pipelines->getPipeline(sh)) {
+            MatVecPushConstants pc = {};
+            pc.addrWeight = addrW;
+            pc.addrInput  = addrInput;
+            pc.addrOutput = addrOutput;
+            pc.inDim  = inDim;
+            pc.outDim = outDim;
+            pc.transB = transB;
+            scheduler->dispatchInBatch(pipelines->getPipeline(sh), pipelines->getLayout(sh),
+                                       &pc, sizeof(pc), (outDim + 63) / 64, 1, 1);
+        } else {
+            uint64_t addrW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity,
+                                                      *model, tensorName);
+            GemmPushConstants gpc = {};
+            gpc.addrA = addrInput;
+            gpc.addrB = addrW_dq ? addrW_dq : addrW;
+            gpc.addrC = addrOutput;
+            gpc.M = 1; gpc.K = inDim; gpc.N = outDim;
+            gpc.alpha = 1.0f;
+            gpc.transB = transB;
+            scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
+                                       &gpc, sizeof(gpc), (outDim + 31) / 32, 1, 1);
+        }
+    };
+
     allocator->reset();
 
     uint32_t seqLen = seqPos + 1;
@@ -770,10 +827,15 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
     if (embedAddr) {
         const TensorDesc* embedTensor = findTensor(*model, "token_embd.weight");
         bool useQ8Embed = (embedTensor && embedTensor->format == QuantFormat::Q8_0 && !embedCacheReady);
+        bool useQ6Embed = (embedTensor && embedTensor->format == QuantFormat::Q6_K && !embedCacheReady);
 
         if (useQ8Embed) {
             EmbedPushConstants embedPC = {embedAddr, hiddenAddr, tokenId, seqPos, dim};
             scheduler->dispatchInBatch(pipelines->getPipeline("embed_q8_0"), pipelines->getLayout("embed_q8_0"),
+                &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
+        } else if (useQ6Embed) {
+            EmbedPushConstants embedPC = {embedAddr, hiddenAddr, tokenId, seqPos, dim};
+            scheduler->dispatchInBatch(pipelines->getPipeline("embed_q6_k"), pipelines->getLayout("embed_q6_k"),
                 &embedPC, sizeof(embedPC), (dim + 31) / 32, 1, 1);
         } else {
             uint64_t embedAddr_dq = embedCacheReady ? embedCacheAddr : 0;
@@ -789,7 +851,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
     scheduler->endBatch(VK_NULL_HANDLE);
-    scheduler->syncAllThrottled(0.8);
+    scheduler->syncAllThrottled(kGpuUtilizationTarget);
 
     uint32_t layersToRun = std::min(maxLayers, model->blockCount);
 
@@ -797,34 +859,9 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
         std::string prefix = "blk." + std::to_string(layer);
         scheduler->beginBatch(0);
 
-        // === Attention Dequant ===
-        // Each tensor gets a NON-OVERLAPPING region of the dequant buffer.
-        // Layout: attn_norm | Q | K | V | O
-        size_t attnNormSize = getF16OutputSize(*model, prefix + ".attn_norm.weight");
-        size_t qSize = (size_t)dim * dim * sizeof(float);
-        size_t kSize = (size_t)(headDim * model->headCountKv) * dim * sizeof(float);
-        size_t vSize = kSize;
-        size_t oSize = getF16OutputSize(*model, prefix + ".attn_output.weight");
-
-        size_t attnOffNorm = 0;
-        size_t attnOffQ     = attnOffNorm + attnNormSize;
-        size_t attnOffK     = attnOffQ + qSize;
-        size_t attnOffV     = attnOffK + kSize;
-        size_t attnOffO     = attnOffV + vSize;
-
-        uint64_t addrAttnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_norm.weight", attnOffNorm);
-        uint64_t addrQW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_q.weight", attnOffQ);
-        uint64_t addrKW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_k.weight", attnOffK);
-        uint64_t addrVW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_v.weight", attnOffV);
-        uint64_t addrOW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".attn_output.weight", attnOffO);
-
-        scheduler->barrierBetweenGroups(
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-        // === Attention Compute ===
+        // === Attention (fused matvec — no separate dequant) ===
         uint64_t addrAttnNorm = findTensorAddr(*model, prefix + ".attn_norm.weight");
-        RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm_dq ? addrAttnNorm_dq : addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
+        RmsNormPushConstants normPC = {hiddenAddr, addrAttnNorm, attnOutAddr, dim, 1, 1e-6f};
         scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
             &normPC, sizeof(normPC), 1, 1, 1);
 
@@ -833,19 +870,9 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
         uint64_t normHidden = attnOutAddr;
-        uint64_t addrQW = findTensorAddr(*model, prefix + ".attn_q.weight");
-        uint64_t addrKW = findTensorAddr(*model, prefix + ".attn_k.weight");
-        uint64_t addrVW = findTensorAddr(*model, prefix + ".attn_v.weight");
-
-        GemmPushConstants qPC = {normHidden, addrQW_dq ? addrQW_dq : addrQW, qRowAddr, 1, dim, dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &qPC, sizeof(qPC), (dim + 31) / 32, 1, 1);
-        GemmPushConstants kPC = {normHidden, addrKW_dq ? addrKW_dq : addrKW, kRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &kPC, sizeof(kPC), ((uint32_t)(headDim * model->headCountKv) + 31) / 32, 1, 1);
-        GemmPushConstants vPC = {normHidden, addrVW_dq ? addrVW_dq : addrVW, vRowAddr, 1, (uint32_t)(headDim * model->headCountKv), dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &vPC, sizeof(vPC), ((uint32_t)(headDim * model->headCountKv) + 31) / 32, 1, 1);
+        dispatchFusedOrGemm(prefix + ".attn_q.weight", normHidden, qRowAddr, dim, dim, 0);
+        dispatchFusedOrGemm(prefix + ".attn_k.weight", normHidden, kRowAddr, dim, (uint32_t)(headDim * model->headCountKv), 0);
+        dispatchFusedOrGemm(prefix + ".attn_v.weight", normHidden, vRowAddr, dim, (uint32_t)(headDim * model->headCountKv), 0);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -875,10 +902,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        uint64_t addrOW = findTensorAddr(*model, prefix + ".attn_output.weight");
-        GemmPushConstants outPC = {attnOutAddr, addrOW_dq ? addrOW_dq : addrOW, mlpOutAddr, 1, dim, dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &outPC, sizeof(outPC), (dim + 31) / 32, 1, 1);
+        dispatchFusedOrGemm(prefix + ".attn_output.weight", attnOutAddr, mlpOutAddr, dim, dim, 0);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -893,44 +917,9 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 
-        // === FFN Dequant ===
-        // Layout: ffn_norm | up | gate | down
-        size_t upSize = getF16OutputSize(*model, prefix + ".ffn_up.weight");
-        size_t gateSize = getF16OutputSize(*model, prefix + ".ffn_gate.weight");
-        size_t downSize = getF16OutputSize(*model, prefix + ".ffn_down.weight");
-        size_t ffnNormSize = getF16OutputSize(*model, prefix + ".ffn_norm.weight");
-
-        size_t ffnOffNorm = 0;
-        size_t ffnOffUp   = ffnOffNorm + ffnNormSize;
-        size_t ffnOffGate = ffnOffUp + upSize;
-        size_t ffnOffDown = ffnOffGate + gateSize;
-
-        uint64_t addrFfnNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_norm.weight", ffnOffNorm);
-        uint64_t addrUpW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_up.weight", ffnOffUp);
-        uint64_t addrGateW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_gate.weight", ffnOffGate);
-        uint64_t addrDownW_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, prefix + ".ffn_down.weight", ffnOffDown);
-
-        if (layer == 0) {
-            fprintf(stderr, "[diag] L0 attn dequant: norm@0x%llx(off=%zu) Q@0x%llx(off=%zu) K@0x%llx(off=%zu) V@0x%llx(off=%zu) O@0x%llx(off=%zu)\n",
-                (unsigned long long)addrAttnNorm_dq, attnOffNorm,
-                (unsigned long long)addrQW_dq, attnOffQ,
-                (unsigned long long)addrKW_dq, attnOffK,
-                (unsigned long long)addrVW_dq, attnOffV,
-                (unsigned long long)addrOW_dq, attnOffO);
-            fprintf(stderr, "[diag] L0 ffn   dequant: norm@0x%llx(off=%zu) up@0x%llx(off=%zu) gate@0x%llx(off=%zu) down@0x%llx(off=%zu)\n",
-                (unsigned long long)addrFfnNorm_dq, ffnOffNorm,
-                (unsigned long long)addrUpW_dq, ffnOffUp,
-                (unsigned long long)addrGateW_dq, ffnOffGate,
-                (unsigned long long)addrDownW_dq, ffnOffDown);
-        }
-
-        scheduler->barrierBetweenGroups(
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-        // === FFN Compute ===
+        // === FFN (fused matvec — no separate dequant) ===
         uint64_t addrFfnNorm = findTensorAddr(*model, prefix + ".ffn_norm.weight");
-        RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm_dq ? addrFfnNorm_dq : addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
+        RmsNormPushConstants ffnNormPC = {hiddenAddr, addrFfnNorm, attnOutAddr, dim, 1, 1e-6f};
         scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
             &ffnNormPC, sizeof(ffnNormPC), 1, 1, 1);
 
@@ -938,25 +927,12 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        uint64_t addrUpW = findTensorAddr(*model, prefix + ".ffn_up.weight");
-        uint64_t addrGateW = findTensorAddr(*model, prefix + ".ffn_gate.weight");
-        uint64_t addrDownW = findTensorAddr(*model, prefix + ".ffn_down.weight");
-
         uint64_t gateScratchAddr = logitsAddr;
         uint64_t upScratchAddr   = logitsAddr + (uint64_t)hiddenDim * sizeof(float);
         uint64_t interScratchAddr = logitsAddr;
 
-        GemmPushConstants gatePC = {attnOutAddr,
-            addrGateW_dq ? addrGateW_dq : addrGateW,
-            gateScratchAddr, 1, hiddenDim, dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &gatePC, sizeof(gatePC), (hiddenDim + 31) / 32, 1, 1);
-
-        GemmPushConstants upPC = {attnOutAddr,
-            addrUpW_dq ? addrUpW_dq : addrUpW,
-            upScratchAddr, 1, hiddenDim, dim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &upPC, sizeof(upPC), (hiddenDim + 31) / 32, 1, 1);
+        dispatchFusedOrGemm(prefix + ".ffn_gate.weight", attnOutAddr, gateScratchAddr, dim, hiddenDim, 0);
+        dispatchFusedOrGemm(prefix + ".ffn_up.weight",   attnOutAddr, upScratchAddr,   dim, hiddenDim, 0);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -970,11 +946,7 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-        GemmPushConstants downPC = {interScratchAddr,
-            addrDownW_dq ? addrDownW_dq : addrDownW,
-            mlpOutAddr, 1, dim, hiddenDim, 1.0f, 0};
-        scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-            &downPC, sizeof(downPC), (dim + 31) / 32, 1, 1);
+        dispatchFusedOrGemm(prefix + ".ffn_down.weight", interScratchAddr, mlpOutAddr, hiddenDim, dim, 0);
 
         scheduler->barrierBetweenGroups(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -985,41 +957,15 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
             &addPC2, sizeof(addPC2), (dim + 255) / 256, 1, 1);
 
         scheduler->endBatch(VK_NULL_HANDLE);
-        scheduler->syncAllThrottled(0.8);
-
-        // Diagnostic: read back dequant buffer after layer 0 completes
-        if (layer == 0 && dequantMemory) {
-            void* mapped = nullptr;
-            VkResult r = vkMapMemory(ctx->device, dequantMemory, 0, dequantCapacity, 0, &mapped);
-            if (r == VK_SUCCESS && mapped) {
-                float* df = (float*)mapped;
-                fprintf(stderr, "[diag] L0 post-sync dequant buf[0..9]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
-                    df[0], df[1], df[2], df[3], df[4], df[5], df[6], df[7], df[8], df[9]);
-                fprintf(stderr, "[diag] Q-dq@+qOff (%zu bytes in): ", attnOffQ);
-                for (int j = 0; j < 10; ++j) fprintf(stderr, "%.6f ", df[attnOffQ / sizeof(float) + j]);
-                fprintf(stderr, "\n");
-                fprintf(stderr, "[diag] K-dq@+kOff (%zu bytes in): ", attnOffK);
-                for (int j = 0; j < 10; ++j) fprintf(stderr, "%.6f ", df[attnOffK / sizeof(float) + j]);
-                fprintf(stderr, "\n");
-                vkUnmapMemory(ctx->device, dequantMemory);
-            }
-        }
+        scheduler->syncAllThrottled(kGpuUtilizationTarget);
     }
 
     // === Final Norm + LM Head Batch ===
     scheduler->beginBatch(0);
     uint64_t addrOutNorm = findTensorAddr(*model, "output_norm.weight");
     if (!addrOutNorm) addrOutNorm = findTensorAddr(*model, "norm.weight");
-    size_t outNormSize = getF16OutputSize(*model, "output_norm.weight");
-    size_t finalOffNorm = 0;
 
-    uint64_t addrOutNorm_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output_norm.weight", finalOffNorm);
-
-    scheduler->barrierBetweenGroups(
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-    RmsNormPushConstants finalNorm = {hiddenAddr, addrOutNorm_dq ? addrOutNorm_dq : addrOutNorm, attnOutAddr, dim, 1, 1e-6f};
+    RmsNormPushConstants finalNorm = {hiddenAddr, addrOutNorm, attnOutAddr, dim, 1, 1e-6f};
     scheduler->dispatchInBatch(pipelines->getPipeline("rms_norm"), pipelines->getLayout("rms_norm"),
         &finalNorm, sizeof(finalNorm), 1, 1, 1);
 
@@ -1027,25 +973,15 @@ uint32_t InferenceEngine::forwardPartial(uint32_t tokenId, uint32_t seqPos, uint
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    size_t finalOffLMHead = finalOffNorm + outNormSize;
     uint64_t addrLMHead = findTensorAddr(*model, "output.weight");
-    uint64_t addrLMHead_dq = 0;
     uint32_t lmTransB = 0;
-    if (addrLMHead) {
-        addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "output.weight", finalOffLMHead);
-    } else {
+    const char* lmTensorName = "output.weight";
+    if (!addrLMHead) {
         addrLMHead = findTensorAddr(*model, "token_embd.weight");
-        if (embedCacheReady) {
-            addrLMHead_dq = embedCacheAddr;
-        } else {
-            addrLMHead_dq = dequantWeightInBatch(scheduler, pipelines, dequantAddr, dequantCapacity, *model, "token_embd.weight", finalOffLMHead);
-        }
-        lmTransB = 1;
+        lmTensorName = "token_embd.weight";
+        lmTransB = 1;  // weight tying: transpose
     }
-
-    GemmPushConstants lmPC = {attnOutAddr, addrLMHead_dq ? addrLMHead_dq : addrLMHead, logitsAddr, 1, model->vocabSize, dim, 1.0f, lmTransB};
-    scheduler->dispatchInBatch(pipelines->getPipeline("gemm"), pipelines->getLayout("gemm"),
-        &lmPC, sizeof(lmPC), (model->vocabSize + 31) / 32, 1, 1);
+    dispatchFusedOrGemm(lmTensorName, attnOutAddr, logitsAddr, dim, model->vocabSize, lmTransB);
 
     scheduler->endBatch(VK_NULL_HANDLE);
     scheduler->syncAll();
@@ -1188,7 +1124,7 @@ uint32_t InferenceEngine::forwardKernelEntry(uint32_t tokenId, uint32_t seqPos) 
     // 3. Dispatch ONE workgroup — kernel_entry.comp polls mailbox internally
     scheduler->dispatch(pipelines->getPipeline("kernel_entry"), pipelines->getLayout("kernel_entry"),
                          &pc, sizeof(pc), 1, 1, 1);
-    scheduler->syncAllThrottled();
+    scheduler->syncAllThrottled(kGpuUtilizationTarget);
 
     // 4. Read output token from output buffer
     uint32_t nextToken = 0;
@@ -1345,7 +1281,7 @@ uint32_t InferenceEngine::sampleGpu(uint64_t logitsAddr, uint32_t vocabSize,
     uint32_t wgCount = (vocabSize + 255) / 256;
     scheduler->dispatch(pipelines->getPipeline("topk"), pipelines->getLayout("topk"),
                          &pc, sizeof(pc), wgCount, 1, 1);
-    scheduler->syncAllThrottled();
+    scheduler->syncAllThrottled(kGpuUtilizationTarget);
 
     uint32_t nextToken = 0;
     if (allocator->mappedPtr) {

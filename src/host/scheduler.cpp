@@ -328,6 +328,8 @@ void Scheduler::syncAllThrottled(double targetUtilization) {
         if (gpuMs > 0.5 && targetUtilization > 0.0 && targetUtilization < 1.0) {
             double sleepMs = gpuMs * (1.0 / targetUtilization - 1.0);
             if (sleepMs > 0.5) {
+                fprintf(stderr, "[throttle] gpu=%.2fms sleep=%.2fms target=%.0f%%\n",
+                        gpuMs, sleepMs, targetUtilization * 100.0);
                 std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(sleepMs * 1000)));
             }
         }
@@ -345,6 +347,8 @@ void Scheduler::syncAllThrottled(double targetUtilization) {
         if (gpuMs > 0.5 && targetUtilization > 0.0 && targetUtilization < 1.0) {
             double sleepMs = gpuMs * (1.0 / targetUtilization - 1.0);
             if (sleepMs > 0.5) {
+                fprintf(stderr, "[throttle] gpu=%.2fms sleep=%.2fms target=%.0f%%\n",
+                        gpuMs, sleepMs, targetUtilization * 100.0);
                 std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(sleepMs * 1000)));
             }
         }
