@@ -3,24 +3,25 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_scalar_block_layout : require
 
-// =============================================================================
 // EMBED Q6_K — Lookup token ID in Q6_K embedding table, output F32.
-// =============================================================================
-// Output: hidden_state[token_pos * dim + d] = dequant(embed_table[token_id * dim + d])
-// =============================================================================
-// Q6_K block layout: 210 bytes per 256 elements
-//   bytes 0-127:   ql (low 4 bits, 2 per byte)
-//   bytes 128-191: qh (high 2 bits, 4 per byte)
-//   bytes 192-207: sc (int8 sub-block scales, 16 values)
-//   bytes 208-209: d  (float16 super-block scale)
-// =============================================================================
+// Block layout: 210 bytes per 256 elements (d-last)
+//   ql[128] @ 0    — low 4 bits (2 per byte)
+//   qh[64]  @ 128  — high 2 bits (4 per byte)
+//   sc[16]  @ 192  — int8 sub-block scales, 16 elements each
+//   d       @ 208  — float16 super-block scale
+//
+// Dequant: val = ql | (qh << 4); result = d * sc[subBlock] * (val - 32)
+//
+// 256 threads, each thread computes one element (strided across the token's row).
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer QuantRef {
-    uint data[];
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QuantRef {
+    uint8_t data[];
 };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
     float data[];
@@ -34,47 +35,35 @@ layout(push_constant, scalar) uniform PushConstants {
     uint dim;
 } pc;
 
-uint readByte(uint addr) {
-    uint wordIdx = addr / 4;
-    uint byteInWord = addr % 4;
-    uint word = QuantRef(pc.addrQuantTable).data[wordIdx];
-    return (word >> (byteInWord * 8)) & 0xFF;
-}
-
-uint readU16(uint addr) {
-    return readByte(addr) | (readByte(addr + 1) << 8);
-}
-
-float readF16(uint addr) {
-    uint raw = readU16(addr);
-    return unpackFloat2x16(raw).x;
-}
-
 void main() {
     uint d = gl_GlobalInvocationID.x;
     if (d >= pc.dim) return;
 
     uint globalIdx = pc.tokenId * pc.dim + d;
+    uint blockIdx = globalIdx / 256u;
+    uint eleInBlock = globalIdx % 256u;
+    uint blockOffset = blockIdx * 210u;
 
-    uint blockIdx = globalIdx / 256;
-    uint eleInBlock = globalIdx % 256;
-    uint blockOffset = blockIdx * 210;
+    QuantRef Q = QuantRef(pc.addrQuantTable);
 
-    float dScale = readF16(blockOffset + 208);
-    uint subBlock = eleInBlock / 16;
-    int sc = int(readByte(blockOffset + 192 + subBlock));
-    if (sc >= 128) sc -= 256;
+    float dScale = unpackHalf2x16(
+        uint(Q.data[blockOffset + 208u]) |
+        (uint(Q.data[blockOffset + 209u]) << 8)
+    ).x;
 
-    uint qlByteIdx = eleInBlock / 2;
-    uint q4raw = readByte(blockOffset + qlByteIdx);
-    uint q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0xFu) : (q4raw >> 4);
+    uint subBlock = eleInBlock / 16u;
+    int sc = int(int8_t(Q.data[blockOffset + 192u + subBlock]));
 
-    uint qhByteIdx = eleInBlock / 4;
-    uint qhByte = readByte(blockOffset + 128 + qhByteIdx);
-    uint qhShift = (eleInBlock & 3u) * 2;
-    uint qh2 = (qhByte >> qhShift) & 3u;
+    uint qlOff = eleInBlock / 2u;
+    uint q4raw = uint(Q.data[blockOffset + qlOff]);
+    uint q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0x0Fu) : (q4raw >> 4u);
 
-    int val = int(q4 | (qh2 << 4)) - 32;
+    uint qhOff = eleInBlock / 4u;
+    uint qhRaw = uint(Q.data[blockOffset + 128u + qhOff]);
+    uint qhShift = (eleInBlock & 3u) * 2u;
+    uint qh2 = (qhRaw >> qhShift) & 3u;
+
+    int val = int(q4 | (qh2 << 4u)) - 32;
 
     uint hiddenOffset = pc.tokenPos * pc.dim;
     HiddenStateRef(pc.addrHiddenState).data[hiddenOffset + d] = dScale * float(sc) * float(val);
