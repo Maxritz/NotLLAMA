@@ -25,6 +25,10 @@ public:
     uint64_t alloc(size_t size, size_t alignment = 256);
     void reset();
     void upload(uint64_t addr, const void* data, size_t size);
+
+    // Checkpoint/restore for per-layer staging buffer reuse
+    size_t checkpoint() const { return offset; }
+    void restore(size_t cp) { offset = cp; }
 };
 
 } // namespace rdna4

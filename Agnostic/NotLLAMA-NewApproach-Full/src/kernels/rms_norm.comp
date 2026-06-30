@@ -1,0 +1,101 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// =============================================================================
+// RMS NORM — y = x / sqrt(mean(x^2) + eps) * weight
+// =============================================================================
+// One workgroup per row. Multi-subgroup reduction via shared memory.
+// Works correctly on any GPU regardless of wave/subgroup size (32 or 64).
+// 256 threads per workgroup for good parallelism on both RDNA2 (Wave64)
+// and RDNA4 (Wave32).
+// =============================================================================
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer InRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer WeightRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrIn;
+    uint64_t addrWeight;
+    uint64_t addrOut;
+    uint rowSize;      // elements per row (e.g., embedding dim)
+    uint nRows;        // number of rows
+    float eps;
+} pc;
+
+// Shared memory for cross-subgroup reduction.
+// 256 threads / 32 min_subgroup_size = 8 partials max.
+// On Wave64 (RDNA2): 256/64 = 4 subgroups -> 4 partials.
+// On Wave32 (RDNA4): 256/32 = 8 subgroups -> 8 partials.
+shared float sharedInvRms[1];  // Only need 1 float for the final broadcast
+shared float sharedPartial[8]; // Subgroup partial sums
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+
+    if (row >= pc.nRows) return;
+
+    InRef In = InRef(pc.addrIn);
+    WeightRef W = WeightRef(pc.addrWeight);
+    OutRef Out = OutRef(pc.addrOut);
+
+    uint base = row * pc.rowSize;
+
+    // Each thread computes partial sum-of-squares with stride = workgroup size
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.rowSize; i += 256) {
+        float v = In.data[base + i];
+        sumSq += v * v;
+    }
+
+    // Step 1: Reduce within each subgroup (wave) using shuffle
+    sumSq += subgroupShuffleDown(sumSq, 16);
+    sumSq += subgroupShuffleDown(sumSq, 8);
+    sumSq += subgroupShuffleDown(sumSq, 4);
+    sumSq += subgroupShuffleDown(sumSq, 2);
+    sumSq += subgroupShuffleDown(sumSq, 1);
+
+    // Step 2: Write subgroup partial to shared memory
+    uint subgroupId = tid / gl_SubgroupSize;
+    if (gl_SubgroupInvocationID == 0) {
+        sharedPartial[subgroupId] = sumSq;
+    }
+
+    // Wait for all subgroups to write their partial
+    barrier();
+
+    // Step 3: One thread (tid==0) sums all subgroup partials and computes invRms
+    if (tid == 0) {
+        uint numSubgroups = 256 / gl_SubgroupSize;
+        float total = 0.0;
+        for (uint i = 0; i < numSubgroups; ++i) {
+            total += sharedPartial[i];
+        }
+        sharedInvRms[0] = 1.0 / sqrt(total / float(pc.rowSize) + pc.eps);
+    }
+
+    // Wait for tid==0 to write the result
+    barrier();
+
+    // Step 4: All threads read invRms and normalize
+    float invRms = sharedInvRms[0];
+    for (uint i = tid; i < pc.rowSize; i += 256) {
+        Out.data[base + i] = In.data[base + i] * invRms * W.data[i];
+    }
+}

@@ -54,8 +54,23 @@ set(KERNELS
     src/kernels/add.comp
     src/kernels/rms_norm.comp
     src/kernels/embed.comp
+    src/kernels/embed_q8_0.comp
     src/kernels/kv_cache_write.comp
     src/kernels/silu_mul.comp
+    src/kernels/dequantize.comp
+    src/kernels/dequant_turbo.comp
+    src/kernels/gemm_turbo.comp
+    src/kernels/gemm_q4k.comp
+    src/kernels/gemm_q6k.comp
+    src/kernels/flash_attention.comp
+    src/kernels/mlp_fused_gateup.comp
+    src/kernels/topk.comp
+    src/kernels/kernel_entry.comp
+    src/kernels/bda_test.comp
+    src/kernels/dequantize_test.comp
+    src/kernels/kv_cache_dequant.comp
+    src/kernels/kv_cache_quantize.comp
+    src/kernels/compress_context.comp
 )
 
 set(SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)

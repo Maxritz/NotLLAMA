@@ -1,0 +1,244 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QuantRef {
+    uint8_t data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) writeonly buffer FloatOutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t srcAddr;
+    uint64_t dstAddr;
+    uint32_t n;
+    uint32_t DType;
+} pc;
+
+float fp16_to_fp32(uint8_t low, uint8_t high) {
+    uint raw = uint(low) | (uint(high) << 8);
+    return unpackHalf2x16(raw).x;
+}
+
+int sign_extend_u8(uint8_t v) {
+    return int(int8_t(v));
+}
+
+void main() {
+    QuantRef q = QuantRef(pc.srcAddr);
+    FloatOutRef out = FloatOutRef(pc.dstAddr);
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    if (pc.DType == 0) { // F32
+        uint b = i * 4;
+        uint raw = uint(q.data[b]) | (uint(q.data[b + 1]) << 8) | (uint(q.data[b + 2]) << 16) | (uint(q.data[b + 3]) << 24);
+        out.data[i] = uintBitsToFloat(raw);
+        return;
+    }
+
+    if (pc.DType == 1) { // F16
+        out.data[i] = fp16_to_fp32(q.data[i * 2], q.data[i * 2 + 1]);
+        return;
+    }
+
+    if (pc.DType == 2) { // Q8_0
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 34;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        int qval = sign_extend_u8(q.data[bs + 2 + eleInBlock]);
+        out.data[i] = delta * float(qval);
+        return;
+    }
+
+    if (pc.DType == 3) { // Q4_0
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 18;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        uint8_t bval = q.data[bs + 2 + (eleInBlock / 2)];
+        uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+        out.data[i] = delta * (float(nibble) - 8.0f);
+        return;
+    }
+
+    if (pc.DType == 4) { // Q4_1
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 20;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint8_t bval = q.data[bs + 4 + (eleInBlock / 2)];
+        uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+        out.data[i] = delta * float(nibble) + deltaMin;
+        return;
+    }
+
+    if (pc.DType == 5) { // Q5_0
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 22;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        uint byteIdx = bs + 2 + (eleInBlock * 5) / 8;
+        uint8_t bval = q.data[byteIdx];
+        uint shift = (eleInBlock * 5) % 8;
+        uint q5 = (uint(bval) >> shift) & 0x1Fu;
+        if (q5 > 15) q5 |= 0xFFE0u;
+        out.data[i] = delta * (float(int(q5)) - 16.0f);
+        return;
+    }
+
+    if (pc.DType == 6) { // Q5_1
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 24;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint byteIdx = bs + 4 + (eleInBlock * 5) / 8;
+        uint8_t bval = q.data[byteIdx];
+        uint shift = (eleInBlock * 5) % 8;
+        uint q5 = (uint(bval) >> shift) & 0x1Fu;
+        out.data[i] = delta * float(q5) + deltaMin;
+        return;
+    }
+
+    if (pc.DType == 7) { // Q8_1
+        uint blockIdx = i / 32;
+        uint eleInBlock = i % 32;
+        uint bs = blockIdx * 36;
+        float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        int qval = sign_extend_u8(q.data[bs + 4 + eleInBlock]);
+        out.data[i] = delta * float(qval) + deltaMin;
+        return;
+    }
+
+    if (pc.DType == 8) { // Q2_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 80;
+        float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint subBlock = eleInBlock / 64;
+        uint subEle = eleInBlock % 64;
+        uint sc = q.data[bs + 4 + subBlock];
+        uint byteIdx = bs + 8 + subBlock * 16 + subEle / 4;
+        uint8_t bval = q.data[byteIdx];
+        uint shift = (subEle % 4) * 2;
+        uint q2 = (uint(bval) >> shift) & 3u;
+        out.data[i] = d * float(sc) * float(int(q2)) + dmin;
+        return;
+    }
+
+    if (pc.DType == 9) { // Q3_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 112;
+        float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint subBlock = eleInBlock / 32;
+        uint subEle = eleInBlock % 32;
+        uint scIdx = bs + 4 + subBlock;
+        uint sc = q.data[scIdx];
+        uint byteIdx = bs + 12 + subBlock * 24 + subEle / 2;
+        uint8_t bval = q.data[byteIdx];
+        uint nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+        out.data[i] = d * float(sign_extend_u8(uint8_t(sc))) * float(int(nibble) - 8) - dmin;
+        return;
+    }
+
+    if (pc.DType == 10) { // Q4_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 144;
+        float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint subBlock = eleInBlock / 32;
+        uint subEle = eleInBlock % 32;
+        uint scOffset = bs + 132 + subBlock * 2;
+        float sc = fp16_to_fp32(q.data[scOffset], q.data[scOffset + 1]);
+        uint byteIdx = bs + 4 + subBlock * 16 + subEle / 2;
+        uint8_t bval = q.data[byteIdx];
+        uint nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+        uint hiByte = 0;
+        if (subBlock < 4) {
+            uint hiByteIdx = bs + 4 + 64 + subBlock * 8 + subEle / 2;
+            hiByte = q.data[hiByteIdx];
+            uint hiNibble = (subEle % 2 == 0) ? (hiByte & 0x0Fu) : ((hiByte >> 4) & 0x0Fu);
+            nibble |= hiNibble << 4;
+        }
+        out.data[i] = sc * float(int(nibble) - 16) * d - dmin;
+        return;
+    }
+
+    if (pc.DType == 11) { // Q5_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 176;
+        float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
+        uint subBlock = eleInBlock / 32;
+        uint subEle = eleInBlock % 32;
+        uint scOffset = bs + 164 + subBlock * 2;
+        float sc = fp16_to_fp32(q.data[scOffset], q.data[scOffset + 1]);
+        uint nibble = 0;
+        if (subBlock < 4) {
+            uint byteIdx = bs + 4 + subBlock * 20 + subEle / 2;
+            uint8_t bval = q.data[byteIdx];
+            uint lo4 = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+            uint hiByteIdx = bs + 4 + 80 + subBlock * 8 + subEle / 2;
+            uint8_t bvalHi = q.data[hiByteIdx];
+            uint hi4 = (subEle % 2 == 0) ? (bvalHi & 0x0Fu) : ((bvalHi >> 4) & 0x0Fu);
+            nibble = lo4 | (hi4 << 4);
+        } else {
+            uint byteIdx = bs + 4 + 112 + subEle / 2;
+            uint8_t bval = q.data[byteIdx];
+            nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
+        }
+        if (nibble >= 16) nibble |= 0xFFF0u;
+        out.data[i] = sc * float(int(nibble)) * d - dmin;
+        return;
+    }
+
+    if (pc.DType == 14) { // Q8_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 290;
+        float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
+        uint subBlock = eleInBlock / 32;
+        uint subEle = eleInBlock % 32;
+        int sc = sign_extend_u8(q.data[bs + 2 + subBlock]);
+        int qval = sign_extend_u8(q.data[bs + 10 + subBlock * 32 + subEle]);
+        out.data[i] = d * float(sc) * float(qval);
+        return;
+    }
+
+    if (pc.DType == 15) { // Q6_K
+        uint blockIdx = i / 256;
+        uint eleInBlock = i % 256;
+        uint bs = blockIdx * 210;
+        float d = fp16_to_fp32(q.data[bs + 208], q.data[bs + 209]);
+        uint subBlock = eleInBlock / 16;
+        int sc = sign_extend_u8(q.data[bs + 192 + subBlock]);
+        uint qlByteIdx = eleInBlock / 2;
+        uint q4raw = q.data[bs + 0 + qlByteIdx];
+        uint q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0xFu) : (q4raw >> 4);
+        uint qhByteIdx = eleInBlock / 4;
+        uint qhByte = q.data[bs + 128 + qhByteIdx];
+        uint qhShift = (eleInBlock & 3u) * 2;
+        int val = int(q4 | (((qhByte >> qhShift) & 3) << 4)) - 32;
+        out.data[i] = d * float(sc) * float(val);
+        return;
+    }
+
+    out.data[i] = 0.0f;
+}

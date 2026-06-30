@@ -1,0 +1,34 @@
+--- a/src/host/scheduler.cpp
++++ b/src/host/scheduler.cpp
+@@ -45,7 +45,6 @@
+         if (cmdPools[i]) {
+             vkDestroyCommandPool(device, cmdPools[i], nullptr);
+         }
+-        if (layerFence) { vkDestroyFence(device, layerFence, nullptr); }
+     }
+ }
+
+@@ -55,21 +54,6 @@
+     return cmd;
+ }
+
+-bool Scheduler::createLayerFence() {
+-    VkFenceCreateInfo fenceInfo = {};
+-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+-    VkResult r = vkCreateFence(device, &fenceInfo, nullptr, &layerFence);
+-    return r == VK_SUCCESS;
+-}
+-
+-void Scheduler::syncLayer(int aceIndex) {
+-    if (layerFence) {
+-        vkWaitForFences(device, 1, &layerFence, VK_TRUE, UINT64_MAX);
+-        vkResetFences(device, 1, &layerFence);
+-    }
+-    if (cmdPools[aceIndex]) {
+-        vkResetCommandPool(device, cmdPools[aceIndex], 0);
+-    }
+-}
+-
+ void Scheduler::dispatch(VkPipeline pipeline, VkPipelineLayout layout,
+     const void* pushConstants, size_t pcSize,
+     uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) {

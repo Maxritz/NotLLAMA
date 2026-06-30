@@ -1,0 +1,17 @@
+{
+  "mode": "on",
+  "shortPromptThreshold": 15,
+  "toolPriorities": {
+    "prefer": ["read", "glob", "grep"],
+    "avoid": ["task", "webfetch", "websearch"]
+  },
+  "techniques": {
+    "enabled": "all",
+    "disabled": ["emotional-stimuli"]
+  },
+  "context": {
+    "injectGit": true,
+    "injectMcpTools": true,
+    "maxChangedFiles": 10
+  }
+}

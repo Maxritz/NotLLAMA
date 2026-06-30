@@ -4,13 +4,19 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
-// Flash Attention — tiled, RDNA4-friendly.
+// Flash Attention — RDNA-safe (Wave32 and Wave64).
 // Each thread handles hd/32 elements of each Q/K/V row.
-// Online softmax over K/V tiles of size Bc=32.
+// Uses subgroupAdd for dot product reduction — no shared memory,
+// no barriers inside the KV loop, safe on partial workgroups.
+// No early returns — workgroup edge cases handled via conditional guards.
+// S_scores[32] removed: was corrupted on partial workgroups (tid>=sl
+// exited before writing, thread 0 summed undefined values).
+//
 // MAX_HEAD_DIM=256 keeps per-thread arrays at 8 elements (256/32).
 // Models with larger headDim will be rejected at runtime.
 
@@ -45,8 +51,6 @@ layout(push_constant, scalar) uniform PushConstants {
     float invSqrtHeadDim;
 } pc;
 
-shared float s_scores[32];
-
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint hd = pc.headDim;
@@ -60,78 +64,80 @@ void main() {
     OutRef Out = OutRef(pc.addrOut);
 
     uint qRow = qStart + tid;
-    if (qRow >= sl) return;
-    if (hd > MAX_HEAD_DIM) return;
+    bool valid = qRow < sl && hd <= MAX_HEAD_DIM;
 
     uint hdPerThread = max(hd / 32u, 1u);
 
-    // Each thread owns hdPerThread elements of the Q row
-    uint qBase = qRow * hd;
+    // Per-thread Q vector and accumulator
     float myQ[MAX_HD_PER_THREAD];
-    for (uint d = 0; d < hdPerThread; ++d) {
-        uint idx = tid * hdPerThread + d;
-        myQ[d] = (idx < hd) ? float(Q.data[qBase + idx]) : 0.0;
-    }
-
-    // Per-thread accumulator and softmax state
     float myAcc[MAX_HD_PER_THREAD];
-    for (uint d = 0; d < hdPerThread; ++d) myAcc[d] = 0.0;
+    for (uint d = 0; d < MAX_HD_PER_THREAD; ++d) { myQ[d] = 0.0; myAcc[d] = 0.0; }
     float m = -1e30;
     float l = 0.0;
+
+    // Load Q row (invalid threads keep zeros)
+    if (valid) {
+        uint qBase = qRow * hd;
+        for (uint d = 0; d < hdPerThread; ++d) {
+            uint idx = tid * hdPerThread + d;
+            if (idx < hd) myQ[d] = Q.data[qBase + idx];
+        }
+    }
 
     uint numKvTiles = (sl + kvTile - 1) / kvTile;
 
     for (uint kvIdx = 0; kvIdx < numKvTiles; ++kvIdx) {
         uint kvStart = kvIdx * kvTile;
         uint kvEnd = min(kvStart + kvTile, sl);
-        uint kvCount = kvEnd - kvStart;
 
-        for (uint j = 0; j < kvCount; ++j) {
-            uint kRow = kvStart + j;
-            uint kBase = kRow * hd;
+        for (uint j = kvStart; j < kvEnd; ++j) {
+            uint kBase = j * hd;
 
             // Each thread computes partial dot for its hdPerThread slice
             float partialDot = 0.0;
-            for (uint d = 0; d < hdPerThread; ++d) {
-                uint idx = tid * hdPerThread + d;
-                if (idx >= hd) break;
-                partialDot += myQ[d] * K.data[kBase + idx];
+            if (valid) {
+                for (uint d = 0; d < hdPerThread; ++d) {
+                    uint idx = tid * hdPerThread + d;
+                    if (idx >= hd) break;
+                    partialDot += myQ[d] * K.data[kBase + idx];
+                }
             }
 
-            // Reduce: thread 0 sums all 32 partials via shared memory
-            s_scores[tid] = partialDot;
-            barrier();
-            float score = 0.0;
-            if (tid == 0) {
-                for (uint t = 0; t < 32; ++t) score += s_scores[t];
-            }
-            barrier();
-            score = subgroupBroadcastFirst(score) * pc.invSqrtHeadDim;
+            // Subgroup reduction — sums across all active threads.
+            // On RDNA4 (Wave32): subgroup = workgroup = 32 threads.
+            // On RDNA2 (Wave64): subgroup = workgroup (subset of 64-wide wave).
+            // Invalid threads contribute 0; result is identical on all threads.
+            // No barrier needed — subgroupAdd is a cross-lane operation.
+            float score = subgroupAdd(partialDot) * pc.invSqrtHeadDim;
 
-            if (kRow > qRow) score = -1e30;
+            // Causal mask
+            if (valid && j > qRow) score = -1e30;
 
             // Online softmax
-            float mNew = max(m, score);
-            float expScale = exp(m - mNew);
-            float p = exp(score - mNew);
+            if (valid) {
+                float mNew = max(m, score);
+                float expScale = exp(m - mNew);
+                float p = exp(score - mNew);
 
-            // Update accumulator
-            for (uint d = 0; d < hdPerThread; ++d) {
-                uint idx = tid * hdPerThread + d;
-                if (idx >= hd) break;
-                myAcc[d] = myAcc[d] * expScale + p * V.data[kBase + idx];
+                for (uint d = 0; d < hdPerThread; ++d) {
+                    uint idx = tid * hdPerThread + d;
+                    if (idx >= hd) break;
+                    myAcc[d] = myAcc[d] * expScale + p * V.data[kBase + idx];
+                }
+                l = l * expScale + p;
+                m = mNew;
             }
-            l = l * expScale + p;
-            m = mNew;
         }
     }
 
     // Write output
-    float invL = 1.0 / l;
-    uint outBase = qRow * hd;
-    for (uint d = 0; d < hdPerThread; ++d) {
-        uint idx = tid * hdPerThread + d;
-        if (idx >= hd) break;
-        Out.data[outBase + idx] = myAcc[d] * invL;
+    if (valid) {
+        float invL = 1.0 / l;
+        uint outBase = qRow * hd;
+        for (uint d = 0; d < hdPerThread; ++d) {
+            uint idx = tid * hdPerThread + d;
+            if (idx >= hd) break;
+            Out.data[outBase + idx] = myAcc[d] * invL;
+        }
     }
 }

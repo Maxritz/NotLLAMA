@@ -44,7 +44,45 @@ bool VulkanContext::init() {
         physicalDevice = pdevs[0];
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physicalDevice, &props);
-        std::cout << "Selected GPU: " << props.deviceName << " (vendor=" << props.vendorID << ")\n";
+        vendorID = props.vendorID;
+        deviceApiVersion = props.apiVersion;
+        std::strncpy(deviceName, props.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
+        std::cout << "Selected GPU: " << deviceName << " (vendor=" << vendorID << ")\n";
+    } else {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevice, &props);
+        vendorID = props.vendorID;
+        deviceApiVersion = props.apiVersion;
+        std::strncpy(deviceName, props.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
+        std::cout << "Selected GPU: " << deviceName << " (vendor=" << vendorID << ")\n";
+        std::cout << "Device Vulkan version: " << VK_VERSION_MAJOR(deviceApiVersion)
+                  << "." << VK_VERSION_MINOR(deviceApiVersion)
+                  << "." << VK_VERSION_PATCH(deviceApiVersion) << "\n";
+    }
+
+    // Query subgroup/wave size — determines Wave32 (RDNA3/4) vs Wave64 (RDNA2/GCN).
+    // Shaders using subgroup operations must handle both. flash_attention.comp
+    // uses subgroupAdd which is safe on both.
+    {
+        VkPhysicalDeviceSubgroupProperties subgroupProps = {};
+        subgroupProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+        VkPhysicalDeviceProperties2 props2 = {};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &subgroupProps;
+        vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+
+        subgroupSize = subgroupProps.subgroupSize;
+        std::cout << "Subgroup size (wave width): " << subgroupSize << "\n";
+        std::cout << "Subgroup supported stages: 0x" << std::hex
+                  << subgroupProps.supportedStages << std::dec << "\n";
+        if (isAmd()) {
+            if (isWave32()) {
+                std::cout << "AMD Wave32 mode (RDNA3/4)\n";
+            } else {
+                std::cout << "AMD Wave64 mode (RDNA2/GCN)\n";
+            }
+        }
     }
 
     // Find compute queue family with at least 4 queues

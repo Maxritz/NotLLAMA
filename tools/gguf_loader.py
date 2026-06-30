@@ -47,13 +47,13 @@ class GGUFLoader:
         GGMLType.Q2_K: 84, GGMLType.Q3_K: 110,
         GGMLType.Q4_K: 144, GGMLType.Q5_K: 176,
         GGMLType.Q6_K: 210, GGMLType.Q8_K: 292,
-        GGMLType.IQ2_XXS: 256, GGMLType.IQ2_XS: 256,
-        GGMLType.IQ3_XXS: 256, GGMLType.IQ1_S: 256,
-        GGMLType.IQ4_NL: 256, GGMLType.IQ3_S: 256,
-        GGMLType.IQ2_S: 256, GGMLType.IQ4_XS: 256,
+        GGMLType.IQ2_XXS: 66, GGMLType.IQ2_XS: 74,
+        GGMLType.IQ3_XXS: 98, GGMLType.IQ1_S: 50,
+        GGMLType.IQ4_NL: 18, GGMLType.IQ3_S: 110,
+        GGMLType.IQ2_S: 82, GGMLType.IQ4_XS: 146,
         GGMLType.I8: 1, GGMLType.I16: 2, GGMLType.I32: 4, GGMLType.I64: 8,
         GGMLType.F64: 8, GGMLType.BF16: 2,
-        GGMLType.IQ1_M: 256, GGMLType.TQ1_0: 256, GGMLType.TQ2_0: 256,
+        GGMLType.IQ1_M: 56, GGMLType.TQ1_0: 256, GGMLType.TQ2_0: 256,
     }
 
     TYPE_BLOCK_ELEMENTS = {
@@ -324,8 +324,9 @@ class GGUFLoader:
         return result[:num_elements], shape
 
     def dequantize_q8_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:
-        """Dequantize Q8_K — 256 elements/block, 290 bytes. d@0, scales@2, qs@34.
-        8 sub-blocks of 32 elements, each with an int8 scale."""
+        """Dequantize Q8_K — 256 elements/block, 292 bytes.
+        block_q8_k: { float d; int8_t qs[256]; int16_t bsums[16]; }
+        Single float32 scale per block. No sub-block scales."""
         info = self.tensors[name]
         raw = self.get_tensor_raw(name)
         shape = info.shape
@@ -335,19 +336,15 @@ class GGUFLoader:
         result = []
         pos = 0
         QK_K = 256
-        BLOCK_SIZE = 290
+        BLOCK_SIZE = 292
         for _ in range((num_elements + QK_K - 1) // QK_K):
-            d = struct.unpack("<e", raw[pos:pos+2])[0]
-            scales = raw[pos+2:pos+34]   # 32 signed int8 scales
-            qs = raw[pos+34:pos+290]     # 256 signed int8 quants
-            pos += BLOCK_SIZE
+            d = struct.unpack("<f", raw[pos:pos+4])[0]       # float32 scale
+            qs_data = raw[pos+4:pos+260]                     # 256 int8 quants
+            pos += BLOCK_SIZE                                 # skip bsums[16](32B)
 
-            for j in range(8):           # 8 sub-blocks of 32
-                sc = scales[j] if scales[j] < 128 else scales[j] - 256
-                for l in range(32):
-                    q = qs[j * 32 + l]
-                    q_signed = q if q < 128 else q - 256
-                    result.append(d * sc * q_signed)
+            for q_byte in qs_data:
+                q_signed = q_byte if q_byte < 128 else q_byte - 256
+                result.append(d * q_signed)
         return result[:num_elements], shape
 
     def dequantize_q6_k(self, name: str) -> Tuple[List[float], Tuple[int, ...]]:

@@ -39,6 +39,14 @@ static float readF16(const uint8_t* data, size_t offset) {
     return fp16ToFloat(raw);
 }
 
+static float readFloat32(const uint8_t* data, size_t offset) {
+    uint32_t raw = data[offset] | ((uint32_t)data[offset + 1] << 8) |
+                   ((uint32_t)data[offset + 2] << 16) | ((uint32_t)data[offset + 3] << 24);
+    float result;
+    memcpy(&result, &raw, sizeof(float));
+    return result;
+}
+
 static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
                                       QuantFormat format, uint32_t blockSize,
                                       uint32_t blockElements, uint32_t nElements) {
@@ -113,29 +121,35 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             result[i] = delta * (float)nibble + deltaMin;
         }
     } else if (format == QuantFormat::Q5_0) {
+        // block_q5_0: { fp16_t d; uint8_t qh[4]; uint8_t qs[16]; } = 22 bytes
+        // qs pairs: element j (low nibble) + element j+16 (high nibble) for j=0..15
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 32;
             uint32_t eleInBlock = i % 32;
             uint32_t bs = blockIdx * 22;
             float delta = readF16(data, bs);
-            uint32_t byteIdx = bs + 2 + (eleInBlock * 5 / 8);
-            uint8_t bval = data[byteIdx];
-            uint32_t shift = (eleInBlock * 5) % 8;
-            uint32_t q5 = (bval >> shift) & 0x1F;
-            if (q5 > 15) q5 |= 0xE0;
-            result[i] = delta * ((float)(int)q5 - 16.0f);
+            uint8_t qh_byte = data[bs + 2 + (eleInBlock / 8)];
+            uint8_t qs_val = data[bs + 6 + (eleInBlock & 0xF)];
+            uint32_t lo = (eleInBlock < 16) ? (qs_val & 0x0F) : ((qs_val >> 4) & 0x0F);
+            uint32_t hi = (qh_byte >> (eleInBlock % 8)) & 1;
+            int q5 = (int)(lo | (hi << 4)) - 16;
+            result[i] = delta * (float)q5;
         }
     } else if (format == QuantFormat::Q5_1) {
+        // block_q5_1: { fp16_t d; fp16_t m; uint8_t qh[4]; uint8_t qs[16]; } = 24 bytes
+        // qs pairs: element j (low nibble) + element j+16 (high nibble) for j=0..15
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 32;
             uint32_t eleInBlock = i % 32;
             uint32_t bs = blockIdx * 24;
             float delta = readF16(data, bs);
             float deltaMin = readF16(data, bs + 2);
-            uint32_t byteIdx = bs + 4 + (eleInBlock * 5 / 8);
-            uint8_t bval = data[byteIdx];
-            uint32_t shift = (eleInBlock * 5) % 8;
-            uint32_t q5 = (bval >> shift) & 0x1F;
+            uint8_t qh_byte = data[bs + 4 + (eleInBlock / 8)];
+            uint8_t qs_val = data[bs + 8 + (eleInBlock & 0xF)];
+            uint32_t lo = (eleInBlock < 16) ? (qs_val & 0x0F) : ((qs_val >> 4) & 0x0F);
+            uint32_t hi = (qh_byte >> (eleInBlock % 8)) & 1;
+            int q5 = (int)(lo | (hi << 4));
+            result[i] = (delta * (float)q5) + deltaMin;
             result[i] = delta * (float)q5 + deltaMin;
         }
     } else if (format == QuantFormat::Q8_1) {
@@ -165,23 +179,27 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             result[i] = d * (float)sc * (float)(int)q2 + dmin;
         }
     } else if (format == QuantFormat::Q3_K) {
+        // block_q3_k: { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; fp16_t d; } = 110 bytes
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 256;
             uint32_t eleInBlock = i % 256;
-            uint32_t bs = blockIdx * 112;
-            float d = readF16(data, bs);
-            float dmin = readF16(data, bs + 2);
+            uint32_t bs = blockIdx * 110;
+            float d = readF16(data, bs + 108);
             uint32_t subBlock = eleInBlock / 32;
             uint32_t subEle = eleInBlock % 32;
-            uint32_t scIdx = bs + 4 + subBlock;
-            uint8_t sc = data[scIdx];
-            uint32_t byteIdx = bs + 12 + subBlock * 24 + subEle / 2;
-            uint8_t bval = data[byteIdx];
+            uint8_t sc = data[bs + 96 + subBlock];
+            uint32_t qsIdx = bs + 32 + (subEle / 2);
+            uint8_t bval = data[qsIdx];
             uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
-            result[i] = d * (float)(int8_t)sc * (float)(int)(nibble - 8) - dmin;
+            uint32_t hmaskIdx = bs + (subEle / 8);
+            uint32_t hmaskBit = (data[hmaskIdx] >> (subEle % 8)) & 1;
+            int q3 = (nibble & 0x3) | (hmaskBit << 2);
+            if (nibble & 0x8) q3 -= 4;
+            result[i] = d * (float)(int8_t)sc * (float)q3;
         }
     } else if (format == QuantFormat::Q4_K) {
-        // Layout: d(fp16)@0, dmin(fp16)@2, scales_int8(12)@4, qs(128)@16
+        // Layout: d(fp16)@0, dmin(fp16)@2, scales(12)@4, qs(128)@16
+        // scales: 12 bytes packing 8 × 6-bit scale + 8 × 6-bit min (get_scale_min_k4)
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 256;
             uint32_t eleInBlock = i % 256;
@@ -191,12 +209,25 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             float dmin = readF16(data, bs + 2);
             uint32_t subBlock = eleInBlock / 32;
             uint32_t subEle = eleInBlock % 32;
-            uint8_t sc = data[bs + 4 + subBlock];
-            uint32_t qsOffset = bs + 16 + (eleInBlock / 2);
-            uint8_t bval = data[qsOffset];
-            uint32_t nibble = (subEle % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
 
-            result[i] = d * (float)sc * ((float)nibble - 8.0f) + dmin;
+            uint8_t sc, sm;
+            if (subBlock < 4) {
+                sc = data[bs + 4 + subBlock] & 63;
+                sm = data[bs + 4 + subBlock + 4] & 63;
+            } else {
+                uint8_t bJp4 = data[bs + 4 + subBlock + 4];
+                uint8_t bJm4 = data[bs + 4 + subBlock - 4];
+                uint8_t bJ0  = data[bs + 4 + subBlock];
+                sc = (bJp4 & 0x0F) | ((bJm4 >> 6) << 4);
+                sm = (bJp4 >> 4)    | ((bJ0  >> 6) << 4);
+            }
+
+            uint32_t qsChunk = (subBlock / 2) * 32;
+            uint32_t qsOffset = bs + 16 + qsChunk + subEle;
+            uint8_t bval = data[qsOffset];
+            uint32_t nibble = (subBlock & 1) == 0 ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+
+            result[i] = (float)(int)sc * d * (float)nibble - (float)(int)sm * dmin;
         }
     } else if (format == QuantFormat::Q5_K) {
         for (uint32_t i = 0; i < nElements; ++i) {
@@ -226,16 +257,14 @@ static std::vector<float> dequantize(const uint8_t* data, size_t dataSize,
             result[i] = sc * (float)(int)nibble * d - dmin;
         }
     } else if (format == QuantFormat::Q8_K) {
+        // block_q8_k: { float d; int8_t qs[256]; int16_t bsums[16]; } = 292 bytes
         for (uint32_t i = 0; i < nElements; ++i) {
             uint32_t blockIdx = i / 256;
             uint32_t eleInBlock = i % 256;
-            uint32_t bs = blockIdx * 290;
-            float d = readF16(data, bs);
-            uint32_t subBlock = eleInBlock / 32;
-            uint32_t subEle = eleInBlock % 32;
-            int sc = (int8_t)data[bs + 2 + subBlock];
-            int q = (int8_t)data[bs + 10 + subBlock * 32 + subEle];
-            result[i] = d * (float)sc * (float)q;
+            uint32_t bs = blockIdx * 292;
+            float d = readFloat32(data, bs);
+            int q = (int8_t)data[bs + 4 + eleInBlock];
+            result[i] = d * (float)q;
         }
     }
 

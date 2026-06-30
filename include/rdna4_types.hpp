@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 
 namespace rdna4 {
 
@@ -11,6 +12,15 @@ struct GemmPushConstants {
     float alpha;
     uint32_t transB;
 };
+// Verify member offsets match GLSL scalar layout (MSVC rounds sizeof to 8-byte boundary, last 4 bytes unused)
+static_assert(offsetof(GemmPushConstants, addrA) == 0, "addrA offset mismatch");
+static_assert(offsetof(GemmPushConstants, addrB) == 8, "addrB offset mismatch");
+static_assert(offsetof(GemmPushConstants, addrC) == 16, "addrC offset mismatch");
+static_assert(offsetof(GemmPushConstants, M) == 24, "M offset mismatch");
+static_assert(offsetof(GemmPushConstants, N) == 28, "N offset mismatch");
+static_assert(offsetof(GemmPushConstants, K) == 32, "K offset mismatch");
+static_assert(offsetof(GemmPushConstants, transB) == 40, "transB offset mismatch");
+static_assert(sizeof(GemmPushConstants) <= 128, "GemmPushConstants exceeds 128 bytes");
 
 struct AttentionPushConstants {
     uint64_t addrQ, addrK, addrV, addrOut;
@@ -135,6 +145,13 @@ struct DequantizePushConstants {
     uint32_t totalThreads;
     uint32_t elementOffset;
 };
+static_assert(offsetof(DequantizePushConstants, addrQuant) == 0, "");
+static_assert(offsetof(DequantizePushConstants, addrOut) == 8, "");
+static_assert(offsetof(DequantizePushConstants, nElements) == 16, "");
+static_assert(offsetof(DequantizePushConstants, quantFormat) == 20, "");
+static_assert(offsetof(DequantizePushConstants, totalThreads) == 24, "");
+static_assert(offsetof(DequantizePushConstants, elementOffset) == 28, "");
+static_assert(sizeof(DequantizePushConstants) == 32, "");
 
 // ============================================================================
 // kernel_entry.comp push constants — must match GLSL layout(scalar) exactly.

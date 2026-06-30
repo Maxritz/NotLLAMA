@@ -1,0 +1,42 @@
+// ============================================================================
+// dequantWeightInBatch: records dequant dispatches into the ACTIVE batch
+// command buffer via dispatchInBatch(). NO separate submits. NO syncs.
+// Must only be called between beginBatch() and endBatch().
+// Returns the GPU address where the dequantized float32 weights will be.
+// ============================================================================
+static uint64_t dequantWeightInBatch(Scheduler* sched, PipelineBuilder* pipes,
+    uint64_t dequantBufAddr, size_t dequantBufSize,
+    const ModelDesc& model, const std::string& name,
+    size_t outOffset = 0) {
+    const TensorDesc* t = findTensor(model, name);
+    if (!t) return 0;
+    if (t->format == QuantFormat::F16 || t->format == QuantFormat::F32) return t->gpuAddress;
+
+    uint32_t nElements = 1;
+    for (auto d : t->shape) nElements *= d;
+
+    size_t outBytes = (size_t)nElements * sizeof(float);
+    if (outOffset + outBytes > dequantBufSize) return 0;
+
+    const uint32_t MAX_WG_PER_DISPATCH = 256 * 1024;
+    uint32_t elementsPerChunk = MAX_WG_PER_DISPATCH * 32;
+    uint32_t offset = 0;
+
+    while (offset < nElements) {
+        uint32_t chunkSize = std::min(elementsPerChunk, nElements - offset);
+        uint32_t chunkWg = (chunkSize + 31) / 32;
+
+        DequantizePushConstants pc = {};
+        pc.addrQuant = t->gpuAddress;
+        pc.addrOut = dequantBufAddr + outOffset + (uint64_t)offset * sizeof(float);
+        pc.nElements = chunkSize;
+        pc.quantFormat = static_cast<uint32_t>(t->format);
+        pc.totalThreads = chunkWg * 32;
+        pc.elementOffset = offset;
+
+        sched->dispatchInBatch(pipes->getPipeline("dequantize"), pipes->getLayout("dequantize"),
+            &pc, sizeof(pc), chunkWg, 1, 1);
+        offset += chunkSize;
+    }
+    return dequantBufAddr + outOffset;
+}

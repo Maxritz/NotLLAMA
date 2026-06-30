@@ -36,13 +36,13 @@ if __name__ == "__main__":
 ```
 
 ### GGUF / Quantization Rules
-- All K-quant formats use **d-last layout**: quantized weights first, scales/deltas at the END of each block.
+- K-quant formats use **d-last layout** (qs first, d at end) **except Q8_K** which is d-first.
 - Q2_K block size: 84 bytes (scales[16] + qs[64] + d + dmin)
 - Q3_K block size: 110 bytes (hmask[32] + qs[64] + scales[12] + d)
 - Q4_K block size: 144 bytes (qs[128] + scales[12] + d + dmin)
 - Q5_K block size: 176 bytes (qs[128] + qh[32] + scales[12] + d + dmin)
 - Q6_K block size: 210 bytes (ql[128] + qh[64] + scales[16] + d)
-- Q8_K block size: 292 bytes (qs[256] + scales[32] + d + dmin)
+- Q8_K block size: 292 bytes (float32 d + qs[256] + bsums[16]) — d-first exception
 - Nibble extraction in Q4 formats: alternate low/high nibble. `index 0 -> low, index 1 -> high, index 2 -> low, ...`
 - Validation functions must check `d` (delta/scale) at the **correct end-of-block offset**, not offset 0.
 

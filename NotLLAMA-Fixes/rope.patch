@@ -1,0 +1,11 @@
+--- /mnt/agents/NotLLAMA-main/src/kernels/rope.comp	2026-06-29 19:08:49.000000000 +0800
++++ /mnt/agents/output/NotLLAMA-Fixes/fixed/src/kernels/rope.comp	2026-06-29 19:21:48.000000000 +0800
+@@ -39,7 +39,7 @@
+     KRef K = KRef(pc.addrK);
+ 
+     float theta = pow(pc.ropeBase, -float(d & ~1u) / float(pc.headDim));
+-    float angle = float(pc.seqLen) * theta * pc.ropeScale;
++    float angle = float(pc.seqLen - 1) * theta * pc.ropeScale;
+     float cosA = cos(angle);
+     float sinA = sin(angle);
+ 

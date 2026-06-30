@@ -2,22 +2,15 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_scalar_block_layout : require
-
-// Standalone dequantization to float32 staging buffer.
-// Each thread processes one element at a time and loops over the whole tensor
-// in strides of pc.totalThreads, allowing the host to dispatch in 65k-workgroup
-// chunks while still covering every element.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QuantRef {
-    uint8_t data[];
+    uint data[];
 };
-
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer FloatOutRef {
     float data[];
 };
@@ -31,221 +24,315 @@ layout(push_constant, scalar) uniform PushConstants {
     uint elementOffset;
 } pc;
 
-float fp16_to_fp32(uint8_t low, uint8_t high) {
-    uint raw = uint(low) | (uint(high) << 8);
-    return unpackFloat2x16(raw).x;
+float fp16ToFloat(uint16_t h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exponent = (h >> 10u) & 0x1Fu;
+    uint mantissa = h & 0x3FFu;
+    if (exponent == 0u) {
+        if (mantissa == 0u) return sign == 1u ? -0.0 : 0.0;
+        while ((mantissa & 0x400u) == 0u) { mantissa <<= 1u; exponent--; }
+        exponent++;
+        mantissa &= 0x3FFu;
+    } else if (exponent == 31u) {
+        if (mantissa == 0u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+        return 0.0 / 0.0;
+    }
+    exponent += 127u - 15u;
+    uint raw = (sign << 31u) | (exponent << 23u) | (mantissa << 13u);
+    float result;
+    raw = raw;
+    result = uintBitsToFloat(raw);
+    return result;
 }
 
-int sign_extend_u8(uint8_t v) {
-    return int(int8_t(v));
+// Read a single byte from the uint[] buffer (scalar block layout).
+uint readByte(QuantRef src, uint byteOffset) {
+    uint idx = byteOffset / 4u;
+    uint shift = (byteOffset % 4u) * 8u;
+    uint word = src.data[idx];
+    return (word >> shift) & 0xFFu;
+}
+
+// Read 16-bit value from byte array (little-endian).
+uint readU16(QuantRef src, uint byteOffset) {
+    uint lo = readByte(src, byteOffset);
+    uint hi = readByte(src, byteOffset + 1u);
+    return lo | (hi << 8u);
+}
+
+float readF16(QuantRef src, uint byteOffset) {
+    uint raw16 = readU16(src, byteOffset);
+    uint16_t h = uint16_t(raw16);
+    return fp16ToFloat(h);
 }
 
 void main() {
-    QuantRef q = QuantRef(pc.addrQuant);
-    FloatOutRef Out = FloatOutRef(pc.addrOut);
-
     uint gid = gl_GlobalInvocationID.x;
-    uint stride = pc.totalThreads;
+    uint globalIdx = gid + pc.elementOffset;
+    if (globalIdx >= pc.nElements) return;
 
-    for (uint i = gid; i < pc.nElements; i += stride) {
-        uint gi = i + pc.elementOffset;
+    QuantRef src = QuantRef(pc.addrQuant);
+    FloatOutRef dst = FloatOutRef(pc.addrOut);
 
-        // F32 (0)
-        if (pc.quantFormat == 0) {
-            uint b = gi * 4;
-            uint raw = uint(q.data[b]) | (uint(q.data[b + 1]) << 8)
-                     | (uint(q.data[b + 2]) << 16) | (uint(q.data[b + 3]) << 24);
-            Out.data[i] = uintBitsToFloat(raw);
+    if (pc.quantFormat == 0u) {
+        // F32: copy directly (4 bytes per element)
+        uint byteOffset = globalIdx * 4u;
+        uint raw = readByte(src, byteOffset)
+                 | (readByte(src, byteOffset + 1u) << 8u)
+                 | (readByte(src, byteOffset + 2u) << 16u)
+                 | (readByte(src, byteOffset + 3u) << 24u);
+        dst.data[globalIdx] = uintBitsToFloat(raw);
+    }
+    else if (pc.quantFormat == 1u) {
+        // F16: convert to F32
+        dst.data[globalIdx] = readF16(src, globalIdx * 2u);
+    }
+    else if (pc.quantFormat == 8u) {
+        // Q8_0: 32 elements per block, 2-byte fp16 scale + 32 int8
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 34u;
+        float scale = readF16(src, blockStart);
+        int q = int(readByte(src, blockStart + 2u + elemInBlock));
+        dst.data[globalIdx] = scale * float(q);
+    }
+    else if (pc.quantFormat == 9u) {
+        // Q8_1: 32 elements per block, 2-byte fp16 scale + 2-byte fp16 offset + 32 int8
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 36u;
+        float scale = readF16(src, blockStart);
+        float offset = readF16(src, blockStart + 2u);
+        int q = int(readByte(src, blockStart + 4u + elemInBlock));
+        dst.data[globalIdx] = scale * float(q) + offset;
+    }
+    else if (pc.quantFormat == 2u) {
+        // Q4_0: 32 elements per block, 2-byte fp16 scale + 16 bytes (32 nibbles)
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 18u;
+        float scale = readF16(src, blockStart);
+        uint byteIdx = blockStart + 2u + (elemInBlock / 2u);
+        uint rawByte = readByte(src, byteIdx);
+        int q;
+        if ((elemInBlock & 1u) == 0u) {
+            q = int(rawByte & 0x0Fu) - 8;
+        } else {
+            q = int((rawByte >> 4u) & 0x0Fu) - 8;
         }
-        // F16 (1)
-        else if (pc.quantFormat == 1) {
-            Out.data[i] = fp16_to_fp32(q.data[gi * 2], q.data[gi * 2 + 1]);
+        dst.data[globalIdx] = scale * float(q);
+    }
+    else if (pc.quantFormat == 3u) {
+        // Q4_1: 32 elements per block, 2-byte fp16 scale + 2-byte fp16 offset + 16 bytes
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 20u;
+        float scale = readF16(src, blockStart);
+        float offset = readF16(src, blockStart + 2u);
+        uint byteIdx = blockStart + 4u + (elemInBlock / 2u);
+        uint rawByte = readByte(src, byteIdx);
+        int q;
+        if ((elemInBlock & 1u) == 0u) {
+            q = int(rawByte & 0x0Fu);
+        } else {
+            q = int((rawByte >> 4u) & 0x0Fu);
         }
-        // Q4_0 (2) — 32 weights per block, 18 bytes per block
-        else if (pc.quantFormat == 2) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 18;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            uint8_t bval = q.data[bs + 2 + (eleInBlock / 2)];
-            uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-            Out.data[i] = delta * (float(nibble) - 8.0f);
+        dst.data[globalIdx] = scale * float(q) + offset;
+    }
+    else if (pc.quantFormat == 6u) {
+        // Q5_0: 32 elements per block, 2-byte fp16 scale + 4 bytes qh + 16 bytes qs
+        // block_q5_0: { fp16_t d; uint8_t qh[4]; uint8_t qs[16]; } = 22 bytes
+        // qs pairs: element j (low nibble) + element j+16 (high nibble) for j=0..15
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 22u;
+        float scale = readF16(src, blockStart);
+        uint qhByte = readByte(src, blockStart + 2u + (elemInBlock / 8u));
+        int highBit = int((qhByte >> (elemInBlock % 8u)) & 1u);
+        uint qsByte = readByte(src, blockStart + 6u + (elemInBlock & 0xFu));
+        int q4;
+        if (elemInBlock < 16u) {
+            q4 = int(qsByte & 0x0Fu);
+        } else {
+            q4 = int((qsByte >> 4u) & 0x0Fu);
         }
-        // Q4_1 (3) — 32 weights per block, 20 bytes per block
-        else if (pc.quantFormat == 3) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 20;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint8_t bval = q.data[bs + 4 + (eleInBlock / 2)];
-            uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-            Out.data[i] = delta * float(nibble) + deltaMin;
+        int q = (q4 | (highBit << 4)) - 16;
+        dst.data[globalIdx] = scale * float(q);
+    }
+    else if (pc.quantFormat == 7u) {
+        // Q5_1: 32 elements per block, 2-byte fp16 scale + 2-byte fp16 offset + 4 bytes qh + 16 bytes qs
+        // block_q5_1: { fp16_t d; fp16_t m; uint8_t qh[4]; uint8_t qs[16]; } = 24 bytes
+        // qs pairs: element j (low nibble) + element j+16 (high nibble) for j=0..15
+        uint blockIdx = globalIdx / 32u;
+        uint elemInBlock = globalIdx % 32u;
+        uint blockStart = blockIdx * 24u;
+        float scale = readF16(src, blockStart);
+        float offset = readF16(src, blockStart + 2u);
+        uint qhByte = readByte(src, blockStart + 4u + (elemInBlock / 8u));
+        int highBit = int((qhByte >> (elemInBlock % 8u)) & 1u);
+        uint qsByte = readByte(src, blockStart + 8u + (elemInBlock & 0xFu));
+        int q4;
+        if (elemInBlock < 16u) {
+            q4 = int(qsByte & 0x0Fu);
+        } else {
+            q4 = int((qsByte >> 4u) & 0x0Fu);
         }
-        // Q5_0 (6) — 32 weights per block, 22 bytes per block
-        else if (pc.quantFormat == 6) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 22;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            uint byteIdx = bs + 2 + (eleInBlock * 5) / 8;
-            uint8_t bval = q.data[byteIdx];
-            uint shift = (eleInBlock * 5) % 8;
-            uint q5 = (uint(bval) >> shift) & 0x1Fu;
-            if (q5 > 15) q5 |= 0xFFFFFFE0u;
-            Out.data[i] = delta * (float(int(q5)) - 16.0f);
+        int q = q4 | (highBit << 4);
+        dst.data[globalIdx] = scale * float(q) + offset;
+    }
+    else if (pc.quantFormat == 10u) {
+        // Q2_K: 256-element super-block, 4 sub-blocks of 64
+        // block_q2_k: { uint8_t scales[16]; uint8_t qs[64]; fp16_t d; fp16_t dmin; } = 84 bytes
+        // scales: 4 sub-blocks × 4 bytes each (d_low 4 bits, dmin 4 bits, packed per sub-block)
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint subBlock = elemInSuper / 64u;
+        uint elemInSub = elemInSuper % 64u;
+        uint sbOffset = superBlock * 84u;
+        // Per sub-block: scales[subBlock*4 + 0..3] packed, read d and dmin
+        uint scaleByte = readByte(src, sbOffset + subBlock * 4u);
+        float d = readF16(src, sbOffset + 64u);    // global d
+        float dmin = readF16(src, sbOffset + 66u);  // global dmin
+        float subScale = d * float(scaleByte & 0xF);
+        float subMin = dmin * float((scaleByte >> 4u) & 0xF);
+        uint byteIdx = sbOffset + 16u + (elemInSub / 4u);
+        uint rawByte = readByte(src, byteIdx);
+        int q2 = int((rawByte >> ((elemInSub % 4u) * 2u)) & 3u);
+        dst.data[globalIdx] = subScale * float(q2) - subMin;
+    }
+    else if (pc.quantFormat == 11u) {
+        // Q3_K: 256-element super-block, 8 sub-blocks of 32
+        // block_q3_k: { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; fp16_t d; } = 110 bytes
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint subBlock = elemInSuper / 32u;
+        uint elemInSub = elemInSuper % 32u;
+        uint sbOffset = superBlock * 110u;
+        float d = readF16(src, sbOffset + 108u);  // d at end (d-last)
+        int sc = int(readByte(src, sbOffset + 96u + subBlock));
+        // qs: 64 bytes = 128 nibbles (3 effective bits each)
+        uint qsIdx = sbOffset + 32u + (elemInSub / 2u);
+        uint rawByte = readByte(src, qsIdx);
+        int q4;
+        if ((elemInSub & 1u) == 0u) {
+            q4 = int(rawByte & 0x0Fu);
+        } else {
+            q4 = int((rawByte >> 4u) & 0x0Fu);
         }
-        // Q5_1 (7) — 32 weights per block, 24 bytes per block
-        else if (pc.quantFormat == 7) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 24;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint byteIdx = bs + 4 + (eleInBlock * 5) / 8;
-            uint8_t bval = q.data[byteIdx];
-            uint shift = (eleInBlock * 5) % 8;
-            uint q5 = (uint(bval) >> shift) & 0x1Fu;
-            Out.data[i] = delta * float(q5) + deltaMin;
+        uint hmaskByte = readByte(src, sbOffset + (elemInSub / 8u));
+        int hmaskBit = int((hmaskByte >> (elemInSub % 8u)) & 1u);
+        // Q3_K: value = (q4 & 0x3) | (hmask << 2) | ((q4 & 0x8) ? -4 : 0)
+        int q3 = (q4 & 0x3) | (hmaskBit << 2);
+        if ((q4 & 0x8u) != 0u) q3 -= 4;
+        dst.data[globalIdx] = d * float(sc) * float(q3);
+    }
+    else if (pc.quantFormat == 12u) {
+        // Q4_K: 256-element super-block, 8 sub-blocks of 32
+        // block_q4_k: { fp16_t d; fp16_t dmin; uint8_t scales[12]; uint8_t qs[128]; } = 144 bytes
+        // scales[12] packs 8 × 6-bit scale + 8 × 6-bit min via get_scale_min_k4()
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint subBlock = elemInSuper / 32u;
+        uint elemInSub = elemInSuper % 32u;
+        uint sbOffset = superBlock * 144u;
+        float d = readF16(src, sbOffset);
+        float dmin = readF16(src, sbOffset + 2u);
+        // Extract 6-bit scale and 6-bit min from packed 12-byte scales (get_scale_min_k4)
+        uint scalesBase = sbOffset + 4u;
+        uint sc, sm;
+        if (subBlock < 4u) {
+            sc = readByte(src, scalesBase + subBlock) & 63u;
+            sm = readByte(src, scalesBase + subBlock + 4u) & 63u;
+        } else {
+            uint bJp4 = readByte(src, scalesBase + subBlock + 4u);
+            uint bJm4 = readByte(src, scalesBase + subBlock - 4u);
+            uint bJ0  = readByte(src, scalesBase + subBlock);
+            sc = (bJp4 & 0x0Fu) | ((bJm4 >> 6u) << 4u);
+            sm = (bJp4 >> 4u)    | ((bJ0  >> 6u) << 4u);
         }
-        // Q8_0 (8) — 32 weights per block, 34 bytes per block
-        else if (pc.quantFormat == 8) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 34;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            int qval = sign_extend_u8(q.data[bs + 2 + eleInBlock]);
-            Out.data[i] = delta * float(qval);
+        // qs: 128 bytes. Sub-block pairs (0+1, 2+3, 4+5, 6+7) share 32 bytes.
+        uint qsBase = sbOffset + 16u;
+        uint qsChunk = (subBlock >> 1u) * 32u;
+        uint rawByte = readByte(src, qsBase + qsChunk + elemInSub);
+        uint q4;
+        if ((subBlock & 1u) == 0u) {
+            q4 = rawByte & 0x0Fu;
+        } else {
+            q4 = (rawByte >> 4u) & 0x0Fu;
         }
-        // Q8_1 (9) — 32 weights per block, 36 bytes per block
-        else if (pc.quantFormat == 9) {
-            uint blockIdx = gi / 32;
-            uint eleInBlock = gi % 32;
-            uint bs = blockIdx * 36;
-            float delta = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float deltaMin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            int qval = sign_extend_u8(q.data[bs + 4 + eleInBlock]);
-            Out.data[i] = delta * float(qval) + deltaMin;
+        dst.data[globalIdx] = d * float(sc) * float(q4) - dmin * float(sm);
+    }
+    else if (pc.quantFormat == 13u) {
+        // Q5_K: 256-element super-block, 8 sub-blocks of 32
+        // block_q5_k: { fp16_t d; fp16_t dmin; int8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } = 176 bytes
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint subBlock = elemInSuper / 32u;
+        uint elemInSub = elemInSuper % 32u;
+        uint sbOffset = superBlock * 176u;
+        float d = readF16(src, sbOffset);
+        float dmin = readF16(src, sbOffset + 2u);
+        // scales: 12 bytes, 8 sub-blocks
+        uint scaleByteIdx = sbOffset + 4u + (subBlock >> 1u);
+        uint scaleByte = readByte(src, scaleByteIdx);
+        float subScale = d * float(scaleByte & 0xF);
+        float subMin = dmin * float((scaleByte >> 4u) & 0xF);
+        // qh: 32 bytes, one bit per element for the 5th bit
+        uint qhIdx = sbOffset + 16u + (elemInSub / 8u);
+        uint qhByte = readByte(src, qhIdx);
+        int highBit = int((qhByte >> (elemInSub % 8u)) & 1u);
+        // qs: 128 bytes, nibbles
+        uint qsIdx = sbOffset + 48u + (elemInSub / 2u);
+        uint rawByte = readByte(src, qsIdx);
+        int q4;
+        if ((elemInSub & 1u) == 0u) {
+            q4 = int(rawByte & 0x0Fu);
+        } else {
+            q4 = int((rawByte >> 4u) & 0x0Fu);
         }
-        // Q2_K (10) — 256 weights per super-block, 80 bytes per block
-        else if (pc.quantFormat == 10) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 80;
-            float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint subBlock = eleInBlock / 64;
-            uint subEle = eleInBlock % 64;
-            uint sc = q.data[bs + 4 + subBlock];
-            uint byteIdx = bs + 8 + subBlock * 16 + subEle / 4;
-            uint8_t bval = q.data[byteIdx];
-            uint shift = (subEle % 4) * 2;
-            uint q2 = (uint(bval) >> shift) & 3u;
-            Out.data[i] = d * float(sc) * float(int(q2)) + dmin;
-        }
-        // Q3_K (11) — 256 weights per super-block, 112 bytes per block
-        else if (pc.quantFormat == 11) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 112;
-            float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint subBlock = eleInBlock / 32;
-            uint subEle = eleInBlock % 32;
-            uint8_t sc = q.data[bs + 4 + subBlock];
-            uint byteIdx = bs + 12 + subBlock * 24 + subEle / 2;
-            uint8_t bval = q.data[byteIdx];
-            uint nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-            Out.data[i] = d * float(sign_extend_u8(sc)) * float(int(nibble) - 8) - dmin;
-        }
-        // Q4_K (12) — 256 weights per super-block, 144 bytes per block
-        else if (pc.quantFormat == 12) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 144;
-            float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint subBlock = eleInBlock / 32;
-            uint subEle = eleInBlock % 32;
-            uint scOffset = bs + 132 + subBlock * 2;
-            float sc = fp16_to_fp32(q.data[scOffset], q.data[scOffset + 1]);
-            uint byteIdx = bs + 4 + subBlock * 16 + subEle / 2;
-            uint8_t bval = q.data[byteIdx];
-            uint nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-            if (subBlock < 4) {
-                uint hiByteIdx = bs + 4 + 64 + subBlock * 8 + subEle / 2;
-                uint8_t hiByte = q.data[hiByteIdx];
-                uint hiNibble = (subEle % 2 == 0) ? (hiByte & 0x0Fu) : ((hiByte >> 4) & 0x0Fu);
-                nibble |= hiNibble << 4;
-            }
-            Out.data[i] = sc * float(int(nibble) - 16) * d - dmin;
-        }
-        // Q5_K (13) — 256 weights per super-block, 176 bytes per block
-        else if (pc.quantFormat == 13) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 176;
-            float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            float dmin = fp16_to_fp32(q.data[bs + 2], q.data[bs + 3]);
-            uint subBlock = eleInBlock / 32;
-            uint subEle = eleInBlock % 32;
-            uint scOffset = bs + 164 + subBlock * 2;
-            float sc = fp16_to_fp32(q.data[scOffset], q.data[scOffset + 1]);
-            uint nibble = 0;
-            if (subBlock < 4) {
-                uint byteIdx = bs + 4 + subBlock * 20 + subEle / 2;
-                uint8_t bval = q.data[byteIdx];
-                uint lo4 = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-                uint hiByteIdx = bs + 4 + 80 + subBlock * 8 + subEle / 2;
-                uint8_t bvalHi = q.data[hiByteIdx];
-                uint hi4 = (subEle % 2 == 0) ? (bvalHi & 0x0Fu) : ((bvalHi >> 4) & 0x0Fu);
-                nibble = lo4 | (hi4 << 4);
-            } else {
-                uint byteIdx = bs + 4 + 112 + subEle / 2;
-                uint8_t bval = q.data[byteIdx];
-                nibble = (subEle % 2 == 0) ? (bval & 0x0Fu) : ((bval >> 4) & 0x0Fu);
-            }
-            if (nibble >= 16) nibble |= 0xFFFFFFF0u;
-            Out.data[i] = sc * float(int(nibble)) * d - dmin;
-        }
-        // Q6_K (14) — 256 weights per super-block, 210 bytes per block
-        else if (pc.quantFormat == 14) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 210;
-
-            float d = fp16_to_fp32(q.data[bs + 208], q.data[bs + 209]);
-
-            uint subBlock = eleInBlock / 16;
-            int sc = sign_extend_u8(q.data[bs + 192 + subBlock]);
-
-            uint qlByteIdx = eleInBlock / 2;
-            uint8_t q4raw = q.data[bs + 0 + qlByteIdx];
-            uint q4 = (eleInBlock & 1u) == 0u ? (q4raw & 0x0Fu) : (q4raw >> 4);
-
-            uint qhByteIdx = eleInBlock / 4;
-            uint8_t qhByte = q.data[bs + 128 + qhByteIdx];
-            uint qhShift = (eleInBlock & 3u) * 2;
-
-            int val = int(q4 | (((qhByte >> qhShift) & 3) << 4)) - 32;
-
-            Out.data[i] = d * float(sc) * float(val);
-        }
-        // Q8_K (15) — 256 weights per super-block, 290 bytes per block
-        else if (pc.quantFormat == 15) {
-            uint blockIdx = gi / 256;
-            uint eleInBlock = gi % 256;
-            uint bs = blockIdx * 290;
-            float d = fp16_to_fp32(q.data[bs], q.data[bs + 1]);
-            uint subBlock = eleInBlock / 32;
-            uint subEle = eleInBlock % 32;
-            int sc = sign_extend_u8(q.data[bs + 2 + subBlock]);
-            int qval = sign_extend_u8(q.data[bs + 10 + subBlock * 32 + subEle]);
-            Out.data[i] = d * float(sc) * float(qval);
-        }
-        // Fallback
-        else {
-            Out.data[i] = 0.0f;
-        }
+        int q5 = (q4 | (highBit << 4)) - 16;
+        dst.data[globalIdx] = subScale * float(q5) - subMin;
+    }
+    else if (pc.quantFormat == 14u) {
+        // Q6_K: 256-element super-block, d-last layout
+        // block_q6_k: { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; fp16_t d; } = 210 bytes
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint subBlock = elemInSuper / 16u;
+        uint sbOffset = superBlock * 210u;
+        float d = readF16(src, sbOffset + 208u);
+        int sc = int(readByte(src, sbOffset + 192u + subBlock));
+        uint loIdx = sbOffset + (elemInSuper / 2u);
+        uint hiIdx = sbOffset + 128u + (elemInSuper / 4u);
+        uint loByte = readByte(src, loIdx);
+        uint hiByte = readByte(src, hiIdx);
+        int lo2 = int((loByte >> ((elemInSuper & 1u) * 4u)) & 0xF);
+        int hi2 = int((hiByte >> ((elemInSuper & 3u) * 2u)) & 0x3);
+        int q = ((hi2 << 4) | lo2) - 32;
+        dst.data[globalIdx] = d * float(sc) * float(q);
+    }
+    else if (pc.quantFormat == 30u) {
+        // BF16: top 16 bits of F32 stored as 16-bit. Shift left 16 bits → F32.
+        uint byteOffset = globalIdx * 2u;
+        uint raw16 = readU16(src, byteOffset);
+        dst.data[globalIdx] = uintBitsToFloat(raw16 << 16u);
+    }
+    else if (pc.quantFormat == 15u) {
+        // Q8_K: 256-element super-block
+        // block_q8_k: { float d; int8_t qs[256]; int16_t bsums[16]; } = 292 bytes
+        uint superBlock = globalIdx / 256u;
+        uint elemInSuper = globalIdx % 256u;
+        uint sbOffset = superBlock * 292u;
+        float d = uintBitsToFloat(
+            readByte(src, sbOffset)
+            | (readByte(src, sbOffset + 1u) << 8u)
+            | (readByte(src, sbOffset + 2u) << 16u)
+            | (readByte(src, sbOffset + 3u) << 24u));
+        int q = int(readByte(src, sbOffset + 4u + elemInSuper));
+        dst.data[globalIdx] = d * float(q);
+    }
+    else {
+        // Unknown format: output zeros
+        dst.data[globalIdx] = 0.0;
     }
 }

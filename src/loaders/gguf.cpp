@@ -30,7 +30,7 @@ GGUFQuantMeta getQuantMeta(GGUFTensorType type) {
         case GGUFTensorType::Q4_K:    return {type, 256, 144};
         case GGUFTensorType::Q5_K:    return {type, 256, 176};
         case GGUFTensorType::Q6_K:    return {type, 256, 210};
-        case GGUFTensorType::Q8_K:    return {type, 256, 256};
+        case GGUFTensorType::Q8_K:    return {type, 256, 292};
         case GGUFTensorType::BF16:    return {type, 1, 2};
         default:                      return {type, 1, 4};
     }

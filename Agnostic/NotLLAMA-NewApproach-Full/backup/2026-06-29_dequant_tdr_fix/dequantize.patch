@@ -1,0 +1,22 @@
+diff --git a/src/kernels/dequantize.comp b/src/kernels/dequantize.comp
+index 785cb0b..4dae169 100644
+--- a/src/kernels/dequantize.comp
++++ b/src/kernels/dequantize.comp
+@@ -5,7 +5,7 @@
+ #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+ #extension GL_EXT_scalar_block_layout : require
+ 
+-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
+     uint data[];
+@@ -69,7 +69,7 @@ void main() {
+         uint qhShift = (eleInBlock & 3u) * 2;
+ 
+         int val = int((q4 | (((qhByte >> qhShift) & 3) << 4))) - 32;
+-        Out.data[i] = d * float(sc) * float(val);
++        Out.data[i] = d * float(val);
+     }
+     // Q8_0 (8) — 32 elements per block, 34 bytes
+     else if (pc.quantFormat == 8) {
