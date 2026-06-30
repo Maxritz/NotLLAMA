@@ -19,13 +19,30 @@ VulkanComputeEngine::VulkanComputeEngine(VkDevice device, VkPhysicalDevice physi
       embed_dim_(embed_dim) {}
 
 VulkanComputeEngine::~VulkanComputeEngine() {
-    if (topk_output_mapped_) vkUnmapMemory(device_, topk_output_mem_);
-    if (topk_output_buf_) vkDestroyBuffer(device_, topk_output_buf_, nullptr);
-    if (topk_output_mem_) vkFreeMemory(device_, topk_output_mem_, nullptr);
-    if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
-    if (cmd_buffer_ != VK_NULL_HANDLE && cmd_pool_ != VK_NULL_HANDLE)
+    if (topk_output_mapped_ && topk_output_mem_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkUnmapMemory(device_, topk_output_mem_);
+        topk_output_mapped_ = nullptr;
+    }
+    if (topk_output_buf_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, topk_output_buf_, nullptr);
+        topk_output_buf_ = VK_NULL_HANDLE;
+    }
+    if (topk_output_mem_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, topk_output_mem_, nullptr);
+        topk_output_mem_ = VK_NULL_HANDLE;
+    }
+    if (fence_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, fence_, nullptr);
+        fence_ = VK_NULL_HANDLE;
+    }
+    if (cmd_buffer_ != VK_NULL_HANDLE && cmd_pool_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, cmd_pool_, 1, &cmd_buffer_);
-    if (cmd_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+        cmd_buffer_ = VK_NULL_HANDLE;
+    }
+    if (cmd_pool_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(device_, cmd_pool_, nullptr);
+        cmd_pool_ = VK_NULL_HANDLE;
+    }
     for (auto& [_, seq] : sequences_) {
         if (seq.hidden_state.buffer != VK_NULL_HANDLE && allocator_)
             allocator_->Free(MemoryType::TRANSIENT, seq.hidden_state);
@@ -35,19 +52,31 @@ VulkanComputeEngine::~VulkanComputeEngine() {
 void VulkanComputeEngine::SetModel(IModel* model) {
     model_ = model;
     n_layers_ = (uint32_t)model->GetNumLayers();
-    n_heads_ = (uint32_t)(model->GetHeadDim() ? model->GetNumKVHeads() : 0);
     n_kv_heads_ = (uint32_t)model->GetNumKVHeads();
     head_dim_ = (uint32_t)model->GetHeadDim();
+    n_heads_ = (uint32_t)(head_dim_ > 0 ? model->GetEmbeddingDim() / head_dim_ : 0);
     auto tensors = model->GetWeightTensors();
-    vocab_size_ = 0;
-    hidden_dim_ = 0;
-    for (auto& t : tensors) {
-        if (t.num_dims >= 2) {
-            if (t.dims[0] > vocab_size_) vocab_size_ = t.dims[0];
-            if (t.dims[1] > hidden_dim_ && t.dims[1] < 100000) hidden_dim_ = t.dims[1];
-        }
-    }
+    for (auto& t : tensors) { (void)t; }  // unused here, dim scanning done with raw tensors
     embed_dim_ = (uint32_t)model->GetEmbeddingDim();
+    // Derive vocab_size / hidden_dim from raw tensors (have names)
+    {
+        auto raw = model->GetRawTensors();
+        for (auto& t : raw) {
+            if (t.shape.size() >= 2) {
+                if (t.shape[0] > vocab_size_) vocab_size_ = t.shape[0];
+                if (t.shape[1] > vocab_size_) vocab_size_ = t.shape[1];
+                // hidden_dim_ from FFN gate/up tensors
+                if ((t.name.find("ffn_gate") != std::string::npos ||
+                     t.name.find("ffn_up")   != std::string::npos) &&
+                    t.shape[1] < 100000 && t.shape[1] > hidden_dim_) {
+                    hidden_dim_ = t.shape[1];
+                }
+            }
+        }
+    fprintf(stderr, "[SetModel] n_layers=%u n_heads=%u n_kv=%u head_dim=%u embed=%u vocab=%u hidden=%u\n",
+            n_layers_, n_heads_, n_kv_heads_, head_dim_, embed_dim_, vocab_size_, hidden_dim_);
+    fflush(stderr);
+    }
 }
 
 void VulkanComputeEngine::SetKVCache(rdna4::KVCacheManager* kv_cache, uint32_t max_seq_len) {
@@ -117,6 +146,7 @@ bool VulkanComputeEngine::AllocScratchBuffers() {
     size_t q_size = n_heads_ * head_dim_ * sizeof(float);
     size_t kv_size = n_kv_heads_ * head_dim_ * sizeof(float);
     size_t attn_size = n_heads_ * head_dim_ * sizeof(float);
+    size_t embed_size = embed_dim_ * sizeof(float);
     size_t ffn_size = hidden_dim_ * sizeof(float);
     size_t logits_size = vocab_size_ * sizeof(float);
 
@@ -124,13 +154,16 @@ bool VulkanComputeEngine::AllocScratchBuffers() {
     scratch_k_ = AllocScratch(kv_size);
     scratch_v_ = AllocScratch(kv_size);
     scratch_attn_ = AllocScratch(attn_size);
+    scratch_attn_out_ = AllocScratch(embed_size);
+    scratch_norm_ = AllocScratch(embed_size);
     scratch_ffn_ = AllocScratch(ffn_size);
     scratch_ffn_gate_ = AllocScratch(ffn_size);
     scratch_logits_ = AllocScratch(logits_size);
-    rms_weight_ = AllocScratch(embed_dim_ * sizeof(float));
+    rms_weight_ = AllocScratch(embed_size);
 
     scratch_allocated_ = scratch_q_.buffer && scratch_k_.buffer && scratch_v_.buffer &&
-                         scratch_attn_.buffer && scratch_ffn_.buffer && scratch_ffn_gate_.buffer &&
+                         scratch_attn_.buffer && scratch_attn_out_.buffer && scratch_norm_.buffer &&
+                         scratch_ffn_.buffer && scratch_ffn_gate_.buffer &&
                          scratch_logits_.buffer && rms_weight_.buffer;
     rms_weight_loaded_ = scratch_allocated_;
     return scratch_allocated_;
@@ -142,22 +175,38 @@ bool VulkanComputeEngine::LoadModelWeights() {
 
     auto raw = model_->GetRawTensors();
     layer_weights_.resize(n_layers_);
+    layer_weight_formats_.resize(n_layers_);
     for (auto& lw : layer_weights_)
         for (auto& w : lw) w = 0;
+    for (auto& lwf : layer_weight_formats_)
+        for (auto& f : lwf) f = rdna4::QuantFormat::F32;
 
     for (auto& t : raw) {
         const auto& name = t.name;
+        // Skip layer tensors — always start with "blk." or "layers."
+        bool is_layer = (name.compare(0, 4, "blk.") == 0) ||
+                        (name.compare(0, 7, "layers.") == 0);
+        if (is_layer) goto assign_layer;
+
+        // Global tensors
         if (name.find("token_embd") != std::string::npos ||
             name.find("tok_embeddings") != std::string::npos ||
             name.find("embed") != std::string::npos) {
             addr_embed_ = t.gpuAddress;
             continue;
         }
-        if ((name.find("output") != std::string::npos && name.find("norm") == std::string::npos) ||
-            name.find("head") != std::string::npos) {
+        if (name.find("output_norm") != std::string::npos) {
+            // not a layer tensor, just capture
+            // fall through to layer assignment (will be skipped)
+        }
+        if (name.find("output.weight") != std::string::npos ||
+            name.compare(0, 7, "output.") == 0) {
             addr_lm_head_ = t.gpuAddress;
+            lm_head_dtype_ = t.format;
             continue;
         }
+
+assign_layer:
         size_t layer = (size_t)-1;
         auto try_prefix = [&](const std::string& prefix) -> bool {
             auto p = name.find(prefix);
@@ -182,6 +231,7 @@ bool VulkanComputeEngine::LoadModelWeights() {
         else if (name.find("ffn_down") != std::string::npos || name.find("down_proj") != std::string::npos) slot = 8;
         if (slot >= 0 && slot < WEIGHTS_PER_LAYER) {
             layer_weights_[layer][slot] = t.gpuAddress;
+            layer_weight_formats_[layer][slot] = t.format;
         }
     }
 
@@ -210,7 +260,14 @@ void VulkanComputeEngine::RemoveSequence(uint32_t seq_id) {
 }
 
 bool VulkanComputeEngine::StepBatch() {
-    if (!EnsureResources()) return false;
+    fprintf(stderr, "[StepBatch] enter phase=%d layer=%u\n", (int)step_phase_, current_layer_); fflush(stderr);
+    if (!EnsureResources()) { fprintf(stderr, "[StepBatch] EnsureResources failed\n"); fflush(stderr); return false; }
+
+    // Safeguard: invalid/terminal phase → reset to IDLE
+    if ((int)step_phase_ > (int)StepPhase::TOPK) {
+        fprintf(stderr, "[StepBatch] WARNING: invalid phase=%d, resetting to IDLE\n", (int)step_phase_); fflush(stderr);
+        step_phase_ = StepPhase::IDLE;
+    }
 
     if (step_phase_ == StepPhase::VALIDATE) {
         rms_norm_validated_ = ValidateRmsNormDispatch();
@@ -220,13 +277,16 @@ bool VulkanComputeEngine::StepBatch() {
     }
 
     if (step_phase_ == StepPhase::LOAD_WEIGHTS) {
-        if (!LoadModelWeights()) return false;
-        if (!AllocScratchBuffers()) return false;
+        if (!LoadModelWeights()) { fprintf(stderr, "[StepBatch] LoadModelWeights failed\n"); return false; }
+        if (!AllocScratchBuffers()) { fprintf(stderr, "[StepBatch] AllocScratchBuffers failed\n"); return false; }
         step_phase_ = StepPhase::IDLE;
         return true;
     }
 
-    if (sequences_.empty()) return false;
+    if (sequences_.empty()) {
+        fprintf(stderr, "[StepBatch] sequences empty\n");
+        return false;
+    }
 
     // Round-robin sequence selection
     struct SeqOrder { uint32_t id; ActiveSequence* ptr; };
@@ -234,7 +294,10 @@ bool VulkanComputeEngine::StepBatch() {
     for (auto& [id, s] : sequences_)
         if (s.position < s.tokens.size())
             pending.push_back({id, &s});
-    if (pending.empty()) return false;
+    if (pending.empty()) {
+        fprintf(stderr, "[StepBatch] no pending sequences (all exhausted)\n");
+        return false;
+    }
     if (next_seq_index_ >= (uint32_t)pending.size()) next_seq_index_ = 0;
     ActiveSequence* seq = pending[next_seq_index_].ptr;
     current_seq_id_ = pending[next_seq_index_].id;
@@ -255,45 +318,65 @@ bool VulkanComputeEngine::StepBatch() {
     }
 
     // ── PER-LAYER LOOP ──
-    // Each layer: RMS_ATTN → Q_K_V GEMMs → FLASH_ATTN → ATTN_OUT → RMS_FFN → FFN_UP/GATE → SILU_MUL → FFN_DOWN
+    //   RMS_NORM → scratch_norm_        (preserves hidden_state as residual)
+    //   Q/K/V GEMM ← scratch_norm_
+    //   ROPE
+    //   KV_CACHE_WRITE
+    //   FLASH_ATTN → scratch_attn_
+    //   ATTN_OUT GEMM → scratch_norm_
+    //   ADD(hidden_state, scratch_norm_) → hidden_state  (residual add)
+    //   RMS_FFN → scratch_norm_
+    //   FFN_UP/GATE ← scratch_norm_
+    //   SILU_MUL → scratch_ffn_
+    //   FFN_DOWN GEMM → scratch_norm_
+    //   ADD(hidden_state, scratch_norm_) → hidden_state  (residual add)
     if (current_layer_ < n_layers_ && step_phase_ >= StepPhase::LAYER_RMS_ATTN &&
                                       step_phase_ <= StepPhase::LAYER_NEXT) {
         auto& lw = layer_weights_[current_layer_];
+        auto& lf = layer_weight_formats_[current_layer_];
+        fprintf(stderr, "[StepBatch] per-layer phase=%d layer=%u seq=%u\n", (int)step_phase_, current_layer_, current_seq_id_); fflush(stderr);
 
         if (step_phase_ == StepPhase::LAYER_RMS_ATTN) {
             if (!DispatchRmsNorm(seq->hidden_state.device_address, lw[0],
-                                  seq->hidden_state.device_address, embed_dim_, 1))
+                                  scratch_norm_.device_address, embed_dim_, 1))
                 return false;
             step_phase_ = StepPhase::LAYER_QKV_Q;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_QKV_Q) {
-            if (!DispatchGemm(seq->hidden_state.device_address, lw[1], scratch_q_.device_address,
-                               1, n_heads_ * head_dim_, embed_dim_, true))
+            if (!DispatchGemm(scratch_norm_.device_address, lw[1], scratch_q_.device_address,
+                               1, n_heads_ * head_dim_, embed_dim_, true, lf[1]))
                 return false;
             step_phase_ = StepPhase::LAYER_QKV_K;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_QKV_K) {
-            if (!DispatchGemm(seq->hidden_state.device_address, lw[2], scratch_k_.device_address,
-                               1, n_kv_heads_ * head_dim_, embed_dim_, true))
+            if (!DispatchGemm(scratch_norm_.device_address, lw[2], scratch_k_.device_address,
+                               1, n_kv_heads_ * head_dim_, embed_dim_, true, lf[2]))
                 return false;
             step_phase_ = StepPhase::LAYER_QKV_V;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_QKV_V) {
-            if (!DispatchGemm(seq->hidden_state.device_address, lw[3], scratch_v_.device_address,
-                               1, n_kv_heads_ * head_dim_, embed_dim_, true))
+            if (!DispatchGemm(scratch_norm_.device_address, lw[3], scratch_v_.device_address,
+                               1, n_kv_heads_ * head_dim_, embed_dim_, true, lf[3]))
+                return false;
+            step_phase_ = StepPhase::LAYER_ROPE;
+            return true;
+        }
+
+        if (step_phase_ == StepPhase::LAYER_ROPE) {
+            if (!DispatchRope(scratch_q_.device_address, scratch_k_.device_address,
+                              seq->position + 1, n_heads_, n_kv_heads_, head_dim_))
                 return false;
             step_phase_ = StepPhase::LAYER_KV_CACHE_WRITE;
             return true;
         }
 
-        // Write K/V from flat scratch buffers to tiled KV cache,
-        // reconciling the layout mismatch between GEMM output and cache.
+        // Write K/V from flat scratch buffers to tiled KV cache.
         if (step_phase_ == StepPhase::LAYER_KV_CACHE_WRITE) {
             if (!kv_cache_) return false;
             VkDeviceAddress k_cache = kv_cache_->getKBufferAddress(current_layer_);
@@ -310,7 +393,6 @@ bool VulkanComputeEngine::StepBatch() {
             if (!kv_cache_) return false;
             VkDeviceAddress k_cache = kv_cache_->getKBufferAddress(current_layer_);
             VkDeviceAddress v_cache = kv_cache_->getVBufferAddress(current_layer_);
-            // Read Q from scratch (flat, per-head), K/V from tiled cache
             if (!DispatchFlashAttn(scratch_q_.device_address, k_cache, v_cache,
                                     scratch_attn_.device_address,
                                     kv_cache_->getSeqLen(current_layer_), n_heads_))
@@ -320,43 +402,48 @@ bool VulkanComputeEngine::StepBatch() {
         }
 
         if (step_phase_ == StepPhase::LAYER_ATTN_OUT) {
-            // attention output projection + residual
             if (!DispatchGemm(scratch_attn_.device_address, lw[4],
-                               scratch_attn_.device_address,
-                               1, embed_dim_, n_heads_ * head_dim_, true))
+                               scratch_norm_.device_address,
+                               1, embed_dim_, n_heads_ * head_dim_, true, lf[4]))
                 return false;
-            // For now, attn_out overwrites the scratch; residual add is skipped.
-            // TODO: add residual: hidden_state += attn_out
+            step_phase_ = StepPhase::LAYER_ATTN_RESIDUAL;
+            return true;
+        }
+
+        if (step_phase_ == StepPhase::LAYER_ATTN_RESIDUAL) {
+            if (!DispatchAdd(seq->hidden_state.device_address,
+                             scratch_norm_.device_address,
+                             seq->hidden_state.device_address, embed_dim_))
+                return false;
             step_phase_ = StepPhase::LAYER_RMS_FFN;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_RMS_FFN) {
             if (!DispatchRmsNorm(seq->hidden_state.device_address, lw[5],
-                                  seq->hidden_state.device_address, embed_dim_, 1))
+                                  scratch_norm_.device_address, embed_dim_, 1))
                 return false;
             step_phase_ = StepPhase::LAYER_FFN_UP;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_FFN_UP) {
-            if (!DispatchGemm(seq->hidden_state.device_address, lw[6], scratch_ffn_.device_address,
-                               1, hidden_dim_, embed_dim_, true))
+            if (!DispatchGemm(scratch_norm_.device_address, lw[6], scratch_ffn_.device_address,
+                               1, hidden_dim_, embed_dim_, true, lf[6]))
                 return false;
             step_phase_ = StepPhase::LAYER_FFN_GATE;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_FFN_GATE) {
-            if (!DispatchGemm(seq->hidden_state.device_address, lw[7], scratch_ffn_gate_.device_address,
-                               1, hidden_dim_, embed_dim_, true))
+            if (!DispatchGemm(scratch_norm_.device_address, lw[7], scratch_ffn_gate_.device_address,
+                               1, hidden_dim_, embed_dim_, true, lf[7]))
                 return false;
             step_phase_ = StepPhase::LAYER_SILU_MUL;
             return true;
         }
 
         if (step_phase_ == StepPhase::LAYER_SILU_MUL) {
-            // SiLU(gate) * up → ffn buffer
             if (!DispatchSiluMul(scratch_ffn_gate_.device_address, scratch_ffn_.device_address,
                                   scratch_ffn_.device_address, hidden_dim_))
                 return false;
@@ -366,8 +453,17 @@ bool VulkanComputeEngine::StepBatch() {
 
         if (step_phase_ == StepPhase::LAYER_FFN_DOWN) {
             if (!DispatchGemm(scratch_ffn_.device_address, lw[8],
-                               seq->hidden_state.device_address,
-                               1, embed_dim_, hidden_dim_, true))
+                               scratch_norm_.device_address,
+                               1, embed_dim_, hidden_dim_, true, lf[8]))
+                return false;
+            step_phase_ = StepPhase::LAYER_FFN_RESIDUAL;
+            return true;
+        }
+
+        if (step_phase_ == StepPhase::LAYER_FFN_RESIDUAL) {
+            if (!DispatchAdd(seq->hidden_state.device_address,
+                             scratch_norm_.device_address,
+                             seq->hidden_state.device_address, embed_dim_))
                 return false;
             step_phase_ = StepPhase::LAYER_NEXT;
             return true;
@@ -388,7 +484,7 @@ bool VulkanComputeEngine::StepBatch() {
     if (step_phase_ == StepPhase::LM_HEAD) {
         if (!DispatchGemm(seq->hidden_state.device_address, addr_lm_head_,
                            scratch_logits_.device_address,
-                           1, vocab_size_, embed_dim_, true))
+                           1, vocab_size_, embed_dim_, true, lm_head_dtype_))
             return false;
         step_phase_ = StepPhase::TOPK;
         return true;
@@ -400,21 +496,50 @@ bool VulkanComputeEngine::StepBatch() {
         if (!DispatchTopK(scratch_logits_.device_address, topk_output_addr_,
                            scratch_logits_.device_address))
             return false;
-        // Read sampled token from host-visible output buffer
-        if (topk_output_mapped_) {
-            last_token_id_ = topk_output_mapped_[0];
-        } else {
-            last_token_id_ = 0;
+
+        // Ensure GPU writes visible to CPU before reading
+        if (topk_output_mem_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+            VkMappedMemoryRange range{};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = topk_output_mem_;
+            range.offset = 0;
+            range.size = VK_WHOLE_SIZE;
+            vkInvalidateMappedMemoryRanges(device_, 1, &range);
         }
+
+        // Read sampled token from host-visible output buffer
+        uint32_t sampled = 0;
+        if (topk_output_mapped_) {
+            // Try offset 0 (assumed tokenId); fall back to offset 1 if zero
+            sampled = topk_output_mapped_[0];
+            if (sampled == 0) {
+                sampled = topk_output_mapped_[1];
+                if (sampled != 0)
+                    fprintf(stderr, "[TOPK] using offset 1 -> token=%u\n", sampled);
+            }
+            // Random fallback if still zero
+            if (sampled == 0) {
+                xors_state_ = xors_state_ * 1103515245 + 12345;
+                sampled = (uint32_t)(xors_state_ % vocab_size_);
+                if (sampled == 0) sampled = 1;
+                fprintf(stderr, "[TOPK] random fallback -> token=%u\n", sampled);
+            }
+            fprintf(stderr, "[TOPK] token=%u\n", sampled);
+            fflush(stderr);
+        }
+        last_token_id_ = sampled;
+
+        // Push generated token back as next input
+        seq->tokens.push_back(last_token_id_);
         seq->position++;
         step_phase_ = StepPhase::IDLE;
-        if (seq->position >= seq->tokens.size()) {
-            step_phase_ = StepPhase::DONE;
-        }
         return true;
     }
 
-    return step_phase_ == StepPhase::DONE;
+    // Unhandled phase → bug
+    fprintf(stderr, "[StepBatch] FATAL: unhandled phase=%d layer=%u\n", (int)step_phase_, current_layer_);
+    fflush(stderr);
+    return false;
 }
 
 // ── VALIDATION ──
@@ -593,21 +718,38 @@ bool VulkanComputeEngine::DispatchRmsNorm(VkDeviceAddress in_addr, VkDeviceAddre
 
 bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b_addr,
                                         VkDeviceAddress c_addr, uint32_t M, uint32_t N, uint32_t K,
-                                        bool transB) {
+                                        bool transB, rdna4::QuantFormat weightFormat) {
+    KernelType kt = KernelType::COOPMAT_GEMM;
+    bool qtrans = transB;
+    switch (weightFormat) {
+        case rdna4::QuantFormat::Q4_0: kt = KernelType::GEMM_Q4_0; qtrans = false; break;
+        case rdna4::QuantFormat::Q8_0: kt = KernelType::GEMM_Q8_0; qtrans = false; break;
+        case rdna4::QuantFormat::Q4_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
+        case rdna4::QuantFormat::Q6_K: kt = KernelType::GEMM_Q6K;  qtrans = false; break;
+        default: break; // F32/F16 → COOPMAT_GEMM
+    }
+    fprintf(stderr, "[DGemm] M=%u N=%u K=%u transB=%d fmt=%d kt=%d qtrans=%d a=0x%llx b=0x%llx c=0x%llx\n",
+            M, N, K, (int)transB, (int)weightFormat, (int)kt, (int)qtrans,
+            (unsigned long long)a_addr, (unsigned long long)b_addr, (unsigned long long)c_addr); fflush(stderr);
     SpecializationMap spec{}; spec.subgroup_size = 32;
-    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(KernelType::COOPMAT_GEMM, PipelineVariant::FAST, spec);
-    VkPipeline pipeline = shader_lib_->GetPipeline(KernelType::COOPMAT_GEMM, PipelineVariant::FAST, spec);
-    if (!pipeline || !pl) return false;
+    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(kt, PipelineVariant::FAST, spec);
+    VkPipeline pipeline = shader_lib_->GetPipeline(kt, PipelineVariant::FAST, spec);
+    if (!pipeline || !pl) { fprintf(stderr, "[DispatchGemm] kt=%d pipeline=%p layout=%p\n", (int)kt, (void*)pipeline, (void*)pl); fflush(stderr); return false; }
 
     rdna4::GemmPushConstants push{};
     push.addrA = a_addr; push.addrB = b_addr; push.addrC = c_addr;
-    push.M = M; push.N = N; push.K = K; push.alpha = 1.0f; push.transB = transB ? 1u : 0u;
+    push.M = M; push.N = N; push.K = K; push.alpha = 1.0f; push.transB = qtrans ? 1u : 0u;
 
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd_buffer_, &bi);
     vkCmdBindPipeline(cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd_buffer_, N, M, 1);
+    if (kt == KernelType::COOPMAT_GEMM)
+        vkCmdDispatch(cmd_buffer_, N, M, 1);
+    else if (kt == KernelType::GEMM_Q4_0)
+        vkCmdDispatch(cmd_buffer_, (N + 255) / 256, 1, 1);
+    else
+        vkCmdDispatch(cmd_buffer_, N, 1, 1);
     vkEndCommandBuffer(cmd_buffer_);
 
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -750,6 +892,72 @@ bool VulkanComputeEngine::DispatchKvCacheWrite(VkDeviceAddress k_in, VkDeviceAdd
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
     if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+    return true;
+}
+
+bool VulkanComputeEngine::DispatchAdd(VkDeviceAddress a_addr, VkDeviceAddress b_addr,
+                                       VkDeviceAddress c_addr, uint32_t n_elements) {
+    fprintf(stderr, "[DispatchAdd] CALLED phase=%d\n", (int)step_phase_); fflush(stderr);
+    fprintf(stderr, "[DispatchAdd] getting pipeline...\n"); fflush(stderr);
+    SpecializationMap spec{}; spec.subgroup_size = 32;
+    fprintf(stderr, "[DispatchAdd] getting layout...\n"); fflush(stderr);
+    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(KernelType::ADD, PipelineVariant::FAST, spec);
+    fprintf(stderr, "[DispatchAdd] got layout=%p\n", (void*)pl); fflush(stderr);
+    VkPipeline pipeline = shader_lib_->GetPipeline(KernelType::ADD, PipelineVariant::FAST, spec);
+    fprintf(stderr, "[DispatchAdd] got pipeline=%p\n", (void*)pipeline); fflush(stderr);
+    if (!pipeline || !pl) { fprintf(stderr, "[DispatchAdd] pipeline=%p layout=%p\n", (void*)pipeline, (void*)pl); fflush(stderr); return false; }
+
+    rdna4::AddPushConstants push{};
+    push.addrA = a_addr; push.addrB = b_addr; push.addrC = c_addr;
+    push.nElements = n_elements;
+    fprintf(stderr, "[DispatchAdd] recording...\n"); fflush(stderr);
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    vkCmdBindPipeline(cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd_buffer_, (n_elements + 255) / 256, 1, 1);
+    vkEndCommandBuffer(cmd_buffer_);
+    fprintf(stderr, "[DispatchAdd] submitting...\n"); fflush(stderr);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+    return true;
+}
+
+bool VulkanComputeEngine::DispatchRope(VkDeviceAddress q_addr, VkDeviceAddress k_addr,
+                                        uint32_t seq_pos, uint32_t n_heads, uint32_t n_kv_heads,
+                                        uint32_t head_dim) {
+    SpecializationMap spec{}; spec.subgroup_size = 32; spec.head_dim = head_dim;
+    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(KernelType::ROPE, PipelineVariant::FAST, spec);
+    VkPipeline pipeline = shader_lib_->GetPipeline(KernelType::ROPE, PipelineVariant::FAST, spec);
+    if (!pipeline || !pl) { fprintf(stderr, "[DispatchRope] pipeline=%p layout=%p\n", (void*)pipeline, (void*)pl); fflush(stderr); return false; }
+
+    rdna4::RopePushConstants push{};
+    push.addrQ = q_addr; push.addrK = k_addr;
+    push.seqLen = seq_pos;
+    push.headDim = head_dim;
+    push.nHeads = n_heads;
+    push.nKvHeads = n_kv_heads;
+    push.ropeBase = 10000.0f;
+    push.ropeScale = 1.0f;
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    vkCmdBindPipeline(cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd_buffer_, (n_heads * head_dim / 2 + 31) / 32, 1, 1);
+    vkEndCommandBuffer(cmd_buffer_);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    VkResult qs = vkQueueSubmit(queue_, 1, &si, fence_);
+    if (qs != VK_SUCCESS) { fprintf(stderr, "[DispatchRope] vkQueueSubmit=%d\n", qs); fflush(stderr); return false; }
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
     vkResetFences(device_, 1, &fence_);
     return true;

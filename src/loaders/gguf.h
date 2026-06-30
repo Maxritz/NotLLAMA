@@ -67,14 +67,10 @@ public:
     ~GGUFLoader() = default;
 
     bool load(const std::string& path);
-    void uploadToGPU(VkDevice device, VkPhysicalDevice physDev,
-                     VkCommandPool pool, VkQueue queue);
 
     const GGUFMetadata& metadata() const { return meta_; }
     const std::vector<GGUFFakeTensor>& tensors() const { return tensors_; }
     const std::vector<uint8_t>& data() const { return data_; }
-    const std::vector<rdna4::GpuBuffer>& gpuBuffers() const { return gpuBuffers_; }
-    rdna4::GpuBuffer getTensorBuffer(const std::string& name) const;
     int tensorIndex(const std::string& name) const;
     void printInfo() const;
 
@@ -86,7 +82,6 @@ private:
     std::vector<GGUFFakeTensor> tensors_;
     std::unordered_map<std::string, int> tensorMap_;
     std::vector<uint8_t> data_;
-    std::vector<rdna4::GpuBuffer> gpuBuffers_;
     size_t dataSize_ = 0;
 };
 

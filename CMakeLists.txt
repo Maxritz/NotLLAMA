@@ -34,6 +34,7 @@ set(HOST_SRC
     src/host/allocator.cpp
     src/host/vgpr_stub.cpp
     src/host/turboquant_dispatch.cpp
+    src/loaders/gguf.cpp
     src/engine/vulkan_device.cpp
     src/engine/ring_allocator_adapter.cpp
     src/engine/vulkan_compute_engine.cpp

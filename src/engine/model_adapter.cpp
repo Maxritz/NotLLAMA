@@ -113,7 +113,11 @@ bool ModelAdapter::LoadFromGGUF(const std::string& path) {
         if (model_.tensors.empty()) return false;
         layers_loaded_.assign(model_.blockCount, false);
         return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[ModelAdapter] Exception in LoadFromGGUF: %s\n", e.what()); fflush(stderr);
+        return false;
     } catch (...) {
+        fprintf(stderr, "[ModelAdapter] Unknown exception in LoadFromGGUF\n"); fflush(stderr);
         return false;
     }
 }

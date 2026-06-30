@@ -5,9 +5,12 @@
 #include <cstring>
 #include <algorithm>
 #include <iostream>
+#include <cstdint>
+#include <string_view>
 
 #ifdef _MSC_VER
 #pragma warning(disable: 4996)
+#include <io.h>
 #endif
 
 namespace notllama {
@@ -47,6 +50,8 @@ static std::string readString(FILE* f) {
     if (len > 0 && fread(s.data(), 1, len, f) != len) return "";
     return s;
 }
+
+static bool skipValue(FILE* f, GGUFType type);
 
 static std::vector<std::string> readStringArray(FILE* f) {
     std::vector<std::string> out;
@@ -89,8 +94,23 @@ static bool skipValue(FILE* f, GGUFType type) {
     }
 }
 
+// Read an integer value whose GGUF type is known (handles uint32, uint64, int32, int64)
+static uint64_t readIntByType(FILE* f, GGUFType type) {
+    uint64_t val = 0;
+    switch (type) {
+        case GGUFType::UINT32: { uint32_t v; fread(&v, 4, 1, f); val = v; break; }
+        case GGUFType::INT32:  { int32_t  v; fread(&v, 4, 1, f); val = v; break; }
+        case GGUFType::UINT64: { uint64_t v; fread(&v, 8, 1, f); val = v; break; }
+        case GGUFType::INT64:  { int64_t  v; fread(&v, 8, 1, f); val = v; break; }
+        case GGUFType::FLOAT32: { float v; fread(&v, 4, 1, f); val = (uint64_t)v; break; }
+        default: skipValue(f, type); break;
+    }
+    return val;
+}
+
 bool GGUFLoader::load(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
+    fprintf(stderr, "[GGUF] load(%s) f=%p\n", path.c_str(), (void*)f); fflush(stderr);
     if (!f) {
         std::cerr << "GGUF: cannot open " << path << std::endl;
         return false;
@@ -107,9 +127,13 @@ bool GGUFLoader::load(const std::string& path) {
         fclose(f);
         return false;
     }
+    fprintf(stderr, "[GGUF] version=%u ok\n", version); fflush(stderr);
 
-    uint64_t nMetadata;
+    uint64_t nTensors_header, nMetadata;
+    readU64(f, nTensors_header);  // GGUF v3: tensor_count before metadata_kv_count
     readU64(f, nMetadata);
+    fprintf(stderr, "[GGUF] nTensors_header=%llu nMetadata=%llu\n",
+            (unsigned long long)nTensors_header, (unsigned long long)nMetadata); fflush(stderr);
 
     for (uint64_t i = 0; i < nMetadata; ++i) {
         std::string key = readString(f);
@@ -117,26 +141,34 @@ bool GGUFLoader::load(const std::string& path) {
         readU32(f, typeU32);
         GGUFType type = static_cast<GGUFType>(typeU32);
 
+        // Extract suffix after first dot for architecture-agnostic matching
+        size_t dot = key.find('.');
+        std::string_view suffix = (dot != std::string::npos)
+            ? std::string_view(key).substr(dot + 1) : std::string_view(key);
+
         if (key == "general.architecture") {
             meta_.architecture = readString(f);
-        } else if (key == "llama.embedding_length" || key == "qwen2.embedding_length") {
-            readU32(f, meta_.nEmbd);
-        } else if (key == "llama.attention.head_count" || key == "qwen2.attention.head_count") {
-            readU32(f, meta_.nHeads);
-        } else if (key == "llama.attention.head_count_kv" || key == "qwen2.attention.head_count_kv") {
-            readU32(f, meta_.nKVHeads);
-        } else if (key == "llama.block_count" || key == "qwen2.block_count") {
-            readU32(f, meta_.nLayers);
-        } else if (key == "llama.feed_forward_length" || key == "qwen2.feed_forward_length") {
-            readU32(f, meta_.nFF);
-        } else if (key == "llama.vocab_size" || key == "qwen2.vocab_size") {
-            readU32(f, meta_.nVocab);
-        } else if (key == "llama.context_length" || key == "qwen2.context_length") {
-            readU32(f, meta_.nCtx);
-        } else if (key == "llama.rope.freq_base" || key == "qwen2.rope.freq_base") {
-            readF32(f, meta_.ropeFreqBase);
-        } else if (key == "llama.rope.scale_linear" || key == "qwen2.rope.scale_linear") {
-            readF32(f, meta_.ropeScaling);
+            fprintf(stderr, "[GGUF] architecture=%s\n", meta_.architecture.c_str()); fflush(stderr);
+        } else if (suffix == "embedding_length" || suffix == "hidden_size") {
+            meta_.nEmbd = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "attention.head_count") {
+            meta_.nHeads = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "attention.head_count_kv") {
+            meta_.nKVHeads = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "block_count") {
+            meta_.nLayers = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "feed_forward_length" || suffix == "intermediate_size") {
+            meta_.nFF = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "vocab_size") {
+            meta_.nVocab = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "context_length" || suffix == "max_position_embeddings") {
+            meta_.nCtx = (uint32_t)readIntByType(f, type);
+        } else if (suffix == "rope.freq_base") {
+            if (type == GGUFType::FLOAT32) readF32(f, meta_.ropeFreqBase);
+            else skipValue(f, type);
+        } else if (suffix == "rope.scale_linear" || suffix == "rope.freq_scale") {
+            if (type == GGUFType::FLOAT32) readF32(f, meta_.ropeScaling);
+            else skipValue(f, type);
         } else if (key == "tokenizer.ggml.tokens") {
             meta_.tokens = readStringArray(f);
         } else if (key == "tokenizer.ggml.merges") {
@@ -158,8 +190,7 @@ bool GGUFLoader::load(const std::string& path) {
     if (meta_.nCtx == 0) meta_.nCtx = 2048;
     if (meta_.ropeFreqBase == 0) meta_.ropeFreqBase = 10000.0f;
 
-    uint64_t nTensors;
-    readU64(f, nTensors);
+    uint64_t nTensors = nTensors_header;
 
     tensors_.resize(nTensors);
     for (uint64_t i = 0; i < nTensors; ++i) {
@@ -176,14 +207,15 @@ bool GGUFLoader::load(const std::string& path) {
         tensorMap_[t.name] = static_cast<int>(i);
     }
 
-    long dataStart = ftell(f);
-    long aligned = (dataStart + 31) & ~31L;
-    if (aligned > dataStart) fseek(f, aligned - dataStart, SEEK_CUR);
-    dataStart = ftell(f);
+    int64_t dataStart = _ftelli64(f);
+    int64_t aligned = (dataStart + 31) & ~31LL;
+    if (aligned > dataStart) _fseeki64(f, aligned - dataStart, SEEK_CUR);
+    dataStart = _ftelli64(f);
 
-    fseek(f, 0, SEEK_END);
-    long fileSize = ftell(f);
-    dataSize_ = fileSize - dataStart;
+    _fseeki64(f, 0, SEEK_END);
+    int64_t fileSize = _ftelli64(f);
+    dataSize_ = (size_t)(fileSize - dataStart);
+    fprintf(stderr, "[GGUF] dataStart=%lld fileSize=%lld dataSize=%zu\n", (long long)dataStart, (long long)fileSize, dataSize_); fflush(stderr);
 
     for (auto& t : tensors_) {
         auto qm = getQuantMeta(t.type);
@@ -195,7 +227,7 @@ bool GGUFLoader::load(const std::string& path) {
     }
 
     data_.resize(dataSize_);
-    fseek(f, dataStart, SEEK_SET);
+    _fseeki64(f, dataStart, SEEK_SET);
     fread(data_.data(), 1, dataSize_, f);
     fclose(f);
 
@@ -208,6 +240,7 @@ bool GGUFLoader::load(const std::string& path) {
     return true;
 }
 
+#if 0  // Legacy upload path — not used by modular engine (uses WeightUploader::uploadTensor)
 void GGUFLoader::uploadToGPU(VkDevice dev, VkPhysicalDevice physDev,
                              VkCommandPool pool, VkQueue queue) {
     gpuBuffers_.resize(tensors_.size());
@@ -358,6 +391,7 @@ rdna4::GpuBuffer GGUFLoader::getTensorBuffer(const std::string& name) const {
     if (it == tensorMap_.end()) return {};
     return gpuBuffers_[it->second];
 }
+#endif  // Legacy upload path
 
 int GGUFLoader::tensorIndex(const std::string& name) const {
     auto it = tensorMap_.find(name);

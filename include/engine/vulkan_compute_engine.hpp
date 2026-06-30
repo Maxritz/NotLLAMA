@@ -39,6 +39,7 @@ public:
 
     // Results: valid after TOPK phase
     uint32_t LastTokenId() const { return last_token_id_; }
+    int GetPhase() const { return static_cast<int>(step_phase_); }
 
 private:
     VkDevice device_;
@@ -70,16 +71,20 @@ private:
     //   attn_norm, q_proj, k_proj, v_proj, attn_out, ffn_norm, ffn_up, ffn_gate, ffn_down
     static constexpr uint32_t WEIGHTS_PER_LAYER = 9;
     std::vector<std::array<VkDeviceAddress, WEIGHTS_PER_LAYER>> layer_weights_;
+    std::vector<std::array<rdna4::QuantFormat, WEIGHTS_PER_LAYER>> layer_weight_formats_;
 
     // Global weight addresses
     VkDeviceAddress addr_embed_ = 0;   // token_embd.weight [vocab, dim]
     VkDeviceAddress addr_lm_head_ = 0; // output.weight [dim, vocab]
+    rdna4::QuantFormat lm_head_dtype_ = rdna4::QuantFormat::F32;
 
     // Scratch buffers
     GpuAllocation scratch_q_;      // [n_heads * head_dim]
     GpuAllocation scratch_k_;      // [n_kv_heads * head_dim]
     GpuAllocation scratch_v_;      // [n_kv_heads * head_dim]
     GpuAllocation scratch_attn_;   // [n_heads * head_dim] (attention output)
+    GpuAllocation scratch_attn_out_;// [embed_dim] (attention-output GEMM output)
+    GpuAllocation scratch_norm_;   // [embed_dim] (RMS_NORM output, preserves hidden_state as residual)
     GpuAllocation scratch_ffn_;    // [hidden_dim] (FFN intermediate)
     GpuAllocation scratch_ffn_gate_;// [hidden_dim] (gate output)
     GpuAllocation scratch_logits_; // [vocab_size]
@@ -106,10 +111,12 @@ private:
         VALIDATE, LOAD_WEIGHTS, IDLE,
         EMBED,
         LAYER_RMS_ATTN, LAYER_QKV_Q, LAYER_QKV_K, LAYER_QKV_V,
-        LAYER_KV_CACHE_WRITE, LAYER_FLASH_ATTN, LAYER_ATTN_OUT, LAYER_RMS_FFN,
-        LAYER_FFN_UP, LAYER_FFN_GATE, LAYER_SILU_MUL, LAYER_FFN_DOWN,
+        LAYER_ROPE,
+        LAYER_KV_CACHE_WRITE, LAYER_FLASH_ATTN, LAYER_ATTN_OUT, LAYER_ATTN_RESIDUAL,
+        LAYER_RMS_FFN,
+        LAYER_FFN_UP, LAYER_FFN_GATE, LAYER_SILU_MUL, LAYER_FFN_DOWN, LAYER_FFN_RESIDUAL,
         LAYER_NEXT,
-        LM_HEAD, TOPK, DONE
+        LM_HEAD, TOPK
     };
     StepPhase step_phase_ = StepPhase::VALIDATE;
     uint32_t current_layer_ = 0;
@@ -139,7 +146,12 @@ private:
     bool DispatchRmsNorm(VkDeviceAddress in_addr, VkDeviceAddress weight_addr,
                          VkDeviceAddress out_addr, uint32_t row_size, uint32_t n_rows);
     bool DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b_addr, VkDeviceAddress c_addr,
-                       uint32_t M, uint32_t N, uint32_t K, bool transB = false);
+                       uint32_t M, uint32_t N, uint32_t K, bool transB = false,
+                       rdna4::QuantFormat weightFormat = rdna4::QuantFormat::F32);
+    bool DispatchAdd(VkDeviceAddress a_addr, VkDeviceAddress b_addr, VkDeviceAddress c_addr,
+                     uint32_t n_elements);
+    bool DispatchRope(VkDeviceAddress q_addr, VkDeviceAddress k_addr,
+                      uint32_t seq_pos, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim);
     bool DispatchFlashAttn(VkDeviceAddress q_addr, VkDeviceAddress k_addr,
                             VkDeviceAddress v_addr, VkDeviceAddress out_addr,
                             uint32_t seq_len, uint32_t n_q_rows);

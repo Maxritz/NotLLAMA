@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
     }
 
     // ── Engine ──
+    {
     notllama::RingAllocatorAdapter allocator(ctx.device, ctx.physicalDevice,
                                               512 * 1024 * 1024,
                                               256 * 1024 * 1024,
@@ -182,36 +183,25 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to add sequence\n"; ctx.cleanup(); return 1;
     }
 
-    // Step through validation + weight loading
-    fprintf(stderr, "[main] Starting StepBatch loop\n");
-    for (int i = 0; i < 5; i++) {
-        fprintf(stderr, "[main] StepBatch iter %d...\n", i);
-        if (!engine.StepBatch()) {
-            fprintf(stderr, "[main] StepBatch returned false at iter %d\n", i);
-            break;
-        }
-        fprintf(stderr, "[main] StepBatch iter %d OK\n", i);
-    }
-    fprintf(stderr, "[main] StepBatch loop done\n");
-
-    // ── Inference loop ──
+    // ── Generation loop ──
     printf("\nGenerating...\n");
     fprintf(stderr, "[main] Starting inference loop\n");
     auto t0 = std::chrono::steady_clock::now();
     uint32_t tokens_generated = 0;
     const uint32_t max_tokens = 128;
-    std::vector<uint32_t> output_ids = input_ids;
-
+    std::vector<uint32_t> output_ids;
+    output_ids.reserve(max_tokens);
+    uint32_t prev_token = UINT32_MAX;
     while (tokens_generated < max_tokens) {
         if (!engine.StepBatch()) {
             printf("[engine stopped at token %u]\n", tokens_generated);
             break;
         }
         uint32_t last_id = engine.LastTokenId();
-        if (tokens_generated > 0 || last_id != 0) {
+        if (last_id != prev_token) {
             output_ids.push_back(last_id);
             tokens_generated++;
-            engine.AddSequence(0, {last_id});
+            prev_token = last_id;
         }
     }
 
@@ -222,6 +212,7 @@ int main(int argc, char** argv) {
 
     std::string output = tokenizer.decode(output_ids);
     printf("\n--- Output ---\n%s\n---\n", output.c_str());
+    } // engine + allocator + desc_mgr destroyed here
 
     // ── Cleanup ──
     kv_cache.free();
