@@ -30,6 +30,7 @@ struct ModelDesc {
     uint32_t feedForwardLength;
     uint32_t headCount;
     uint32_t headCountKv;
+    uint32_t headDim;       // actual head dim, derived from Q weight shape (not embeddingLength/headCount)
     uint32_t vocabSize;
     uint32_t contextLength;
     std::vector<TensorDesc> tensors;
@@ -45,11 +46,16 @@ public:
         : device(dev), physicalDevice(pdev), queueFamilyIndex(qfi) {}
 
     ModelDesc load(const std::string& jsonPath, const std::string& binPath);
+    ModelDesc loadMetadata(const std::string& jsonPath, const std::string& binPath);
+    ModelDesc loadFromGGUF(const std::string& ggufPath, Tokenizer* tokenizer = nullptr);
+    bool uploadTensor(TensorDesc& desc);
+    bool uploadLayer(ModelDesc& model, uint32_t layerIndex);
     void loadTokenizer(Tokenizer& tokenizer, const nlohmann::json& tokenizerJson);
     void freeTensor(const TensorDesc& desc);
     void freeAll(ModelDesc& model);
 
 private:
+    std::vector<uint8_t> binData_;
     VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem);
 };
 

@@ -1,5 +1,6 @@
 #include "rdna4_weights.hpp"
 #include "rdna4_tokenizer.hpp"
+#include "loaders/gguf.h"
 #include <fstream>
 #include <iostream>
 #include <cstring>
@@ -309,6 +310,405 @@ static bool cpuDequantToFloat(const uint8_t* srcData, size_t srcSize,
     return false;
 }
 
+static std::string layerPrefix(uint32_t layerIndex) {
+    return "blk." + std::to_string(layerIndex) + ".";
+}
+
+static bool tensorBelongsToLayer(const std::string& name, uint32_t layerIndex) {
+    std::string prefix = layerPrefix(layerIndex);
+    return name.compare(0, prefix.size(), prefix) == 0;
+}
+
+ModelDesc WeightUploader::loadMetadata(const std::string& jsonPath, const std::string& binPath) {
+    std::ifstream jsonFile(jsonPath);
+    if (!jsonFile.is_open()) {
+        fprintf(stderr, "[uploader] Failed to open JSON: %s\n", jsonPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+    nlohmann::json j;
+    try {
+        jsonFile >> j;
+    } catch (const nlohmann::json::parse_error& e) {
+        fprintf(stderr, "[uploader] JSON parse error: %s\n", e.what()); fflush(stderr);
+        return ModelDesc();
+    }
+
+    ModelDesc model;
+    auto& m = j["model"];
+    model.architecture = m.value("architecture", "unknown");
+    model.blockCount = m.value("block_count", 0);
+    model.embeddingLength = m.value("embedding_length", 0);
+    model.feedForwardLength = m.value("feed_forward_length", 0);
+    model.headCount = m.value("attention.head_count", 0);
+    model.headCountKv = m.value("attention.head_count_kv", 0);
+    model.vocabSize = m.value("vocab_size", 0);
+    model.contextLength = m.value("context_length", 0);
+
+    fprintf(stderr, "[uploader] JSON parsed: %s | blocks=%u dim=%u heads=%u\n",
+            model.architecture.c_str(), model.blockCount, model.embeddingLength, model.headCount);
+    fflush(stderr);
+
+    std::ifstream binFile(binPath, std::ios::binary | std::ios::ate);
+    if (!binFile.is_open()) {
+        fprintf(stderr, "[uploader] Failed to open binary: %s\n", binPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+    std::streampos binEnd = binFile.tellg();
+    if (binEnd <= 0) {
+        fprintf(stderr, "[uploader] Binary file empty: %s\n", binPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+    size_t binSize = static_cast<size_t>(binEnd);
+    binFile.seekg(0, std::ios::beg);
+    try {
+        binData_.resize(binSize);
+    } catch (const std::bad_alloc&) {
+        fprintf(stderr, "[uploader] OOM: cannot allocate %zu MB for binary\n",
+                binSize / 1024 / 1024); fflush(stderr);
+        return ModelDesc();
+    }
+    binFile.read(reinterpret_cast<char*>(binData_.data()), binSize);
+    if (!binFile) {
+        fprintf(stderr, "[uploader] Failed to read %zu bytes from binary\n", binSize); fflush(stderr);
+        binData_.clear();
+        return ModelDesc();
+    }
+    fprintf(stderr, "[uploader] Binary loaded: %zu MB (deferred upload)\n", binSize / 1024 / 1024);
+    fflush(stderr);
+
+    size_t tensorIdx = 0;
+    size_t totalTensors = j["tensors"].size();
+    for (auto& t : j["tensors"]) {
+        TensorDesc desc;
+        desc.name = t.value("name", "");
+        desc.format = ggmlToQuantFormat(t.value("dtype_id", 0));
+        if (desc.format == QuantFormat::UNSUPPORTED) {
+            fprintf(stderr, "  [!] UNSUPPORTED format, skipping tensor\n"); fflush(stderr);
+            tensorIdx++;
+            continue;
+        }
+        desc.shape = t.value("shape", std::vector<uint32_t>{});
+        desc.nDims = t.value("n_dims", 0);
+        desc.sizeBytes = t.value<size_t>("size_bytes", 0);
+        desc.binOffset = t.value<size_t>("bin_offset", 0);
+        desc.binSize = t.value<size_t>("bin_size", 0);
+        desc.blockSize = t.value("quant_block_size", 1);
+        desc.blockElements = t.value("quant_block_elements", 1);
+        desc.gpuAddress = 0;
+        desc.buffer = VK_NULL_HANDLE;
+        desc.memory = VK_NULL_HANDLE;
+
+        if (desc.binOffset + desc.binSize > binSize) {
+            fprintf(stderr, "  [!] OUT OF BOUNDS: offset %zu + size %zu > binSize %zu\n",
+                    desc.binOffset, desc.binSize, binSize); fflush(stderr);
+            tensorIdx++;
+            continue;
+        }
+
+        model.tensors.push_back(desc);
+        tensorIdx++;
+    }
+
+    fprintf(stderr, "[uploader] Metadata loaded: %zu tensors (none uploaded yet)\n", model.tensors.size());
+    fflush(stderr);
+
+    // Derive headDim from Q weight shape
+    model.headDim = 0;
+    for (auto& t : model.tensors) {
+        if (t.name.find("blk.0.attn_q.weight") != std::string::npos && t.shape.size() == 2) {
+            model.headDim = t.shape[1] / model.headCount;
+            fprintf(stderr, "[uploader] Derived headDim=%u from Q weight shape [%u, %u]\n",
+                    model.headDim, t.shape[0], t.shape[1]);
+            break;
+        }
+    }
+    if (model.headDim == 0) {
+        model.headDim = model.embeddingLength / model.headCount;
+        fprintf(stderr, "[uploader] WARNING: Could not derive headDim, using dim/headCount=%u\n", model.headDim);
+    }
+
+    return model;
+}
+
+static void loadTokenizerFromGGUF(Tokenizer& tokenizer, const notllama::GGUFMetadata& meta) {
+    tokenizer.loadFromGGUF(meta.tokens, meta.merges, meta.bosId, meta.eosId, meta.padId, meta.unkId);
+}
+
+ModelDesc WeightUploader::loadFromGGUF(const std::string& ggufPath, Tokenizer* tokenizer) {
+    notllama::GGUFLoader loader;
+    if (!loader.load(ggufPath)) {
+        fprintf(stderr, "[uploader] Failed to load GGUF: %s\n", ggufPath.c_str()); fflush(stderr);
+        return ModelDesc();
+    }
+
+    const auto& meta = loader.metadata();
+    ModelDesc model;
+    model.architecture = meta.architecture;
+    model.blockCount = meta.nLayers;
+    model.embeddingLength = meta.nEmbd;
+    model.feedForwardLength = meta.nFF;
+    model.headCount = meta.nHeads;
+    model.headCountKv = meta.nKVHeads;
+    model.vocabSize = meta.nVocab;
+    model.contextLength = meta.nCtx;
+
+    const auto& tensors = loader.tensors();
+    model.tensors.reserve(tensors.size());
+    for (const auto& t : tensors) {
+        TensorDesc desc;
+        desc.name = t.name;
+        desc.format = ggmlToQuantFormat(static_cast<int>(t.type));
+        if (desc.format == QuantFormat::UNSUPPORTED) {
+            fprintf(stderr, "  [!] UNSUPPORTED GGUF format for %s, skipping\n", t.name.c_str());
+            fflush(stderr);
+            continue;
+        }
+        desc.shape.reserve(t.dims.size());
+        for (auto d : t.dims) desc.shape.push_back(static_cast<uint32_t>(d));
+        desc.nDims = static_cast<uint32_t>(t.dims.size());
+        desc.sizeBytes = t.nbytes;
+        desc.binOffset = t.offset;
+        desc.binSize = t.nbytes;
+        auto qm = notllama::getQuantMeta(t.type);
+        desc.blockSize = qm.blockSize;
+        desc.blockElements = qm.blockSize;
+        desc.gpuAddress = 0;
+        desc.buffer = VK_NULL_HANDLE;
+        desc.memory = VK_NULL_HANDLE;
+        model.tensors.push_back(desc);
+    }
+
+    // Derive headDim from Q weight shape [inDim, outDim] where outDim = n_heads * headDim
+    model.headDim = 0;
+    for (auto& t : model.tensors) {
+        if (t.name.find("blk.0.attn_q.weight") != std::string::npos && t.shape.size() == 2) {
+            if (model.headCount > 0) {
+                model.headDim = t.shape[1] / model.headCount;
+                fprintf(stderr, "[uploader] Derived headDim=%u from Q weight shape [%u, %u]\n",
+                        model.headDim, t.shape[0], t.shape[1]);
+            }
+            break;
+        }
+    }
+    if (model.headDim == 0 && model.headCount > 0) {
+        model.headDim = model.embeddingLength / model.headCount;
+        fprintf(stderr, "[uploader] WARNING: Could not derive headDim, using dim/headCount=%u\n", model.headDim);
+    }
+
+    binData_ = loader.data();
+    if (tokenizer) {
+        loadTokenizerFromGGUF(*tokenizer, meta);
+        fprintf(stderr, "[uploader] Tokenizer loaded: %zu tokens, %zu merges\n",
+                meta.tokens.size(), meta.merges.size());
+        fflush(stderr);
+    }
+    fprintf(stderr, "[uploader] GGUF loaded: %s | L=%u dim=%u heads=%u/%u | %zu tensors | %zu MB data (deferred upload)\n",
+            model.architecture.c_str(), model.blockCount, model.embeddingLength,
+            model.headCount, model.headCountKv, model.tensors.size(),
+            binData_.size() / 1024 / 1024);
+    fflush(stderr);
+    return model;
+}
+
+bool WeightUploader::uploadTensor(TensorDesc& desc) {
+    if (desc.binOffset + desc.binSize > binData_.size()) {
+        fprintf(stderr, "  [uploadTensor] OOB: offset %zu + size %zu > binData %zu\n",
+                desc.binOffset, desc.binSize, binData_.size()); fflush(stderr);
+        return false;
+    }
+
+    // Create device-local GPU buffer
+    VkDeviceAddress addr = 0;
+    VkDeviceMemory bufMem = VK_NULL_HANDLE;
+    VkBuffer buffer = createGpuBuffer(desc.binSize, &addr, &bufMem);
+    if (buffer == VK_NULL_HANDLE) {
+        fprintf(stderr, "  [uploadTensor] createGpuBuffer failed for %s\n", desc.name.c_str()); fflush(stderr);
+        return false;
+    }
+
+    // Create staging buffer
+    VkBufferCreateInfo stagingInfo = {};
+    stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingInfo.size = desc.binSize;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer staging;
+    VkResult r = vkCreateBuffer(device, &stagingInfo, nullptr, &staging);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "  [uploadTensor] staging buffer create failed: %d\n", r); fflush(stderr);
+        freeTensor(desc);
+        return false;
+    }
+
+    VkMemoryRequirements stagingMemReq;
+    vkGetBufferMemoryRequirements(device, staging, &stagingMemReq);
+
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+
+    uint32_t stagingMemType = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((stagingMemReq.memoryTypeBits & (1 << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
+            stagingMemType = i;
+            break;
+        }
+    }
+    if (stagingMemType == UINT32_MAX) {
+        fprintf(stderr, "  [uploadTensor] No HOST_VISIBLE|HOST_COHERENT memory\n"); fflush(stderr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    VkMemoryAllocateInfo stagingAlloc = {};
+    stagingAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    stagingAlloc.allocationSize = stagingMemReq.size;
+    stagingAlloc.memoryTypeIndex = stagingMemType;
+
+    VkDeviceMemory stagingMem;
+    r = vkAllocateMemory(device, &stagingAlloc, nullptr, &stagingMem);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "  [uploadTensor] staging memory alloc failed: %d\n", r); fflush(stderr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    r = vkBindBufferMemory(device, staging, stagingMem, 0);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "  [uploadTensor] staging bind failed: %d\n", r); fflush(stderr);
+        vkFreeMemory(device, stagingMem, nullptr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    void* mapped = nullptr;
+    r = vkMapMemory(device, stagingMem, 0, desc.binSize, 0, &mapped);
+    if (r != VK_SUCCESS || !mapped) {
+        fprintf(stderr, "  [uploadTensor] staging map failed: %d\n", r); fflush(stderr);
+        vkFreeMemory(device, stagingMem, nullptr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    std::memcpy(mapped, binData_.data() + desc.binOffset, desc.binSize);
+    vkUnmapMemory(device, stagingMem);
+
+    // Command pool + buffer for copy
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.queueFamilyIndex = queueFamilyIndex;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+
+    VkCommandPool copyPool;
+    r = vkCreateCommandPool(device, &poolInfo, nullptr, &copyPool);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "  [uploadTensor] command pool create failed: %d\n", r); fflush(stderr);
+        vkFreeMemory(device, stagingMem, nullptr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = copyPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer copyCmd;
+    r = vkAllocateCommandBuffers(device, &allocInfo, &copyCmd);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "  [uploadTensor] command buffer alloc failed: %d\n", r); fflush(stderr);
+        vkDestroyCommandPool(device, copyPool, nullptr);
+        vkFreeMemory(device, stagingMem, nullptr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(copyCmd, &beginInfo);
+
+    VkBufferCopy copyRegion = {};
+    copyRegion.size = desc.binSize;
+    vkCmdCopyBuffer(copyCmd, staging, buffer, 1, &copyRegion);
+    vkEndCommandBuffer(copyCmd);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &copyCmd;
+
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence;
+    vkCreateFence(device, &fenceInfo, nullptr, &fence);
+
+    VkQueue submitQueue;
+    vkGetDeviceQueue(device, queueFamilyIndex, 0, &submitQueue);
+    vkQueueSubmit(submitQueue, 1, &submitInfo, fence);
+    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    vkDestroyFence(device, fence, nullptr);
+    vkFreeCommandBuffers(device, copyPool, 1, &copyCmd);
+    vkDestroyCommandPool(device, copyPool, nullptr);
+    vkFreeMemory(device, stagingMem, nullptr);
+    vkDestroyBuffer(device, staging, nullptr);
+
+    desc.buffer = buffer;
+    desc.gpuAddress = addr;
+    desc.memory = bufMem;
+
+    fprintf(stderr, "  [uploadTensor] %s uploaded @ 0x%llx (%zu bytes, format=%u)\n",
+            desc.name.c_str(), (unsigned long long)addr, desc.binSize, (uint32_t)desc.format);
+    fflush(stderr);
+
+    return true;
+}
+
+bool WeightUploader::uploadLayer(ModelDesc& model, uint32_t layerIndex) {
+    uint32_t count = 0;
+    uint32_t totalTensors = 0;
+
+    for (auto& t : model.tensors) {
+        if (!tensorBelongsToLayer(t.name, layerIndex))
+            continue;
+
+        totalTensors++;
+        // Skip if already uploaded (gpuAddress != 0)
+        if (t.gpuAddress != 0) {
+            count++;
+            continue;
+        }
+
+        if (uploadTensor(t)) {
+            count++;
+        } else {
+            fprintf(stderr, "  [uploadLayer] FAILED: %s (layer %u)\n", t.name.c_str(), layerIndex);
+            fflush(stderr);
+        }
+    }
+
+    if (totalTensors == 0) {
+        fprintf(stderr, "[uploadLayer] No tensors found for layer %u\n", layerIndex);
+        fflush(stderr);
+        return false;
+    }
+
+    fprintf(stderr, "[uploadLayer] Layer %u: %u/%u tensors uploaded\n", layerIndex, count, totalTensors);
+    fflush(stderr);
+
+    return count > 0;
+}
+
 ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& binPath) {
     std::ifstream jsonFile(jsonPath);
     if (!jsonFile.is_open()) {
@@ -564,6 +964,23 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
     vkDestroyCommandPool(device, uploadPool, nullptr);
 
     fprintf(stderr, "[uploader] Model ready: %zu tensors\n", model.tensors.size()); fflush(stderr);
+
+    // Derive headDim from Q weight shape [inDim, outDim] where outDim = n_heads * headDim
+    model.headDim = 0;
+    for (auto& t : model.tensors) {
+        if (t.name.find("blk.0.attn_q.weight") != std::string::npos && t.shape.size() == 2) {
+            // Weight is [inDim, outDim] — outDim = n_heads * headDim
+            model.headDim = t.shape[1] / model.headCount;
+            fprintf(stderr, "[uploader] Derived headDim=%u from Q weight shape [%u, %u]\n",
+                    model.headDim, t.shape[0], t.shape[1]);
+            break;
+        }
+    }
+    if (model.headDim == 0) {
+        model.headDim = model.embeddingLength / model.headCount;
+        fprintf(stderr, "[uploader] WARNING: Could not derive headDim from weights, using dim/headCount=%u\n", model.headDim);
+    }
+
     return model;
 }
 

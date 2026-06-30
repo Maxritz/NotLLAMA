@@ -67,7 +67,7 @@ void Scheduler::dispatch(VkPipeline pipeline, VkPipelineLayout layout,
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     if (pushConstants && pcSize > 0) {
-        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pushConstants);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<uint32_t>(pcSize), pushConstants);
     }
     vkCmdDispatch(cmd, gx, gy, gz);
 
@@ -123,7 +123,7 @@ void Scheduler::dispatchTimed(const std::string& name, Profiler* profiler,
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     if (pushConstants && pcSize > 0) {
-        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pushConstants);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<uint32_t>(pcSize), pushConstants);
     }
     vkCmdDispatch(cmd, gx, gy, gz);
 

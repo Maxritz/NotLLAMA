@@ -31,18 +31,26 @@ struct GGUFQuantMeta {
 GGUFQuantMeta getQuantMeta(GGUFTensorType type);
 
 struct GGUFMetadata {
-    uint32_t nParams;
-    uint32_t nLayers;
-    uint32_t nHeads;
-    uint32_t nKVHeads;
-    uint32_t nEmbd;
-    uint32_t nFF;
-    uint32_t nVocab;
-    uint32_t nCtx;
-    float ropeFreqBase;
-    float ropeScaling;
-    uint32_t headDim;
+    uint32_t nParams = 0;
+    uint32_t nLayers = 0;
+    uint32_t nHeads = 0;
+    uint32_t nKVHeads = 0;
+    uint32_t nEmbd = 0;
+    uint32_t nFF = 0;
+    uint32_t nVocab = 0;
+    uint32_t nCtx = 0;
+    float ropeFreqBase = 10000.0f;
+    float ropeScaling = 1.0f;
+    uint32_t headDim = 0;
     std::string architecture;
+
+    // Tokenizer data (populated when present in GGUF metadata)
+    std::vector<std::string> tokens;
+    std::vector<std::string> merges;
+    uint32_t bosId = 1;
+    uint32_t eosId = 2;
+    uint32_t padId = 0;
+    uint32_t unkId = 3;
 };
 
 struct GGUFFakeTensor {
@@ -63,6 +71,8 @@ public:
                      VkCommandPool pool, VkQueue queue);
 
     const GGUFMetadata& metadata() const { return meta_; }
+    const std::vector<GGUFFakeTensor>& tensors() const { return tensors_; }
+    const std::vector<uint8_t>& data() const { return data_; }
     const std::vector<rdna4::GpuBuffer>& gpuBuffers() const { return gpuBuffers_; }
     rdna4::GpuBuffer getTensorBuffer(const std::string& name) const;
     int tensorIndex(const std::string& name) const;

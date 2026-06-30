@@ -1,0 +1,60 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer QRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer KRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrQ;
+    uint64_t addrK;
+    uint seqLen;
+    uint headDim;
+    uint nHeads;
+    uint nKvHeads;
+    float ropeBase;
+    float ropeScale;
+} pc;
+
+void main() {
+    // One thread per even/odd pair — avoids a read-after-write race between
+    // the two threads that touch the same pair.
+    uint pairIdx = gl_GlobalInvocationID.x;
+    uint pairsPerHead = pc.headDim / 2u;
+    uint totalPairs = pc.nHeads * pairsPerHead;
+    if (pairIdx >= totalPairs) return;
+
+    uint head = pairIdx / pairsPerHead;
+    uint pair = pairIdx % pairsPerHead;
+    uint d0 = pair * 2u;
+    uint d1 = d0 + 1u;
+    uint kvHead = head / (pc.nHeads / pc.nKvHeads);
+
+    QRef Q = QRef(pc.addrQ);
+    KRef K = KRef(pc.addrK);
+
+    float theta = pow(pc.ropeBase, -float(d0) / float(pc.headDim));
+    float angle = float(pc.seqLen - 1) * theta * pc.ropeScale;
+    float cosA = cos(angle);
+    float sinA = sin(angle);
+
+    uint qBase = (pc.seqLen - 1) * pc.nHeads * pc.headDim + head * pc.headDim + d0;
+    float q0 = Q.data[qBase];
+    float q1 = Q.data[qBase + 1u];
+    Q.data[qBase]      = q0 * cosA - q1 * sinA;
+    Q.data[qBase + 1u] = q1 * cosA + q0 * sinA;
+
+    uint kBase = (pc.seqLen - 1) * pc.nKvHeads * pc.headDim + kvHead * pc.headDim + d0;
+    float k0 = K.data[kBase];
+    float k1 = K.data[kBase + 1u];
+    K.data[kBase]      = k0 * cosA - k1 * sinA;
+    K.data[kBase + 1u] = k1 * cosA + k0 * sinA;
+}

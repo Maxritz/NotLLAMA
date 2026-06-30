@@ -33,7 +33,7 @@ bool PipelineBuilder::loadShader(const std::string& name, const std::string& spv
     return true;
 }
 
-bool PipelineBuilder::createComputePipeline(const std::string& name, size_t pushConstantSize) {
+bool PipelineBuilder::createComputePipeline(const std::string& name, uint32_t pushConstantSize) {
     auto it = modules.find(name);
     if (it == modules.end()) {
         std::cerr << "Shader module not loaded: " << name << "\n";

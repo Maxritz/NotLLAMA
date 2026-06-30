@@ -22,6 +22,23 @@ static_assert(offsetof(GemmPushConstants, K) == 32, "K offset mismatch");
 static_assert(offsetof(GemmPushConstants, transB) == 40, "transB offset mismatch");
 static_assert(sizeof(GemmPushConstants) <= 128, "GemmPushConstants exceeds 128 bytes");
 
+// Batched prefill matmul — identical layout to GemmPushConstants.
+// M > 1 for prefill, M = 1 for generation (same as gemm).
+struct MatMulPushConstants {
+    uint64_t addrA;    // input [M, K]
+    uint64_t addrB;    // weight [N, K] row-major
+    uint64_t addrC;    // output [M, N]
+    uint32_t M;        // number of tokens (rows)
+    uint32_t N;        // output dimension (columns)
+    uint32_t K;        // input dimension (reduction)
+    float alpha;       // output scale
+    uint32_t transB;   // 0 = B[N,K] row-major
+};
+static_assert(sizeof(MatMulPushConstants) == sizeof(GemmPushConstants),
+    "MatMulPushConstants must match GemmPushConstants layout");
+static_assert(sizeof(MatMulPushConstants) <= 128,
+    "MatMulPushConstants exceeds 128 bytes");
+
 struct AttentionPushConstants {
     uint64_t addrQ, addrK, addrV, addrOut;
     uint32_t seqLen, headDim, nHeads, nKvHeads, headIndex;
@@ -114,6 +131,7 @@ struct KVCacheWritePushConstants {
     uint32_t seqPos;
     uint32_t headDim;
     uint32_t nKvHeads;
+    uint32_t maxSeq;      // per-head stride = maxSeq * headDim
 };
 
 struct BdaTestPushConstants {
@@ -223,5 +241,49 @@ struct GemmTurboPushConstants {
 }; // 52 bytes under scalar layout
 static_assert(sizeof(GemmTurboPushConstants) <= 128,
     "GemmTurboPushConstants must fit in 128 bytes");
+
+// ── KV cache quantize Q8_0 push constants ─────────────────────────
+struct KVCacheQuantizeQ80PushConstants {
+    uint64_t addrSrc;       // F32 KV cache input
+    uint64_t addrDst;       // Q8_0 packed output
+    uint64_t addrScales;    // F16 scales output
+    uint32_t seqLen;        // Number of tokens
+    uint32_t nHeads;        // Number of KV heads
+    uint32_t headDim;       // Head dimension
+}; // 36 bytes
+static_assert(sizeof(KVCacheQuantizeQ80PushConstants) <= 128,
+    "KVCacheQuantizeQ80PushConstants must fit in 128 bytes");
+
+// ── RMS norm + multiply fusion push constants ─────────────────────
+struct RmsNormMulPushConstants {
+    uint64_t addrX;         // Input tensor
+    uint64_t addrScale;     // Scale tensor
+    uint64_t addrOut;       // Output tensor
+    uint32_t dim;           // Hidden dimension
+    float    eps;           // Epsilon
+}; // 28 bytes
+static_assert(sizeof(RmsNormMulPushConstants) <= 128,
+    "RmsNormMulPushConstants must fit in 128 bytes");
+
+// ── Copy/conversion push constants ────────────────────────────────
+struct CpyPushConstants {
+    uint64_t addrSrc;
+    uint64_t addrDst;
+    uint32_t n;
+}; // 20 bytes
+static_assert(sizeof(CpyPushConstants) <= 128,
+    "CpyPushConstants must fit in 128 bytes");
+
+// ── Add + RMS norm fusion push constants ──────────────────────────
+struct AddRmsNormPushConstants {
+    uint64_t addrX;         // Input tensor
+    uint64_t addrResidual;  // Residual tensor
+    uint64_t addrNorm;      // Norm weight
+    uint64_t addrOut;       // Output tensor
+    uint32_t dim;           // Hidden dimension
+    float    eps;           // Epsilon
+}; // 36 bytes
+static_assert(sizeof(AddRmsNormPushConstants) <= 128,
+    "AddRmsNormPushConstants must fit in 128 bytes");
 
 } // namespace rdna4

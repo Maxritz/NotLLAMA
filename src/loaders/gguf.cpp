@@ -48,6 +48,20 @@ static std::string readString(FILE* f) {
     return s;
 }
 
+static std::vector<std::string> readStringArray(FILE* f) {
+    std::vector<std::string> out;
+    uint32_t arrType;
+    uint64_t arrLen;
+    if (!readU32(f, arrType) || !readU64(f, arrLen)) return out;
+    if (static_cast<GGUFType>(arrType) != GGUFType::STRING) {
+        for (uint64_t i = 0; i < arrLen; ++i) skipValue(f, static_cast<GGUFType>(arrType));
+        return out;
+    }
+    out.reserve(arrLen);
+    for (uint64_t i = 0; i < arrLen; ++i) out.push_back(readString(f));
+    return out;
+}
+
 static bool skipValue(FILE* f, GGUFType type) {
     switch (type) {
         case GGUFType::UINT8: case GGUFType::INT8: case GGUFType::BOOL: {
@@ -121,6 +135,20 @@ bool GGUFLoader::load(const std::string& path) {
             readU32(f, meta_.nCtx);
         } else if (key == "llama.rope.freq_base" || key == "qwen2.rope.freq_base") {
             readF32(f, meta_.ropeFreqBase);
+        } else if (key == "llama.rope.scale_linear" || key == "qwen2.rope.scale_linear") {
+            readF32(f, meta_.ropeScaling);
+        } else if (key == "tokenizer.ggml.tokens") {
+            meta_.tokens = readStringArray(f);
+        } else if (key == "tokenizer.ggml.merges") {
+            meta_.merges = readStringArray(f);
+        } else if (key == "tokenizer.ggml.bos_token_id") {
+            readU32(f, meta_.bosId);
+        } else if (key == "tokenizer.ggml.eos_token_id") {
+            readU32(f, meta_.eosId);
+        } else if (key == "tokenizer.ggml.padding_token_id") {
+            readU32(f, meta_.padId);
+        } else if (key == "tokenizer.ggml.unknown_token_id") {
+            readU32(f, meta_.unkId);
         } else {
             skipValue(f, type);
         }

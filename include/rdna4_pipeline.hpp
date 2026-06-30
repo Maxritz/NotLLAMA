@@ -17,7 +17,7 @@ public:
     PipelineBuilder(VkDevice dev) : device(dev) {}
 
     bool loadShader(const std::string& name, const std::string& spvPath);
-    bool createComputePipeline(const std::string& name, size_t pushConstantSize);
+    bool createComputePipeline(const std::string& name, uint32_t pushConstantSize);
 
     VkPipeline getPipeline(const std::string& name) const;
     VkPipelineLayout getLayout(const std::string& name) const;
