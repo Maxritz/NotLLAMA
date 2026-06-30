@@ -141,6 +141,11 @@ bool GGUFLoader::load(const std::string& path) {
         readU32(f, typeU32);
         GGUFType type = static_cast<GGUFType>(typeU32);
 
+        // Print EVERY key before processing
+        fprintf(stderr, "[GGUF META %3llu] key='%s' type=%u ",
+                (unsigned long long)i, key.c_str(), typeU32);
+        fflush(stderr);
+
         // Extract suffix after first dot for architecture-agnostic matching
         size_t dot = key.find('.');
         std::string_view suffix = (dot != std::string::npos)
@@ -148,42 +153,57 @@ bool GGUFLoader::load(const std::string& path) {
 
         if (key == "general.architecture") {
             meta_.architecture = readString(f);
-            fprintf(stderr, "[GGUF] architecture=%s\n", meta_.architecture.c_str()); fflush(stderr);
+            fprintf(stderr, "val='%s'\n", meta_.architecture.c_str());
         } else if (suffix == "embedding_length" || suffix == "hidden_size") {
             meta_.nEmbd = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nEmbd);
         } else if (suffix == "attention.head_count") {
             meta_.nHeads = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nHeads);
         } else if (suffix == "attention.head_count_kv") {
             meta_.nKVHeads = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nKVHeads);
         } else if (suffix == "block_count") {
             meta_.nLayers = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nLayers);
         } else if (suffix == "feed_forward_length" || suffix == "intermediate_size") {
             meta_.nFF = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nFF);
         } else if (suffix == "vocab_size") {
             meta_.nVocab = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nVocab);
         } else if (suffix == "context_length" || suffix == "max_position_embeddings") {
             meta_.nCtx = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.nCtx);
         } else if (suffix == "rope.freq_base") {
-            if (type == GGUFType::FLOAT32) readF32(f, meta_.ropeFreqBase);
-            else skipValue(f, type);
+            if (type == GGUFType::FLOAT32) { readF32(f, meta_.ropeFreqBase); fprintf(stderr, "val=%f\n", meta_.ropeFreqBase); }
+            else { skipValue(f, type); fprintf(stderr, "skipped\n"); }
         } else if (suffix == "rope.scale_linear" || suffix == "rope.freq_scale") {
-            if (type == GGUFType::FLOAT32) readF32(f, meta_.ropeScaling);
-            else skipValue(f, type);
+            if (type == GGUFType::FLOAT32) { readF32(f, meta_.ropeScaling); fprintf(stderr, "val=%f\n", meta_.ropeScaling); }
+            else { skipValue(f, type); fprintf(stderr, "skipped\n"); }
         } else if (key == "tokenizer.ggml.tokens") {
             meta_.tokens = readStringArray(f);
+            fprintf(stderr, "val=[%zu strings]\n", meta_.tokens.size());
         } else if (key == "tokenizer.ggml.merges") {
             meta_.merges = readStringArray(f);
+            fprintf(stderr, "val=[%zu strings]\n", meta_.merges.size());
         } else if (key == "tokenizer.ggml.bos_token_id") {
-            readU32(f, meta_.bosId);
+            meta_.bosId = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.bosId);
         } else if (key == "tokenizer.ggml.eos_token_id") {
-            readU32(f, meta_.eosId);
+            meta_.eosId = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.eosId);
         } else if (key == "tokenizer.ggml.padding_token_id") {
-            readU32(f, meta_.padId);
+            meta_.padId = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.padId);
         } else if (key == "tokenizer.ggml.unknown_token_id") {
-            readU32(f, meta_.unkId);
+            meta_.unkId = (uint32_t)readIntByType(f, type);
+            fprintf(stderr, "val=%u\n", meta_.unkId);
         } else {
             skipValue(f, type);
+            fprintf(stderr, "skipped\n");
         }
+        fflush(stderr);
     }
 
     if (meta_.nHeads > 0 && meta_.nEmbd > 0) meta_.headDim = meta_.nEmbd / meta_.nHeads;
