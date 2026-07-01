@@ -29,6 +29,11 @@ public:
     bool UploadGlobalWeights();
     const void* GetWeightShadowCopy(const std::string& tensor_name) override;
 
+    // Weight loading mode: vram (free RAM copy), mirror (keep shadow), lazy (on-demand)
+    void SetLoadMode(rdna4::WeightLoadMode mode) { uploader_.SetLoadMode(mode); }
+    rdna4::WeightLoadMode GetLoadMode() const { return uploader_.GetLoadMode(); }
+    void OnAllLayersUploaded() { uploader_.OnAllLayersUploaded(model_); }
+
     rdna4::Tokenizer& GetTokenizer() { return tokenizer_; }
 
 private:

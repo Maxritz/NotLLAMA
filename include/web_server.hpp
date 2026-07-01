@@ -1,7 +1,7 @@
 #pragma once
 #include "multi_model_manager.hpp"
 #include "model_router.hpp"
-#include "mtp_engine.hpp"
+#include "inference_runner.hpp"
 #include <string>
 #include <functional>
 #include <thread>
@@ -71,7 +71,7 @@ class WebServer {
 public:
     WebServer(MultiModelManager* model_mgr,
               ModelRouter* router,
-              MTPEngine* mtp,
+              InferenceRunner* inference,
               const std::string& host = "127.0.0.1",
               int32_t port = 8080,
               int32_t timeout_seconds = 600);
@@ -101,7 +101,7 @@ private:
     MultiModelManager* model_mgr_;
     AgentHandlerFn agent_handler_;
     ModelRouter* router_;
-    MTPEngine* mtp_;
+    InferenceRunner* inference_;
     std::string host_;
     int32_t port_;
     int32_t timeout_seconds_;

@@ -36,6 +36,13 @@ struct ModelDesc {
     std::vector<TensorDesc> tensors;
 };
 
+// Weight loading strategy
+enum class WeightLoadMode {
+    VRAM,    // Upload to GPU, free system RAM copy immediately (fastest inference)
+    MIRROR,  // Keep system RAM shadow copy for layer swapping (default)
+    LAZY     // Upload on first use, lowest startup memory
+};
+
 class WeightUploader {
 public:
     VkDevice device;
@@ -54,8 +61,26 @@ public:
     void freeTensor(const TensorDesc& desc);
     void freeAll(ModelDesc& model);
 
+    // Set loading strategy (call before load/loadFromGGUF)
+    void SetLoadMode(WeightLoadMode mode) { load_mode_ = mode; }
+    WeightLoadMode GetLoadMode() const { return load_mode_; }
+
+    // After all requested layers are uploaded, apply load-mode policy
+    //   VRAM:  free system RAM copy
+    //   MIRROR: keep system RAM copy (default)
+    //   LAZY:   no-op (layers uploaded on demand)
+    void OnAllLayersUploaded(ModelDesc& model);
+
+    // Force free the system RAM copy (use when switching to VRAM-only mode)
+    void FreeSystemRAMCopy();
+
+    // Check if a tensor's data is still available in system RAM
+    bool HasSystemRAMCopy() const { return !binData_.empty(); }
+
 private:
     std::vector<uint8_t> binData_;
+    WeightLoadMode load_mode_ = WeightLoadMode::MIRROR;
+
     VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem);
 };
 

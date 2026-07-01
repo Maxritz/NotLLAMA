@@ -67,6 +67,9 @@ struct CLIOptions {
     bool special = false;                         // --special
     std::string output_format = "text";           // --output-format (text/json)
 
+    // Weight loading mode
+    std::string load_mode = "mirror";             // --load-mode (vram|mirror|lazy)
+
     // Performance options
     int32_t threads = -1;                         // --threads / -t (-1 = auto)
     int32_t threads_batch = -1;                   // --threads-batch

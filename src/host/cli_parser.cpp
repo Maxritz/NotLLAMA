@@ -96,6 +96,9 @@ bool CLIParser::Parse(int argc, char** argv, CLIOptions& out) {
         else if (arg == "--draft-model" && i + 1 < argc) {
             out.draft_model = argv[++i];
         }
+        else if (arg == "--load-mode" && i + 1 < argc) {
+            out.load_mode = argv[++i];
+        }
         else if ((arg == "--gpu-layers" || arg == "-ngl") && i + 1 < argc) {
             if (!ParseInt(argv[++i], out.gpu_layers)) {
                 fprintf(stderr, "Error: Invalid --gpu-layers value\n"); return false;
@@ -434,6 +437,10 @@ void CLIParser::PrintHelp(const char* program_name) {
     "      --model-id ID         Label for the model (default: filename)\n"
     "      --model-tags TAGS     Comma-separated tags (e.g., \"code,python\")\n"
     "      --draft-model FNAME   Draft model for speculative decoding\n"
+    "      --load-mode MODE      Weight loading: vram|mirror|lazy (default: mirror)\n"
+    "                            vram  = upload to VRAM, free RAM copy immediately\n"
+    "                            mirror= keep RAM shadow copy for layer swapping\n"
+    "                            lazy  = upload on first use (lowest startup RAM)\n"
     "  -ngl, --gpu-layers N      GPU layers to offload (-1 = all, 0 = CPU only)\n"
     "      --split-mode MODE      How to split VRAM/RAM: 'layer' or 'row' (default: layer)\n"
     "      --spill-dir PATH       Directory to page layers to when RAM full\n"
