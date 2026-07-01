@@ -1,0 +1,57 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Q1_0: 1-bit per element, 128-element blocks, FP16 scale
+// Block size: 2 bytes scale + 128 bits = 2 + 16 = 18 bytes
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef { uint data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HiddenRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer OutRef { float data[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA; uint64_t addrB; uint64_t addrC;
+    uint M; uint N; uint K;
+    float alpha; uint transB;
+} pc;
+
+uint extractByte(WeightRef buf, uint byteOff) {
+    uint word = buf.data[byteOff >> 2];
+    return (word >> ((byteOff & 3u) << 3u)) & 0xFFu;
+}
+float readF16(WeightRef buf, uint byteOff) {
+    return float(float16_t(extractByte(buf, byteOff) | (extractByte(buf, byteOff + 1u) << 8u)));
+}
+float dequantQ1_0(WeightRef buf, uint blockOffset, uint elemInBlock) {
+    float d = readF16(buf, blockOffset);
+    uint byteIdx = blockOffset + 2u + (elemInBlock >> 3u);
+    uint rawByte = extractByte(buf, byteIdx);
+    uint bit = (rawByte >> (elemInBlock & 7u)) & 1u;
+    int q = int(bit) * 2 - 1;
+    return d * float(q);
+}
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.N || pc.transB != 0u) return;
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) { OutRef outBuf = OutRef(pc.addrC); outBuf.data[col] = 0.0; }
+        return;
+    }
+    WeightRef weight = WeightRef(pc.addrB);
+    HiddenRef hidden = HiddenRef(pc.addrA);
+    OutRef outBuf = OutRef(pc.addrC);
+    uint blocksPerCol = (pc.K + 127u) >> 7;
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; ++k) {
+        uint blockIdx = k >> 7;
+        uint elemInBlock = k & 127u;
+        uint blockOffset = (col * blocksPerCol + blockIdx) * 18u;
+        float w = dequantQ1_0(weight, blockOffset, elemInBlock);
+        sum += w * hidden.data[k];
+    }
+    outBuf.data[col] = pc.alpha * sum;
+}

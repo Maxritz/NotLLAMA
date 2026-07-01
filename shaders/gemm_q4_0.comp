@@ -6,7 +6,7 @@
 #extension GL_EXT_scalar_block_layout : require
 
 // Per-thread matvec: each thread computes one output column.
-// Dispatch: ((N + 255) / 256, 1, 1) workgroups, so GPU never sees N workgroups.
+// Dispatch: ((N + 255) / 256, 1, 1) workgroups.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef {
@@ -31,7 +31,8 @@ layout(push_constant, scalar) uniform PushConstants {
 } pc;
 
 uint extractByte(WeightRef buf, uint byteOff) {
-    uint word = buf.data[byteOff >> 2];
+    uint wordIdx = byteOff >> 2;
+    uint word = buf.data[wordIdx];
     return (word >> ((byteOff & 3u) << 3u)) & 0xFFu;
 }
 
@@ -43,7 +44,7 @@ float readF16(WeightRef buf, uint byteOff) {
 
 float dequantQ4_0(WeightRef buf, uint blockOffset, uint elemInBlock) {
     float d = readF16(buf, blockOffset);
-    uint byteIdx = blockOffset + 2u + (elemInBlock / 2u);
+    uint byteIdx = blockOffset + 2u + (elemInBlock >> 1u);
     uint rawByte = extractByte(buf, byteIdx);
     int q;
     if ((elemInBlock & 1u) == 0u) {
@@ -56,20 +57,44 @@ float dequantQ4_0(WeightRef buf, uint blockOffset, uint elemInBlock) {
 
 void main() {
     uint col = gl_GlobalInvocationID.x;
+
     if (col >= pc.N || pc.transB != 0u) return;
+
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) {
+            OutRef outBuf = OutRef(pc.addrC);
+            outBuf.data[col] = 0.0;
+        }
+        return;
+    }
 
     WeightRef weight = WeightRef(pc.addrB);
     HiddenRef hidden = HiddenRef(pc.addrA);
     OutRef outBuf = OutRef(pc.addrC);
 
-    uint blocksPerCol = (pc.K + 31u) / 32u;
+    uint blocksPerCol = (pc.K + 31u) >> 5;
     float sum = 0.0;
 
-    for (uint k = 0; k < pc.K; ++k) {
-        uint blockIdx = k / 32u;
-        uint elemInBlock = k % 32u;
+    uint k = 0;
+    for (; k + 1 < pc.K; k += 2) {
+        uint blockIdx0 = k >> 5;
+        uint elem0 = k & 31u;
+        uint blockOffset0 = (col * blocksPerCol + blockIdx0) * 18u;
+        float w0 = dequantQ4_0(weight, blockOffset0, elem0);
+
+        uint k1 = k + 1;
+        uint blockIdx1 = k1 >> 5;
+        uint elem1 = k1 & 31u;
+        uint blockOffset1 = (blockIdx1 == blockIdx0) ? blockOffset0 : (col * blocksPerCol + blockIdx1) * 18u;
+        float w1 = dequantQ4_0(weight, blockOffset1, elem1);
+
+        sum += w0 * hidden.data[k] + w1 * hidden.data[k1];
+    }
+    if (k < pc.K) {
+        uint blockIdx = k >> 5;
+        uint elem = k & 31u;
         uint blockOffset = (col * blocksPerCol + blockIdx) * 18u;
-        float w = dequantQ4_0(weight, blockOffset, elemInBlock);
+        float w = dequantQ4_0(weight, blockOffset, elem);
         sum += w * hidden.data[k];
     }
 

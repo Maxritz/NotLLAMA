@@ -47,6 +47,7 @@ set(HOST_SRC
     src/engine/vulkan_device.cpp
     src/engine/ring_allocator_adapter.cpp
     src/engine/vulkan_compute_engine.cpp
+    src/engine/layer_swap_manager.cpp
     src/engine/tokenizer_adapter.cpp
     src/engine/model_adapter.cpp
     src/engine/kv_cache_adapter.cpp

@@ -5,6 +5,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
+// Q8_0: 32-element blocks, 34 bytes each (2 byte F16 scale + 32 x int8)
+// Per-thread matvec like Q4_0, but no nibble unpacking needed.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef {
@@ -45,51 +47,47 @@ float dequantQ8_0(WeightRef buf, uint blockOffset, uint elemInBlock) {
     return d * float(q);
 }
 
-shared float partial[256];
-
 void main() {
-    uint col = gl_WorkGroupID.x;
+    uint col = gl_GlobalInvocationID.x;
     if (col >= pc.N || pc.transB != 0u) return;
-    uint tid = gl_LocalInvocationIndex;
+
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) {
+            OutRef outBuf = OutRef(pc.addrC);
+            outBuf.data[col] = 0.0;
+        }
+        return;
+    }
 
     WeightRef weight = WeightRef(pc.addrB);
     HiddenRef hidden = HiddenRef(pc.addrA);
     OutRef outBuf = OutRef(pc.addrC);
 
+    uint blocksPerCol = (pc.K + 31u) >> 5;
     float sum = 0.0;
-    uint numBlocks = pc.K / 256u;
-    uint remainder = pc.K % 256u;
-    uint blocksPerCol = (pc.K + 31u) / 32u;
 
-    for (uint b = 0; b < numBlocks; b++) {
-        uint globalElem = b * 256u + tid;
-        uint elemInBlock = tid % 32u;
-        uint blockOffset = (col * blocksPerCol + globalElem / 32u) * 34u;
-        float w = dequantQ8_0(weight, blockOffset, elemInBlock);
-        float h = hidden.data[globalElem];
-        sum += w * h;
+    uint k = 0;
+    for (; k + 1 < pc.K; k += 2) {
+        uint blockIdx0 = k >> 5;
+        uint elem0 = k & 31u;
+        uint blockOffset0 = (col * blocksPerCol + blockIdx0) * 34u;
+        float w0 = dequantQ8_0(weight, blockOffset0, elem0);
+
+        uint k1 = k + 1;
+        uint blockIdx1 = k1 >> 5;
+        uint elem1 = k1 & 31u;
+        uint blockOffset1 = (blockIdx1 == blockIdx0) ? blockOffset0 : (col * blocksPerCol + blockIdx1) * 34u;
+        float w1 = dequantQ8_0(weight, blockOffset1, elem1);
+
+        sum += w0 * hidden.data[k] + w1 * hidden.data[k1];
+    }
+    if (k < pc.K) {
+        uint blockIdx = k >> 5;
+        uint elem = k & 31u;
+        uint blockOffset = (col * blocksPerCol + blockIdx) * 34u;
+        float w = dequantQ8_0(weight, blockOffset, elem);
+        sum += w * hidden.data[k];
     }
 
-    if (tid < remainder) {
-        uint globalElem = numBlocks * 256u + tid;
-        uint elemInBlock = tid % 32u;
-        uint blockOffset = (col * blocksPerCol + globalElem / 32u) * 34u;
-        float w = dequantQ8_0(weight, blockOffset, elemInBlock);
-        float h = hidden.data[globalElem];
-        sum += w * h;
-    }
-
-    partial[tid] = sum;
-    barrier();
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        barrier();
-    }
-
-    if (tid == 0) {
-        outBuf.data[col] = pc.alpha * partial[0];
-    }
+    outBuf.data[col] = pc.alpha * sum;
 }

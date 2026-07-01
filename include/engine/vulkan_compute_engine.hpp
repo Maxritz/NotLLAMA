@@ -73,9 +73,18 @@ private:
     std::vector<std::array<VkDeviceAddress, WEIGHTS_PER_LAYER>> layer_weights_;
     std::vector<std::array<rdna4::QuantFormat, WEIGHTS_PER_LAYER>> layer_weight_formats_;
 
+    // Layer weight GPU allocations (for cleanup)
+    std::vector<GpuAllocation> layer_weight_allocs_;
+
+    // MoE layer detection
+    std::vector<bool> layer_is_moe_;
+    std::vector<VkDeviceAddress> layer_moe_gate_;
+    std::vector<rdna4::QuantFormat> layer_moe_gate_fmt_;
+
     // Global weight addresses
     VkDeviceAddress addr_embed_ = 0;   // token_embd.weight [vocab, dim]
     VkDeviceAddress addr_lm_head_ = 0; // output.weight [dim, vocab]
+    VkDeviceAddress addr_output_norm_ = 0;
     rdna4::QuantFormat lm_head_dtype_ = rdna4::QuantFormat::F32;
 
     // Scratch buffers

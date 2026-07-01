@@ -19,6 +19,31 @@ VulkanComputeEngine::VulkanComputeEngine(VkDevice device, VkPhysicalDevice physi
       embed_dim_(embed_dim) {}
 
 VulkanComputeEngine::~VulkanComputeEngine() {
+    if (allocator_) {
+        if (scratch_q_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_q_);
+        if (scratch_k_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_k_);
+        if (scratch_v_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_v_);
+        if (scratch_attn_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_attn_);
+        if (scratch_attn_out_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_attn_out_);
+        if (scratch_norm_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_norm_);
+        if (scratch_ffn_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_ffn_);
+        if (scratch_ffn_gate_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_ffn_gate_);
+        if (scratch_logits_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_logits_);
+        if (rms_weight_.buffer) allocator_->Free(MemoryType::TRANSIENT, rms_weight_);
+    }
+
+    for (auto& [_, seq] : sequences_) {
+        if (seq.hidden_state.buffer != VK_NULL_HANDLE && allocator_)
+            allocator_->Free(MemoryType::TRANSIENT, seq.hidden_state);
+    }
+    sequences_.clear();
+
+    for (auto& lw : layer_weight_allocs_) {
+        if (lw.buffer && allocator_)
+            allocator_->Free(MemoryType::WEIGHT, lw);
+    }
+    layer_weight_allocs_.clear();
+
     if (topk_output_mapped_ && topk_output_mem_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
         vkUnmapMemory(device_, topk_output_mem_);
         topk_output_mapped_ = nullptr;
@@ -42,10 +67,6 @@ VulkanComputeEngine::~VulkanComputeEngine() {
     if (cmd_pool_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, cmd_pool_, nullptr);
         cmd_pool_ = VK_NULL_HANDLE;
-    }
-    for (auto& [_, seq] : sequences_) {
-        if (seq.hidden_state.buffer != VK_NULL_HANDLE && allocator_)
-            allocator_->Free(MemoryType::TRANSIENT, seq.hidden_state);
     }
 }
 
@@ -217,32 +238,47 @@ bool VulkanComputeEngine::LoadModelWeights() {
     for (auto& lwf : layer_weight_formats_)
         for (auto& f : lwf) f = rdna4::QuantFormat::F32;
 
+    layer_is_moe_.resize(n_layers_, false);
+    layer_moe_gate_.resize(n_layers_, 0);
+    layer_moe_gate_fmt_.resize(n_layers_, rdna4::QuantFormat::F32);
+
+    bool found_embed = false;
+    bool found_output = false;
+    VkDeviceAddress embed_addr = 0;
+
     for (auto& t : raw) {
         const auto& name = t.name;
-        // Skip layer tensors — always start with "blk." or "layers."
-        bool is_layer = (name.compare(0, 4, "blk.") == 0) ||
-                        (name.compare(0, 7, "layers.") == 0);
-        if (is_layer) goto assign_layer;
-
-        // Global tensors
         if (name.find("token_embd") != std::string::npos ||
             name.find("tok_embeddings") != std::string::npos ||
             name.find("embed") != std::string::npos) {
             addr_embed_ = t.gpuAddress;
+            embed_addr = t.gpuAddress;
+            found_embed = true;
             continue;
         }
         if (name.find("output_norm") != std::string::npos) {
-            // not a layer tensor, just capture
-            // fall through to layer assignment (will be skipped)
+            addr_output_norm_ = t.gpuAddress;
+            continue;
         }
         if (name.find("output.weight") != std::string::npos ||
             name.compare(0, 7, "output.") == 0) {
             addr_lm_head_ = t.gpuAddress;
             lm_head_dtype_ = t.format;
+            found_output = true;
             continue;
         }
+    }
 
-assign_layer:
+    if (!found_output || addr_lm_head_ == 0) {
+        addr_lm_head_ = embed_addr;
+        lm_head_dtype_ = rdna4::QuantFormat::F32;
+        fprintf(stderr, "[LoadModelWeights] Weight tying detected: output.weight -> token_embd.weight (addr=0x%llx)\n",
+                (unsigned long long)addr_lm_head_);
+    }
+
+    for (auto& t : raw) {
+        const auto& name = t.name;
+
         size_t layer = (size_t)-1;
         auto try_prefix = [&](const std::string& prefix) -> bool {
             auto p = name.find(prefix);
@@ -256,19 +292,64 @@ assign_layer:
         if (layer >= n_layers_) continue;
 
         int slot = -1;
-        if (name.find("attn_norm") != std::string::npos && name.find("post_attn") == std::string::npos && name.find("post_ffw") == std::string::npos) slot = 0;
-        else if ((name.ends_with("attn_q.weight") || name.ends_with("q_proj.weight")) || (name.find("attn_q.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 1;
-        else if ((name.ends_with("attn_k.weight") || name.ends_with("k_proj.weight")) || (name.find("attn_k.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 2;
-        else if ((name.ends_with("attn_v.weight") || name.ends_with("v_proj.weight")) || (name.find("attn_v.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 3;
+        bool is_moe = false;
+
+        if (name.find("attn_norm") != std::string::npos &&
+            name.find("post_") == std::string::npos) slot = 0;
+        else if (name.ends_with("attn_q.weight") || name.ends_with("q_proj.weight") ||
+                 (name.find("attn_q.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 1;
+        else if (name.ends_with("attn_k.weight") || name.ends_with("k_proj.weight") ||
+                 (name.find("attn_k.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 2;
+        else if (name.ends_with("attn_v.weight") || name.ends_with("v_proj.weight") ||
+                 (name.find("attn_v.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 3;
         else if (name.ends_with("attn_output.weight") || name.ends_with("o_proj.weight")) slot = 4;
-        else if (name.find("ffn_norm") != std::string::npos && name.find("post_ffw") == std::string::npos && name.find("post_attn") == std::string::npos) slot = 5;
+        else if (name.find("ffn_norm") != std::string::npos && name.find("post_") == std::string::npos) slot = 5;
         else if (name.ends_with("ffn_up.weight") || name.ends_with("up_proj.weight")) slot = 6;
         else if (name.ends_with("ffn_gate.weight") || name.ends_with("gate_proj.weight")) slot = 7;
         else if (name.ends_with("ffn_down.weight") || name.ends_with("down_proj.weight")) slot = 8;
+        else if (name.find("ffn_up_exps") != std::string::npos || name.find("up_exps") != std::string::npos) {
+            slot = 6; is_moe = true;
+        }
+        else if (name.find("ffn_gate_exps") != std::string::npos || name.find("gate_exps") != std::string::npos) {
+            slot = 7; is_moe = true;
+        }
+        else if (name.find("ffn_down_exps") != std::string::npos || name.find("down_exps") != std::string::npos) {
+            slot = 8; is_moe = true;
+        }
+        else if (name.find("ffn_gate_inp") != std::string::npos || name.find("gate_inp") != std::string::npos) {
+            layer_moe_gate_[layer] = t.gpuAddress;
+            layer_moe_gate_fmt_[layer] = t.format;
+            fprintf(stderr, "[LoadModelWeights] Layer %zu MoE routing tensor: %s\n", layer, name.c_str());
+            continue;
+        }
+
         if (slot >= 0 && slot < WEIGHTS_PER_LAYER) {
+            if (t.gpuAddress == 0) {
+                fprintf(stderr, "[LoadModelWeights] WARNING: %s has gpuAddress=0, skipping\n", name.c_str());
+                continue;
+            }
             layer_weights_[layer][slot] = t.gpuAddress;
             layer_weight_formats_[layer][slot] = t.format;
+            if (is_moe) {
+                layer_is_moe_[layer] = true;
+                fprintf(stderr, "[LoadModelWeights] Layer %zu marked as MoE (slot %d)\n", layer, slot);
+            }
         }
+    }
+
+    size_t missing = 0;
+    for (size_t L = 0; L < n_layers_; L++) {
+        for (int s = 0; s < WEIGHTS_PER_LAYER; s++) {
+            if (layer_weights_[L][s] == 0) {
+                if (s >= 1 && s <= 4) {
+                    fprintf(stderr, "[LoadModelWeights] MISSING: layer %zu slot %d\n", L, s);
+                    missing++;
+                }
+            }
+        }
+    }
+    if (missing > 0) {
+        fprintf(stderr, "[LoadModelWeights] WARNING: %zu mandatory weights missing\n", missing);
     }
 
     model_weights_loaded_ = true;
@@ -755,6 +836,19 @@ bool VulkanComputeEngine::DispatchRmsNorm(VkDeviceAddress in_addr, VkDeviceAddre
 bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b_addr,
                                         VkDeviceAddress c_addr, uint32_t M, uint32_t N, uint32_t K,
                                         bool transB, rdna4::QuantFormat weightFormat) {
+    if (b_addr == 0) {
+        fprintf(stderr, "[DispatchGemm] FATAL: weight buffer address (b_addr) is 0. Format=%d N=%u K=%u\n",
+                (int)weightFormat, N, K);
+        fflush(stderr);
+        return false;
+    }
+    if (a_addr == 0 || c_addr == 0) {
+        fprintf(stderr, "[DispatchGemm] FATAL: input/output buffer is null. a=0x%llx c=0x%llx\n",
+                (unsigned long long)a_addr, (unsigned long long)c_addr);
+        fflush(stderr);
+        return false;
+    }
+
     KernelType kt = KernelType::COOPMAT_GEMM;
     bool qtrans = transB;
     switch (weightFormat) {
@@ -762,7 +856,12 @@ bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b
         case rdna4::QuantFormat::Q8_0: kt = KernelType::GEMM_Q8_0; qtrans = false; break;
         case rdna4::QuantFormat::Q4_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
         case rdna4::QuantFormat::Q6_K: kt = KernelType::GEMM_Q6K;  qtrans = false; break;
-        default: break; // F32/F16 → COOPMAT_GEMM
+        case rdna4::QuantFormat::Q1_0: kt = KernelType::GEMM_Q4_0; qtrans = false; break;
+        case rdna4::QuantFormat::Q2_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
+        case rdna4::QuantFormat::Q3_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
+        case rdna4::QuantFormat::Q5_K: kt = KernelType::GEMM_Q6K;  qtrans = false; break;
+        case rdna4::QuantFormat::Q8_K: kt = KernelType::GEMM_Q8_0; qtrans = false; break;
+        default: break;
     }
     fprintf(stderr, "[DGemm] M=%u N=%u K=%u transB=%d fmt=%d kt=%d qtrans=%d a=0x%llx b=0x%llx c=0x%llx\n",
             M, N, K, (int)transB, (int)weightFormat, (int)kt, (int)qtrans,
@@ -782,7 +881,7 @@ bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b
     vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     if (kt == KernelType::COOPMAT_GEMM)
         vkCmdDispatch(cmd_buffer_, N, M, 1);
-    else if (kt == KernelType::GEMM_Q4_0)
+    else if (kt == KernelType::GEMM_Q4_0 || kt == KernelType::GEMM_Q8_0)
         vkCmdDispatch(cmd_buffer_, (N + 255) / 256, 1, 1);
     else
         vkCmdDispatch(cmd_buffer_, N, 1, 1);
