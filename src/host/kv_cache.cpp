@@ -116,39 +116,35 @@ void KVCacheManager::append(uint32_t layer, const void* kData, const void* vData
     size_t rowBytes = static_cast<size_t>(nKvHeads) * headDim * sizeof(float);
     size_t kOffset = static_cast<size_t>(l.currentSeqLen) * rowBytes;
 
-    VkPhysicalDeviceProperties physProps;
-    vkGetPhysicalDeviceProperties(physicalDevice, &physProps);
-    VkDeviceSize atomSize = physProps.limits.nonCoherentAtomSize;
-    VkDeviceSize atomMask = atomSize - 1;
-
+    // Try direct map first (works if memory is host-visible)
+    bool kDone = false, vDone = false;
     {
         void* mapped = nullptr;
         VkResult r = vkMapMemory(device, l.kMemory, kOffset, rowBytes, 0, &mapped);
         if (r == VK_SUCCESS && mapped) {
             std::memcpy(mapped, kData, rowBytes);
-            VkMappedMemoryRange range = {};
-            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-            range.memory = l.kMemory;
-            range.offset = kOffset & ~atomMask;
-            range.size = (rowBytes + (kOffset & atomMask) + atomMask) & ~atomMask;
-            vkFlushMappedMemoryRanges(device, 1, &range);
+            vkFlushMappedMemoryRanges(device, 0, nullptr);
             vkUnmapMemory(device, l.kMemory);
+            kDone = true;
         }
     }
-
     {
         void* mapped = nullptr;
         VkResult r = vkMapMemory(device, l.vMemory, kOffset, rowBytes, 0, &mapped);
         if (r == VK_SUCCESS && mapped) {
             std::memcpy(mapped, vData, rowBytes);
-            VkMappedMemoryRange range = {};
-            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-            range.memory = l.vMemory;
-            range.offset = kOffset & ~atomMask;
-            range.size = (rowBytes + (kOffset & atomMask) + atomMask) & ~atomMask;
-            vkFlushMappedMemoryRanges(device, 1, &range);
+            vkFlushMappedMemoryRanges(device, 0, nullptr);
             vkUnmapMemory(device, l.vMemory);
+            vDone = true;
         }
+    }
+
+    // If direct map failed, we need a staging buffer approach
+    // Note: this requires a command pool and queue which we don't have in this context.
+    // The shader-based KV_CACHE_WRITE path should be used instead for device-local memory.
+    if (!kDone || !vDone) {
+        fprintf(stderr, "[kv_cache] WARNING: Direct memory map failed for layer %u. "
+                "Use shader-based KV cache write path instead.\n", layer);
     }
 
     l.currentSeqLen++;

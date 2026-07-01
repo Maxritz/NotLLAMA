@@ -57,6 +57,43 @@ static bool isQuantized(QuantFormat fmt) {
     return fmt != QuantFormat::F32 && fmt != QuantFormat::F16;
 }
 
+// Block size lookup for each quant format
+static uint32_t getBlockElements(QuantFormat fmt) {
+    switch (fmt) {
+        case QuantFormat::Q4_0: return 32;
+        case QuantFormat::Q4_1: return 32;
+        case QuantFormat::Q5_0: return 32;
+        case QuantFormat::Q5_1: return 32;
+        case QuantFormat::Q8_0: return 32;
+        case QuantFormat::Q8_1: return 32;
+        case QuantFormat::Q2_K: return 256;
+        case QuantFormat::Q3_K: return 256;
+        case QuantFormat::Q4_K: return 256;
+        case QuantFormat::Q5_K: return 256;
+        case QuantFormat::Q6_K: return 256;
+        case QuantFormat::Q8_K: return 256;
+        default: return 1;
+    }
+}
+
+static uint32_t getBlockSize(QuantFormat fmt) {
+    switch (fmt) {
+        case QuantFormat::Q4_0: return 18;
+        case QuantFormat::Q4_1: return 20;
+        case QuantFormat::Q5_0: return 22;
+        case QuantFormat::Q5_1: return 24;
+        case QuantFormat::Q8_0: return 34;
+        case QuantFormat::Q8_1: return 36;
+        case QuantFormat::Q2_K: return 84;
+        case QuantFormat::Q3_K: return 110;
+        case QuantFormat::Q4_K: return 144;
+        case QuantFormat::Q5_K: return 176;
+        case QuantFormat::Q6_K: return 210;
+        case QuantFormat::Q8_K: return 292;
+        default: return (fmt == QuantFormat::F16 || fmt == QuantFormat::BF16) ? 2 : 4;
+    }
+}
+
 static float fp16ToFloatCpu(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
     uint32_t exponent = (h >> 10) & 0x1F;
@@ -392,8 +429,14 @@ ModelDesc WeightUploader::loadMetadata(const std::string& jsonPath, const std::s
         desc.sizeBytes = t.value<size_t>("size_bytes", 0);
         desc.binOffset = t.value<size_t>("bin_offset", 0);
         desc.binSize = t.value<size_t>("bin_size", 0);
-        desc.blockSize = t.value("quant_block_size", 1);
-        desc.blockElements = t.value("quant_block_elements", 1);
+        // Set correct block size and elements for the format
+        if (isQuantized(desc.format)) {
+            desc.blockSize = getBlockSize(desc.format);
+            desc.blockElements = getBlockElements(desc.format);
+        } else {
+            desc.blockSize = (desc.format == QuantFormat::F16 || desc.format == QuantFormat::BF16) ? 2 : 4;
+            desc.blockElements = 1;
+        }
         desc.gpuAddress = 0;
         desc.buffer = VK_NULL_HANDLE;
         desc.memory = VK_NULL_HANDLE;
@@ -871,8 +914,14 @@ ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& b
         desc.sizeBytes = t.value<size_t>("size_bytes", 0);
         desc.binOffset = t.value<size_t>("bin_offset", 0);
         desc.binSize = t.value<size_t>("bin_size", 0);
-        desc.blockSize = t.value("quant_block_size", 1);
-        desc.blockElements = t.value("quant_block_elements", 1);
+        // Set correct block size and elements for the format
+        if (isQuantized(desc.format)) {
+            desc.blockSize = getBlockSize(desc.format);
+            desc.blockElements = getBlockElements(desc.format);
+        } else {
+            desc.blockSize = (desc.format == QuantFormat::F16 || desc.format == QuantFormat::BF16) ? 2 : 4;
+            desc.blockElements = 1;
+        }
 
         fprintf(stderr, "\n[tensor %zu/%zu] %s binOffset=%zu binSize=%zu sizeBytes=%zu\n",
                 tensorIdx + 1, totalTensors, desc.name.c_str(),
@@ -1077,13 +1126,21 @@ VkBuffer WeightUploader::createGpuBuffer(size_t size, VkDeviceAddress* outAddr, 
 }
 
 void WeightUploader::freeTensor(const TensorDesc& desc) {
-    if (desc.buffer) vkDestroyBuffer(device, desc.buffer, nullptr);
-    if (desc.memory) vkFreeMemory(device, desc.memory, nullptr);
+    if (desc.buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, desc.buffer, nullptr);
+    }
+    if (desc.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, desc.memory, nullptr);
+    }
 }
 
 void WeightUploader::freeAll(ModelDesc& model) {
-    for (auto& t : model.tensors) freeTensor(t);
-    model.tensors.clear();
+    for (auto& t : model.tensors) {
+        freeTensor(t);
+        t.buffer = VK_NULL_HANDLE;
+        t.memory = VK_NULL_HANDLE;
+        t.gpuAddress = 0;
+    }
 }
 
 } // namespace rdna4

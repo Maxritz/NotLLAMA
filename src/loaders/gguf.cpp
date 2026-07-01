@@ -241,7 +241,9 @@ bool GGUFLoader::load(const std::string& path) {
         auto qm = getQuantMeta(t.type);
         uint64_t nElements = 1;
         for (auto d : t.dims) nElements *= d;
-        t.nbytes = (nElements / qm.blockSize) * qm.bytesPerBlock;
+        // Round up to full blocks to avoid truncation
+        uint64_t nBlocks = (nElements + qm.blockSize - 1) / qm.blockSize;
+        t.nbytes = nBlocks * qm.bytesPerBlock;
         if (t.type == GGUFTensorType::F32) t.nbytes = nElements * 4;
         else if (t.type == GGUFTensorType::F16 || t.type == GGUFTensorType::BF16) t.nbytes = nElements * 2;
     }

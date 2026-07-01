@@ -34,6 +34,14 @@ set(HOST_SRC
     src/host/allocator.cpp
     src/host/vgpr_stub.cpp
     src/host/turboquant_dispatch.cpp
+    src/host/multi_model_manager.cpp
+    src/host/model_router.cpp
+    src/host/mtp_engine.cpp
+    src/host/cli_parser.cpp
+    src/host/web_server.cpp
+    src/host/agent_node.cpp
+    src/host/graphify_client.cpp
+    src/host/memory_tier.cpp
     src/loaders/gguf.cpp
     src/engine/vulkan_device.cpp
     src/engine/ring_allocator_adapter.cpp
@@ -48,9 +56,12 @@ set(HOST_SRC
     main.cpp
 )
 
+# Find threading library
+find_package(Threads REQUIRED)
+
 add_executable(rdna4_llama ${HOST_SRC})
 target_include_directories(rdna4_llama PRIVATE include src)
-target_link_libraries(rdna4_llama PRIVATE Vulkan::Vulkan nlohmann_json::nlohmann_json)
+target_link_libraries(rdna4_llama PRIVATE Vulkan::Vulkan nlohmann_json::nlohmann_json Threads::Threads)
 
 if(MSVC)
     target_compile_options(rdna4_llama PRIVATE /W3 /EHsc)

@@ -28,6 +28,10 @@ RelWithDebInfo/
 VindexLLM/
 reference/
 
+# Patch/fix backup directories
+Finalfixes/
+Patches-dont-sync-to-git/
+
 stderr.txt
 
 __pycache__/

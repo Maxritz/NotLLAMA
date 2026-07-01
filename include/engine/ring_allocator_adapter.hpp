@@ -16,6 +16,7 @@ public:
 
     GpuAllocation Allocate(MemoryType type, size_t size, size_t alignment) override;
     void Free(MemoryType type, const GpuAllocation& alloc) override;
+    void Reset(MemoryType type);
 
     void* Map(const GpuAllocation& alloc) override;
     void Unmap(const GpuAllocation& alloc) override;

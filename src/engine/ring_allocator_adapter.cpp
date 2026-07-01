@@ -39,9 +39,16 @@ GpuAllocation RingAllocatorAdapter::Allocate(MemoryType type, size_t size, size_
 }
 
 void RingAllocatorAdapter::Free(MemoryType type, const GpuAllocation& alloc) {
-    // Ring allocator does not support individual frees; reset only.
+    // Ring allocator uses a circular buffer pattern - allocations are
+    // overwritten when the ring wraps around. Individual frees are not
+    // supported. Call Reset(type) to clear all allocations of a given type.
     (void)type;
     (void)alloc;
+}
+
+void RingAllocatorAdapter::Reset(MemoryType type) {
+    auto* alloc = GetAllocator(type);
+    if (alloc) alloc->reset();
 }
 
 void* RingAllocatorAdapter::Map(const GpuAllocation& alloc) {

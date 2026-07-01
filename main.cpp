@@ -1,221 +1,672 @@
-#include "rdna4.hpp"
-#include "rdna4_vulkan.hpp"
-#include "rdna4_weights.hpp"
-#include "rdna4_tokenizer.hpp"
-#include "rdna4_engine.hpp"
-#include "rdna4_kv_cache.hpp"
+#include "cli_parser.hpp"
+#include "multi_model_manager.hpp"
+#include "model_router.hpp"
+#include "mtp_engine.hpp"
+#include "web_server.hpp"
+#include "agent_node.hpp"
+#include "memory_tier.hpp"
+#include "rdna4_graphify.hpp"
 #include "engine/engine.hpp"
-#include <iostream>
-#include <fstream>
+#include "rdna4_vulkan.hpp"
 #include <cstdio>
-#include <cstring>
-#include <filesystem>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <fstream>
 #include <chrono>
+#include <cstring>
+#include <signal.h>
 
-using namespace rdna4;
+using namespace notllama;
 
-int main(int argc, char** argv) {
-    printf("RDNA4 LLaMA Inference Engine\n");
-    printf("============================\n\n");
+static std::atomic<bool> g_running{true};
+static void SignalHandler(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        fprintf(stderr, "\n[main] Shutdown signal received\n");
+        g_running = false;
+    }
+}
 
-    // Parse flags and positional arguments.
-    bool clear_shaders = false;
-    std::vector<std::string> positionals;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--clear-shaders") {
-            clear_shaders = true;
+// Print colored text
+static void PrintColor(const char* text, const char* color_code) {
+    fprintf(stderr, "%s%s\033[0m", color_code, text);
+}
+
+static std::string ReadPromptFromFile(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return "";
+    return std::string((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+}
+
+static void PrintBanner() {
+    fprintf(stderr,
+        "\n"
+        "+=====================================================+\n"
+        "|  NotLLAMA v0.3.0 - Vulkan Compute LLM               |\n"
+        "|  Multi-Model | MTP | Web | Agents | Graphify | MCP  |\n"
+        "|  llama.cpp-Compatible CLI | Distributed Reasoning   |\n"
+        "+=====================================================+\n"
+        "\n");
+}
+
+static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
+                                MTPEngine* mtp, AgentNode* agent,
+                                MemoryTierManager* memory,
+                                const CLIOptions& opts) {
+    fprintf(stderr, "\n=== Interactive Mode ===\n");
+    fprintf(stderr, "Type 'quit' or 'exit' to stop\n");
+    fprintf(stderr, "Type '/models' to list loaded models\n");
+    fprintf(stderr, "Type '/switch <model_id>' to change model\n");
+    fprintf(stderr, "Type '/route <prompt>' to see routing decision\n");
+    fprintf(stderr, "Type '/clear' to clear context\n");
+    fprintf(stderr, "Type '/memory' to show VRAM/RAM tier stats\n");
+    if (agent && agent->IsRunning()) {
+        fprintf(stderr, "Type '/peers' to list agent peers\n");
+        fprintf(stderr, "Type '/ask <peer> <prompt>' to ask a peer\n");
+        fprintf(stderr, "Type '/askall <prompt>' to ask all peers\n");
+        fprintf(stderr, "Type '/graphify' to check Graphify awareness\n");
+        fprintf(stderr, "Type '/mcp' to check MCP awareness\n");
+    }
+    fprintf(stderr, "========================\n\n");
+
+    auto models = mgr->ListModels();
+    std::string current_model = models.empty() ? "" : models[0];
+    std::vector<uint32_t> context_tokens;
+
+    while (g_running) {
+        if (opts.color) PrintColor("\nYou: ", "\033[1;36m");
+        else fprintf(stderr, "\nYou: ");
+
+        std::string input;
+        if (opts.multiline_input) {
+            // Multi-line: read until empty line
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line.empty()) break;
+                if (!input.empty()) input += "\n";
+                input += line;
+            }
         } else {
-            positionals.push_back(arg);
+            if (!std::getline(std::cin, input)) break;
+        }
+
+        // Commands
+        if (input == "quit" || input == "exit") break;
+        if (input == "/clear") {
+            context_tokens.clear();
+            fprintf(stderr, "[Context cleared]\n");
+            continue;
+        }
+        if (input == "/models") {
+            fprintf(stderr, "Loaded models:\n");
+            for (const auto& id : mgr->ListModels()) {
+                auto* inst = mgr->GetModel(id);
+                fprintf(stderr, "  %s - %s (tags: %s)\n",
+                        id.c_str(), inst ? inst->name.c_str() : "?",
+                        inst ? inst->tags.c_str() : "");
+            }
+            continue;
+        }
+        if (input.starts_with("/switch ")) {
+            std::string new_id = input.substr(8);
+            if (mgr->IsLoaded(new_id)) {
+                current_model = new_id;
+                context_tokens.clear();
+                fprintf(stderr, "[Switched to model: %s]\n", new_id.c_str());
+            } else {
+                fprintf(stderr, "[Model not found: %s]\n", new_id.c_str());
+            }
+            continue;
+        }
+        if (input == "/memory") {
+            fprintf(stderr, "[MemoryTier] %s\n", memory->GetStatsString().c_str());
+            fprintf(stderr, "  gpu_layers=%d split_mode=%s\n",
+                    opts.gpu_layers, opts.extra.count("split-mode") ? opts.extra.at("split-mode").c_str() : "layer");
+            continue;
+        }
+        if (input.starts_with("/route ")) {
+            std::string prompt = input.substr(7);
+            auto decision = router->Route(prompt);
+            fprintf(stderr, "[Router] Primary: %s (confidence: %.2f)\n",
+                    decision.primary_model_id.c_str(), decision.confidence);
+            fprintf(stderr, "[Router] Reason: %s\n", decision.reason.c_str());
+            continue;
+        }
+        // Agent commands
+        if (agent && agent->IsRunning()) {
+            if (input == "/peers") {
+                auto peers = agent->GetPeers();
+                fprintf(stderr, "[Agent] %zu peers:\n", peers.size());
+                for (const auto& p : peers) {
+                    fprintf(stderr, "  %s @ %s:%d | alive=%s | model=%s | tags=",
+                            p.name.c_str(), p.host.c_str(), p.port,
+                            p.alive ? "yes" : "no",
+                            p.model_loaded.c_str());
+                    for (const auto& t : p.tags) fprintf(stderr, "%s ", t.c_str());
+                    fprintf(stderr, "\n");
+                }
+                continue;
+            }
+            if (input.starts_with("/ask ")) {
+                std::string rest = input.substr(5);
+                size_t space = rest.find(' ');
+                if (space != std::string::npos) {
+                    std::string peer_name = rest.substr(0, space);
+                    std::string prompt = rest.substr(space + 1);
+                    AgentReasonRequest req;
+                    req.request_id = agent->GetName() + "-" + std::to_string(
+                        std::chrono::system_clock::now().time_since_epoch().count());
+                    req.from_agent = agent->GetName();
+                    req.query = prompt;
+                    auto resp = agent->AskPeer(peer_name, req);
+                    fprintf(stderr, "\n[Agent '%s' responded]:\n%s\n",
+                            resp.from_agent.c_str(), resp.answer.c_str());
+                } else {
+                    fprintf(stderr, "Usage: /ask <peer_name> <prompt>\n");
+                }
+                continue;
+            }
+            if (input.starts_with("/askall ")) {
+                std::string prompt = input.substr(8);
+                AgentReasonRequest req;
+                req.request_id = agent->GetName() + "-" + std::to_string(
+                    std::chrono::system_clock::now().time_since_epoch().count());
+                req.from_agent = agent->GetName();
+                req.query = prompt;
+                auto resp = agent->AskAll(req);
+                fprintf(stderr, "\n[Best from '%s' | confidence=%.2f]:\n%s\n",
+                        resp.from_agent.c_str(), resp.confidence, resp.answer.c_str());
+                continue;
+            }
+            if (input == "/graphify") {
+                fprintf(stderr, "[Graphify] Available: %s\n",
+                        agent ? "yes" : "no");
+                continue;
+            }
+            if (input == "/mcp") {
+                fprintf(stderr, "[MCP] Available: %s\n",
+                        agent ? "yes" : "no");
+                continue;
+            }
+        }
+        if (input.empty()) continue;
+
+        // Route to best model
+        auto decision = router->Route(input);
+        std::string model_id = current_model.empty() ? decision.primary_model_id : current_model;
+
+        if (model_id.empty()) {
+            fprintf(stderr, "[Error: No model loaded]\n");
+            continue;
+        }
+
+        auto* inst = mgr->GetModel(model_id);
+        if (!inst) {
+            fprintf(stderr, "[Error: Model '%s' not available]\n", model_id.c_str());
+            continue;
+        }
+
+        if (!decision.reason.empty() && model_id != current_model) {
+            fprintf(stderr, "[Routed to '%s' - %s]\n", model_id.c_str(), decision.reason.c_str());
+        }
+
+        // Build prompt with system prompt
+        std::string full_prompt = opts.system_prompt + "\n" + input + "\n";
+
+        // Tokenize prompt (char-level for now)
+        std::vector<uint32_t> prompt_tokens;
+        for (char c : full_prompt) {
+            prompt_tokens.push_back(static_cast<uint8_t>(c));
+        }
+
+        // Set MTP config
+        MTPConfig mtp_cfg;
+        mtp_cfg.n_predict = static_cast<uint32_t>(opts.n_predict > 0 ? opts.n_predict : 256);
+        mtp_cfg.use_draft_model = !opts.draft_model.empty();
+        mtp_cfg.draft_model_id = opts.draft_model;
+        mtp_cfg.n_draft = opts.enable_mtp ? opts.mtp_n_draft : 1;
+        mtp->SetConfig(mtp_cfg);
+        mtp->SetSeed(opts.seed);
+
+        // Generate
+        uint32_t n_predict = opts.n_predict > 0 ? static_cast<uint32_t>(opts.n_predict) : 256;
+        auto start = std::chrono::steady_clock::now();
+        auto generated = mtp->Generate(model_id, prompt_tokens, n_predict);
+        auto end = std::chrono::steady_clock::now();
+
+        // Convert tokens to text
+        std::string response_text;
+        const auto& tok = inst->adapter->GetTokenizer();
+        if (!tok.idToToken.empty()) {
+            for (uint32_t t : generated) {
+                if (t < tok.idToToken.size()) response_text += tok.idToToken[t];
+                else response_text += "?";
+            }
+        } else {
+            for (uint32_t t : generated) {
+                if (t < 256) response_text += static_cast<char>(t);
+            }
+        }
+
+        // Print response
+        if (opts.color) PrintColor("\nAssistant: ", "\033[1;32m");
+        else fprintf(stderr, "\nAssistant: ");
+        fprintf(stderr, "%s\n", response_text.c_str());
+
+        // Update context
+        for (uint32_t t : prompt_tokens) context_tokens.push_back(t);
+        for (uint32_t t : generated) context_tokens.push_back(t);
+
+        // Context window management
+        if (context_tokens.size() > static_cast<size_t>(opts.ctx_size)) {
+            size_t keep = opts.ctx_size / 2;
+            context_tokens = std::vector<uint32_t>(
+                context_tokens.end() - keep, context_tokens.end());
+        }
+
+        // Stats
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double tok_per_sec = (elapsed_ms > 0) ? (generated.size() * 1000.0 / elapsed_ms) : 0;
+        fprintf(stderr, "  [%zu tokens, %.1f ms, %.1f tok/s]\n",
+                generated.size(), elapsed_ms, tok_per_sec);
+    }
+}
+
+static void RunSingleShot(MultiModelManager* mgr, ModelRouter* router,
+                          MTPEngine* mtp, const CLIOptions& opts) {
+    if (opts.prompt.empty()) {
+        fprintf(stderr, "[Error: No prompt specified. Use -p/--prompt or -i for interactive mode]\n");
+        return;
+    }
+
+    if (opts.verbose_prompt && !opts.no_display_prompt) {
+        fprintf(stderr, "Prompt:\n%s\n\n", opts.prompt.c_str());
+    }
+
+    // Route to best model
+    auto decision = router->Route(opts.prompt);
+    std::string model_id = decision.primary_model_id;
+    if (model_id.empty()) {
+        fprintf(stderr, "[Error: No models loaded]\n");
+        return;
+    }
+
+    if (!decision.reason.empty()) {
+        fprintf(stderr, "[Router] %s\n", decision.reason.c_str());
+    }
+
+    auto* inst = mgr->GetModel(model_id);
+    if (!inst) {
+        fprintf(stderr, "[Error: Model '%s' not available]\n", model_id.c_str());
+        return;
+    }
+
+    // Tokenize
+    std::vector<uint32_t> prompt_tokens;
+    for (char c : opts.prompt) {
+        prompt_tokens.push_back(static_cast<uint8_t>(c));
+    }
+
+    // Configure MTP
+    MTPConfig mtp_cfg;
+    mtp_cfg.n_predict = static_cast<uint32_t>(opts.n_predict > 0 ? opts.n_predict : 128);
+    mtp_cfg.temperature = opts.temperature;
+    mtp_cfg.use_draft_model = !opts.draft_model.empty();
+    mtp_cfg.draft_model_id = opts.draft_model;
+    mtp_cfg.n_draft = opts.enable_mtp ? opts.mtp_n_draft : 1;
+    mtp->SetConfig(mtp_cfg);
+    mtp->SetSeed(opts.seed);
+
+    // Generate
+    auto start = std::chrono::steady_clock::now();
+    auto generated = mtp->Generate(model_id, prompt_tokens,
+                                     opts.n_predict > 0 ? static_cast<uint32_t>(opts.n_predict) : 128);
+    auto end = std::chrono::steady_clock::now();
+
+    // Convert to text
+    std::string output;
+    const auto& tok = inst->adapter->GetTokenizer();
+    if (!tok.idToToken.empty()) {
+        for (uint32_t t : generated) {
+            if (t < tok.idToToken.size()) output += tok.idToToken[t];
+            else output += "?";
+        }
+    } else {
+        for (uint32_t t : generated) {
+            if (t < 256) output += static_cast<char>(t);
         }
     }
 
-    if (positionals.size() < 2) {
-        printf("Usage: rdna4_llama [--clear-shaders] <model.weights.json> <model.weights.bin> [prompt]\n");
-        return 0;
+    // Output
+    if (opts.output_format == "json") {
+        nlohmann::json j;
+        j["content"] = output;
+        j["tokens_generated"] = generated.size();
+        j["model"] = model_id;
+        auto elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        j["generation_time_ms"] = elapsed_ms;
+        j["tokens_per_second"] = (elapsed_ms > 0) ? (generated.size() * 1000.0 / elapsed_ms) : 0;
+        std::cout << j.dump(2) << std::endl;
+    } else {
+        if (!opts.no_display_prompt) {
+            fprintf(stderr, "%s", output.c_str());
+        } else {
+            printf("%s", output.c_str());
+        }
+        printf("\n");
+    }
+}
+
+static void RunBenchmark(MultiModelManager* mgr, MTPEngine* mtp, const CLIOptions& opts) {
+    fprintf(stderr, "\n=== Benchmark Mode ===\n");
+    auto models = mgr->ListModels();
+    if (models.empty()) {
+        fprintf(stderr, "[Error: No models loaded for benchmark]\n");
+        return;
     }
 
-    std::string jsonPath = positionals[0];
-    std::string binPath = positionals[1];
-    std::string prompt = (positionals.size() > 2) ? positionals[2] : "Hello";
+    std::string model_id = models[0];
+    auto* inst = mgr->GetModel(model_id);
+    if (!inst) return;
 
-    VulkanContext ctx;
-    if (!ctx.init()) { std::cerr << "Failed to init Vulkan\n"; return 1; }
-    printf("Vulkan initialized (wave32=%d)\n", ctx.isWave32() ? 1 : 0);
+    // Warm-up
+    fprintf(stderr, "Warming up...\n");
+    std::vector<uint32_t> warmup(32, 1); // 32 BOS tokens
+    mtp->Generate(model_id, warmup, 16);
 
-    // ── Shader library ──
+    // Benchmark
+    fprintf(stderr, "\nRunning %d iterations...\n", opts.benchmark_iterations);
+    std::vector<double> latencies;
+    latencies.reserve(opts.benchmark_iterations);
+
+    std::vector<uint32_t> prompt_tokens;
+    if (opts.prompt_benchmark) {
+        // Benchmark prompt processing (prefill)
+        for (int i = 0; i < 256; i++) prompt_tokens.push_back((i % 256) + 1);
+    } else {
+        // Benchmark token generation (decode)
+        prompt_tokens.push_back(1); // BOS
+    }
+
+    MTPConfig mtp_cfg;
+    mtp_cfg.n_predict = 1;
+    mtp->SetConfig(mtp_cfg);
+
+    for (int i = 0; i < opts.benchmark_iterations; i++) {
+        auto start = std::chrono::steady_clock::now();
+        auto generated = mtp->Generate(model_id, prompt_tokens,
+            opts.prompt_benchmark ? 1 : 64);
+        auto end = std::chrono::steady_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double tok_per_sec = (elapsed_ms > 0) ? (generated.size() * 1000.0 / elapsed_ms) : 0;
+        latencies.push_back(elapsed_ms);
+
+        fprintf(stderr, "  Iter %d: %.1f ms, %.1f tok/s\n", i + 1, elapsed_ms, tok_per_sec);
+    }
+
+    // Statistics
+    std::sort(latencies.begin(), latencies.end());
+    double median = latencies[latencies.size() / 2];
+    double min_lat = latencies.front();
+    double max_lat = latencies.back();
+    double avg = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+
+    fprintf(stderr, "\n--- Results ---\n");
+    fprintf(stderr, "Model: %s\n", model_id.c_str());
+    fprintf(stderr, "Iterations: %d\n", opts.benchmark_iterations);
+    fprintf(stderr, "Avg latency: %.1f ms\n", avg);
+    fprintf(stderr, "Median: %.1f ms\n", median);
+    fprintf(stderr, "Min: %.1f ms\n", min_lat);
+    fprintf(stderr, "Max: %.1f ms\n", max_lat);
+    fprintf(stderr, "Avg throughput: %.1f tok/s\n",
+            (avg > 0) ? (1000.0 / avg) : 0);
+}
+
+int main(int argc, char** argv) {
+    signal(SIGINT, SignalHandler);
+    signal(SIGTERM, SignalHandler);
+
+    // Parse CLI
+    CLIOptions opts;
+    if (!CLIParser::Parse(argc, argv, opts)) {
+        if (opts.show_help) {
+            CLIParser::PrintHelp(argv[0]);
+            return 0;
+        }
+        if (opts.show_version) {
+            CLIParser::PrintVersion();
+            return 0;
+        }
+        return 1;
+    }
+
+    PrintBanner();
+
+    // Show parsed options
+    fprintf(stderr, "[Config] Models: %zu | Router: %s | MTP: %s | Server: %s | Agent: %s\n",
+            opts.model_paths.size(),
+            opts.router_mode.c_str(),
+            opts.enable_mtp ? "enabled" : "disabled",
+            opts.server_mode ? "enabled" : "disabled",
+            (!opts.agent_name.empty() || opts.agent_port > 0) ? opts.agent_name.c_str() : "disabled");
+    if (opts.use_graphify) fprintf(stderr, "[Config] Graphify: enabled (%s)\n", opts.graphify_url.c_str());
+    if (opts.use_mcp) fprintf(stderr, "[Config] MCP: enabled (%s)\n", opts.mcp_url.c_str());
+
+    // Initialize Vulkan
+    fprintf(stderr, "[Init] Initializing Vulkan...\n");
+    rdna4::VulkanContext ctx;
+    if (!ctx.init()) {
+        fprintf(stderr, "[FATAL] Vulkan initialization failed\n");
+        return 1;
+    }
+    fprintf(stderr, "[Init] Vulkan OK (wave32=%d, subgroup=%u)\n",
+            ctx.isWave32() ? 1 : 0, ctx.subgroupSize);
+
+    // Create memory tier manager (VRAM / System RAM / Disk offloading)
+    MemoryTierManager memory_tier(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex);
+    TierConfig tier_cfg;
+    tier_cfg.gpu_layers = opts.gpu_layers;
+    if (opts.extra.count("split-mode")) tier_cfg.split_mode = opts.extra.at("split-mode");
+    if (opts.extra.count("spill-dir")) tier_cfg.spill_directory = opts.extra.at("spill-dir");
+    memory_tier.Configure(tier_cfg);
+    fprintf(stderr, "[MemoryTier] %s\n", memory_tier.GetStatsString().c_str());
+
+    // Find shader directory
     std::string shader_dir = "shaders";
     {
         namespace fs = std::filesystem;
         fs::path exe_dir = fs::path(argv[0]).parent_path();
-        fs::path cwd = fs::current_path();
         std::vector<fs::path> candidates = {
             exe_dir / "shaders",
             exe_dir / ".." / "shaders",
-            exe_dir / ".." / ".." / "shaders",
-            cwd / "shaders",
-            cwd / ".." / "shaders",
-            cwd / ".." / ".." / "shaders",
+            fs::current_path() / "shaders",
         };
         for (const auto& c : candidates) {
-            fs::path canon = fs::weakly_canonical(c);
-            if (fs::exists(canon / "rms_norm.comp")) {
-                shader_dir = canon.string();
+            if (fs::exists(c / "rms_norm.comp")) {
+                shader_dir = fs::weakly_canonical(c).string();
                 break;
             }
         }
     }
+    fprintf(stderr, "[Init] Shader dir: %s\n", shader_dir.c_str());
 
-    // Optional: force a fresh compile of all shaders by clearing the SPIR-V cache.
-    if (clear_shaders) {
-        namespace fs = std::filesystem;
-        fs::path cache_dir = fs::path(shader_dir) / "cache";
-        size_t removed = 0;
-        if (fs::exists(cache_dir)) {
-            for (const auto& entry : fs::directory_iterator(cache_dir)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".spv") {
-                    fs::remove(entry.path());
-                    ++removed;
-                }
-            }
+    // Create engine infrastructure
+    VulkanShaderLibrary shader_lib(ctx.device, shader_dir,
+        VulkanDevice(&ctx).GetVendorProfile());
+
+    RingAllocatorAdapter allocator(ctx.device, ctx.physicalDevice,
+        256 * 1024 * 1024,   // weight ring
+        256 * 1024 * 1024,   // transient ring
+        256 * 1024 * 1024);  // KV ring
+
+    VulkanDescriptorManager desc_mgr(ctx.device, ctx.physicalDevice, &allocator);
+
+    // Create multi-model manager
+    MultiModelManager model_mgr(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex,
+                                 &shader_lib, &desc_mgr, &allocator);
+
+    // Load all models specified on command line
+    for (size_t i = 0; i < opts.model_paths.size(); i++) {
+        std::string path = opts.model_paths[i];
+        std::string id = (i < opts.model_ids.size()) ? opts.model_ids[i] : "";
+        std::string tags = (i < opts.model_tags.size()) ? opts.model_tags[i] : "";
+
+        // Derive ID from filename if not specified
+        if (id.empty()) {
+            size_t last_slash = path.find_last_of("/\\");
+            size_t last_dot = path.find_last_of('.');
+            if (last_dot == std::string::npos || last_dot < last_slash)
+                last_dot = path.length();
+            id = path.substr(last_slash == std::string::npos ? 0 : last_slash + 1,
+                             last_dot - (last_slash == std::string::npos ? 0 : last_slash + 1));
         }
-        fprintf(stderr, "[main] Cleared %zu cached SPIR-V files from %s\n",
-                removed, cache_dir.string().c_str());
-    }
 
-    // ── Load model via ModelAdapter (streaming path) ──
-    bool is_gguf = jsonPath.size() >= 5 && jsonPath.compare(jsonPath.size() - 5, 5, ".gguf") == 0;
-    notllama::ModelAdapter model_adapter(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex);
-    bool loaded = is_gguf ? model_adapter.LoadFromGGUF(jsonPath)
-                          : model_adapter.LoadFromPath(jsonPath, nullptr);
-    if (!loaded) {
-        std::cerr << "FATAL: Failed to load model from " << jsonPath << "\n";
-        ctx.cleanup(); return 1;
-    }
+        uint32_t gpu_layers = (opts.gpu_layers < 0) ? (uint32_t)-1 : static_cast<uint32_t>(opts.gpu_layers);
 
-    printf("Model: %s | Layers: %zu | Heads: %zu/%zu | Embed: %zu\n",
-           model_adapter.GetArchitecture().c_str(),
-           model_adapter.GetNumLayers(),
-           model_adapter.GetHeadDim() ? model_adapter.GetNumKVHeads() * model_adapter.GetHeadDim() / model_adapter.GetHeadDim() : 0,
-           model_adapter.GetNumKVHeads(),
-           model_adapter.GetHeadDim() * model_adapter.GetNumKVHeads());
-
-    // Stream all layers to GPU (one at a time)
-    for (uint32_t l = 0; l < model_adapter.GetNumLayers(); l++) {
-        if (!model_adapter.StreamLayerWeights(l, nullptr)) {
-            std::cerr << "FATAL: Failed to stream layer " << l << "\n";
-            ctx.cleanup(); return 1;
-        }
-    }
-
-    // Upload global tensors (embed, output_norm, output)
-    if (!model_adapter.UploadGlobalWeights()) {
-        std::cerr << "FATAL: Failed to upload global weights\n";
-        ctx.cleanup(); return 1;
-    }
-
-    // ── KV cache ──
-    uint32_t n_layers   = (uint32_t)model_adapter.GetNumLayers();
-    uint32_t n_kv_heads = (uint32_t)model_adapter.GetNumKVHeads();
-    uint32_t hd         = (uint32_t)model_adapter.GetHeadDim();
-    rdna4::KVCacheManager kv_cache(ctx.device, ctx.physicalDevice, 2048, n_layers, n_kv_heads, hd);
-    if (n_layers > 0) {
-        if (!kv_cache.allocate()) {
-            std::cerr << "FATAL: KV cache allocation failed\n";
-            ctx.cleanup(); return 1;
+        std::string loaded_id = model_mgr.LoadModel(path, id, id, tags,
+                                                      gpu_layers,
+                                                      static_cast<size_t>(opts.ctx_size),
+                                                      opts.temperature,
+                                                      opts.top_p,
+                                                      opts.top_k);
+        if (loaded_id.empty()) {
+            fprintf(stderr, "[WARN] Failed to load model: %s\n", path.c_str());
         }
     }
 
-    // ── Load tokenizer ──
-    Tokenizer tokenizer;
-    if (is_gguf) {
-        tokenizer = model_adapter.GetTokenizer();
+    if (model_mgr.Count() == 0) {
+        fprintf(stderr, "[WARN] No models loaded. Specify with -m/--model\n");
+        if (!opts.server_mode && opts.prompt.empty()) {
+            fprintf(stderr, "[FATAL] No models and no prompt. Use --help for usage.\n");
+            ctx.cleanup();
+            return 1;
+        }
+    }
+
+    // Create router
+    ModelRouter router(&model_mgr);
+    if (opts.router_mode == "ensemble") router.SetMode(ModelRouter::Mode::ENSEMBLE);
+    else if (opts.router_mode == "cascade") router.SetMode(ModelRouter::Mode::CASCADE);
+
+    // Auto-detect capabilities for all loaded models
+    for (const auto& id : model_mgr.ListModels()) {
+        router.AutoDetectCapabilities(id);
+    }
+
+    // Create MTP engine
+    MTPEngine mtp(&model_mgr);
+    MTPConfig mtp_cfg;
+    mtp_cfg.n_draft = opts.mtp_n_draft;
+    mtp_cfg.use_draft_model = !opts.draft_model.empty();
+    mtp_cfg.draft_model_id = opts.draft_model;
+    mtp.SetConfig(mtp_cfg);
+    mtp.SetSeed(opts.seed);
+
+    // Create distributed agent node
+    AgentConfig agent_cfg;
+    agent_cfg.agent_name = opts.agent_name.empty() ? "notllama-agent-" + std::to_string(opts.port) : opts.agent_name;
+    agent_cfg.agent_port = opts.agent_port;
+    agent_cfg.agent_peers = opts.agent_peers;
+    agent_cfg.use_graphify = opts.use_graphify;
+    agent_cfg.graphify_url = opts.graphify_url;
+    agent_cfg.use_mcp = opts.use_mcp;
+    agent_cfg.mcp_url = opts.mcp_url;
+    agent_cfg.enable_reason_sharing = opts.enable_reason_sharing;
+    agent_cfg.enable_model_distill = opts.enable_model_distill;
+    agent_cfg.log_file = opts.log_file.empty() ? "" : opts.log_file + ".agent.log";
+    agent_cfg.log_max_size_mb = 50;
+    agent_cfg.log_verbosity = 2;
+
+    AgentNode agent_node(agent_cfg);
+    if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+        fprintf(stderr, "[Agent] Node '%s' ready | Peers: %zu\n",
+                agent_cfg.agent_name.c_str(), opts.agent_peers.size());
+        agent_node.RefreshPeers();
+    }
+
+    // Handle --create-model
+    if (!opts.create_model_name.empty()) {
+        ModelCreateRequest mc;
+        mc.model_name = opts.create_model_name;
+        mc.base_model_type = opts.create_model_type;
+        mc.size_mb = opts.create_model_size_mb;
+        mc.quant_format = opts.create_model_quant.empty() ? "Q4_K" : opts.create_model_quant;
+        mc.architecture_type = opts.create_model_arch.empty() ? "dense" : opts.create_model_arch;
+        if (!opts.agent_peers.empty()) {
+            agent_node.RequestModelCreation(mc);
+        }
+        fprintf(stderr, "[Model] Creation request queued: %s\n", opts.create_model_name.c_str());
+    }
+
+    // Server mode
+    if (opts.server_mode) {
+        fprintf(stderr, "\n[Server] Starting HTTP API server...\n");
+        WebServer server(&model_mgr, &router, &mtp,
+                          opts.host, opts.port, opts.timeout);
+        if (!opts.api_key.empty()) server.SetApiKey(opts.api_key);
+        server.EnableEmbeddings(opts.embedding_endpoint);
+        server.EnableReranking(opts.reranking_endpoint);
+
+        // Wire agent endpoints to the web server
+        if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+            server.SetAgentHandler(
+                [&agent_node](const std::string& subpath, const nlohmann::json& body) -> std::string {
+                    return agent_node.HandleAgentEndpoint(subpath, body);
+                });
+            fprintf(stderr, "[Agent] Endpoints wired: /agent/reason, /agent/status, /agent/model/create\n");
+        }
+
+        if (!server.Start()) {
+            fprintf(stderr, "[FATAL] Failed to start server\n");
+            ctx.cleanup();
+            return 1;
+        }
+
+        fprintf(stderr, "[Server] Ready at http://%s:%d\n", opts.host.c_str(), opts.port);
+        fprintf(stderr, "[Server] Endpoints:\n");
+        fprintf(stderr, "  POST /v1/completions\n");
+        fprintf(stderr, "  POST /v1/chat/completions\n");
+        fprintf(stderr, "  GET  /v1/models\n");
+        fprintf(stderr, "  GET  /health\n");
+        if (opts.embedding_endpoint) fprintf(stderr, "  POST /v1/embeddings\n");
+        fprintf(stderr, "  POST /tokenize\n");
+        fprintf(stderr, "  POST /detokenize\n");
+        if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+            fprintf(stderr, "  POST /agent/reason    (distributed reasoning)\n");
+            fprintf(stderr, "  GET  /agent/status    (agent status)\n");
+            fprintf(stderr, "  POST /agent/model/create\n");
+        }
+        fprintf(stderr, "\nPress Ctrl+C to stop\n");
+
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        server.Stop();
+        ctx.cleanup();
+        return 0;
+    }
+
+    // Benchmark mode
+    if (opts.benchmark) {
+        RunBenchmark(&model_mgr, &mtp, opts);
+        ctx.cleanup();
+        return 0;
+    }
+
+    // Interactive or single-shot mode
+    if (opts.interactive) {
+        RunInteractiveMode(&model_mgr, &router, &mtp, &agent_node, &memory_tier, opts);
     } else {
-        std::ifstream jf(jsonPath);
-        nlohmann::json fullJson;
-        if (jf.is_open()) { jf >> fullJson; if (fullJson.contains("tokenizer")) {
-            WeightUploader tmp(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex);
-            tmp.loadTokenizer(tokenizer, fullJson["tokenizer"]);
-        } }
-    }
-    printf("Tokenizer: %zu tokens\n", tokenizer.idToToken.size());
-
-    // ── Encode prompt ──
-    std::vector<uint32_t> input_ids = tokenizer.encode(prompt);
-    if (input_ids.empty()) input_ids = {1};
-    printf("Prompt '%s' -> %zu tokens\n", prompt.c_str(), input_ids.size());
-
-    notllama::VendorProfile profile;
-    profile.vendor = ctx.isAmd() ? notllama::VendorID::AMD : notllama::VendorID::UNKNOWN;
-    profile.subgroup_size = ctx.subgroupSize;
-    profile.wave32 = ctx.isWave32();
-    profile.cooperative_matrix = false;
-
-    notllama::VulkanShaderLibrary shader_lib(ctx.device, shader_dir, profile);
-    notllama::SpecializationMap spec{};
-    spec.subgroup_size = profile.subgroup_size;
-    {
-        auto t0 = std::chrono::steady_clock::now();
-        bool ok = shader_lib.PrecompileAll(spec);
-        auto t1 = std::chrono::steady_clock::now();
-        printf("Shader precompile: %s (%.2fs)\n", ok ? "OK" : "FAILED",
-               std::chrono::duration<double>(t1 - t0).count());
+        RunSingleShot(&model_mgr, &router, &mtp, opts);
     }
 
-    // ── Engine ──
-    {
-    notllama::RingAllocatorAdapter allocator(ctx.device, ctx.physicalDevice,
-                                              512 * 1024 * 1024,
-                                              256 * 1024 * 1024,
-                                              512 * 1024 * 1024);
-    notllama::VulkanDescriptorManager desc_mgr(ctx.device, ctx.physicalDevice, &allocator);
-    if (!desc_mgr.IsValid()) { std::cerr << "Descriptor manager init failed\n"; ctx.cleanup(); return 1; }
-    shader_lib.SetBindlessSetLayout(desc_mgr.GetBindlessSetLayout());
-
-    notllama::VulkanComputeEngine engine(ctx.device, ctx.physicalDevice, ctx.queues[0],
-                                          ctx.queueFamilyIndex, &shader_lib, &desc_mgr,
-                                           &allocator, static_cast<uint32_t>(model_adapter.GetHeadDim() * model_adapter.GetNumKVHeads()));
-    engine.SetModel(&model_adapter);
-    engine.SetKVCache(&kv_cache, 2048);
-
-    // ── Pre-fill prompt (first token) ──
-    if (!engine.AddSequence(0, input_ids)) {
-        std::cerr << "Failed to add sequence\n"; ctx.cleanup(); return 1;
-    }
-
-    // ── Generation loop ──
-    printf("\nGenerating...\n");
-    fprintf(stderr, "[main] Starting inference loop\n");
-    auto t0 = std::chrono::steady_clock::now();
-    uint32_t tokens_generated = 0;
-    const uint32_t max_tokens = 128;
-    std::vector<uint32_t> output_ids;
-    output_ids.reserve(max_tokens);
-    uint32_t prev_token = UINT32_MAX;
-    while (tokens_generated < max_tokens) {
-        if (!engine.StepBatch()) {
-            printf("[engine stopped at token %u]\n", tokens_generated);
-            break;
-        }
-        uint32_t last_id = engine.LastTokenId();
-        if (last_id != prev_token) {
-            output_ids.push_back(last_id);
-            tokens_generated++;
-            prev_token = last_id;
-        }
-    }
-
-    auto t1 = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(t1 - t0).count();
-    printf("\nGenerated %u tokens in %.2fs (%.1f tok/s)\n",
-           tokens_generated, elapsed, tokens_generated / elapsed);
-
-    std::string output = tokenizer.decode(output_ids);
-    printf("\n--- Output ---\n%s\n---\n", output.c_str());
-    } // engine + allocator + desc_mgr destroyed here
-
-    // ── Cleanup ──
-    kv_cache.free();
+    fprintf(stderr, "\n[main] Cleanup...\n");
     ctx.cleanup();
+    fprintf(stderr, "[main] Done.\n");
     return 0;
 }

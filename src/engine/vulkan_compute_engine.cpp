@@ -54,29 +54,65 @@ void VulkanComputeEngine::SetModel(IModel* model) {
     n_layers_ = (uint32_t)model->GetNumLayers();
     n_kv_heads_ = (uint32_t)model->GetNumKVHeads();
     head_dim_ = (uint32_t)model->GetHeadDim();
-    n_heads_ = (uint32_t)(head_dim_ > 0 ? model->GetEmbeddingDim() / head_dim_ : 0);
-    auto tensors = model->GetWeightTensors();
-    for (auto& t : tensors) { (void)t; }  // unused here, dim scanning done with raw tensors
     embed_dim_ = (uint32_t)model->GetEmbeddingDim();
-    // Derive vocab_size / hidden_dim from raw tensors (have names)
-    {
-        auto raw = model->GetRawTensors();
+    n_heads_ = (head_dim_ > 0 && embed_dim_ > 0) ? (embed_dim_ / head_dim_) : 0;
+
+    // Derive vocab_size / hidden_dim from named raw tensors
+    auto raw = model->GetRawTensors();
+    vocab_size_ = 0;
+    hidden_dim_ = 0;
+
+    for (auto& t : raw) {
+        if (t.shape.size() < 2) continue;
+
+        // vocab_size from output/lm_head tensor: shape [vocab, dim] or [dim, vocab]
+        if (t.name.find("output.weight") != std::string::npos ||
+            t.name.find("output_norm") == std::string::npos && t.name.find("output") != std::string::npos) {
+            // output.weight is typically [vocab_size, embedding_dim]
+            if (t.shape[0] > vocab_size_ && t.shape[0] < 1000000) vocab_size_ = t.shape[0];
+        }
+        // Also check token_embd as fallback for vocab_size (shared weight)
+        if (vocab_size_ == 0 && (t.name.find("token_embd") != std::string::npos ||
+                                  t.name.find("tok_embeddings") != std::string::npos)) {
+            if (t.shape[0] > vocab_size_ && t.shape[0] < 1000000) vocab_size_ = t.shape[0];
+        }
+
+        // hidden_dim from FFN gate/up tensors
+        // ffn_gate/gate_proj: [embed_dim, hidden_dim] or [hidden_dim, embed_dim]
+        if ((t.name.find("ffn_gate") != std::string::npos ||
+             t.name.find("ffn_up")   != std::string::npos ||
+             t.name.find("gate_proj") != std::string::npos ||
+             t.name.find("up_proj")  != std::string::npos)) {
+            // For [embed_dim, hidden_dim], shape[1] is hidden_dim
+            // For [hidden_dim, embed_dim], shape[0] is hidden_dim
+            uint32_t candidate = 0;
+            if (t.shape[0] == embed_dim_ && t.shape[1] != embed_dim_) {
+                candidate = t.shape[1];  // [embed, hidden]
+            } else if (t.shape[1] == embed_dim_ && t.shape[0] != embed_dim_) {
+                candidate = t.shape[0];  // [hidden, embed]
+            } else {
+                // Ambiguous: take the larger dimension that's not embed_dim
+                candidate = (t.shape[0] > t.shape[1]) ? t.shape[0] : t.shape[1];
+                if (candidate == embed_dim_) candidate = (t.shape[0] < t.shape[1]) ? t.shape[0] : t.shape[1];
+            }
+            if (candidate > hidden_dim_ && candidate < 1000000) hidden_dim_ = candidate;
+        }
+    }
+
+    // Fallback: if vocab_size still 0, try to get from embedding tensor
+    if (vocab_size_ == 0) {
         for (auto& t : raw) {
-            if (t.shape.size() >= 2) {
-                if (t.shape[0] > vocab_size_) vocab_size_ = t.shape[0];
-                if (t.shape[1] > vocab_size_) vocab_size_ = t.shape[1];
-                // hidden_dim_ from FFN gate/up tensors
-                if ((t.name.find("ffn_gate") != std::string::npos ||
-                     t.name.find("ffn_up")   != std::string::npos) &&
-                    t.shape[1] < 100000 && t.shape[1] > hidden_dim_) {
-                    hidden_dim_ = t.shape[1];
-                }
+            if (t.name.find("token_embd") != std::string::npos ||
+                t.name.find("tok_embeddings") != std::string::npos) {
+                vocab_size_ = t.shape[0];
+                break;
             }
         }
+    }
+
     fprintf(stderr, "[SetModel] n_layers=%u n_heads=%u n_kv=%u head_dim=%u embed=%u vocab=%u hidden=%u\n",
             n_layers_, n_heads_, n_kv_heads_, head_dim_, embed_dim_, vocab_size_, hidden_dim_);
     fflush(stderr);
-    }
 }
 
 void VulkanComputeEngine::SetKVCache(rdna4::KVCacheManager* kv_cache, uint32_t max_seq_len) {
