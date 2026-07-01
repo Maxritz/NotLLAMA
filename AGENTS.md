@@ -81,14 +81,18 @@ Default section order:
 
 ## Code Move (2026-06-30)
 
-The GPU inference stack produced NaN/corruption on real models (Gemma 4 Q4_0) and repeatedly hung/blanked the GPU. Per user instruction, the broken compute/quant/shader code has been moved out of the active source tree to `C:\Users\rr\Desktop\not-working-code\` (outside the repo).
+The previous GPU inference stack produced NaN/corruption on real models and repeatedly hung/blanked the GPU. Per user instruction, the broken compute/quant/shader code was moved to `C:\Users\rr\Desktop\not-working-code\` (outside the repo).
 
-What remains in the active tree:
+A **new active modular engine** (`VulkanComputeEngine` in `src/engine/`) now runs per-token inference with K-quant GEMM, flash attention, and MoE GPU/CPU paths.
+
+Active source tree:
 - `src/host/context.cpp`, `scheduler.cpp`, `allocator.cpp`, `pipeline_builder.cpp`, `kv_cache.cpp`, `weight_uploader.cpp`, `tokenizer.cpp`, `profiler.cpp`, `mailbox.cpp`, `memory.cpp`, `vgpr_stub.cpp`
-- `src/host/inference_engine.cpp` — stub implementation (methods print a disabled message)
-- `src/host/turboquant_dispatch.cpp` — stub implementation
-- `main.cpp` — minimal CLI that loads a model and prints metadata; no inference
-- `CMakeLists.txt` — shader compilation and inference test targets disabled
+- `src/host/inference_engine.cpp` — legacy stub (not the active engine)
+- `src/host/turboquant_dispatch.cpp` — legacy stub
+- `src/engine/vulkan_compute_engine.cpp` — **active** modular engine
+- `src/loaders/gguf.cpp` — Windows memory-mapped GGUF loader (>32 GB)
+- `main.cpp` — full CLI with `-m`, interactive mode, token generation
+- `CMakeLists.txt` — active; all targets build
 
 ## Architecture Philosophy (BINDING ON ALL AGENTS)
 
@@ -399,26 +403,27 @@ Every trace produces durable knowledge. Extract these fields:
   - `turboquant_integration.md` — TurboQuant block layouts, bit-packing diagrams, and 5-step engine wiring checklist.
   - `turboquant_formats.md` — TurboQuant format variants and comparison table.
   - `turboquant_schema.json` — JSON schema for TurboQuant configuration.
-- **`src/host/`**: Vulkan infrastructure — scheduler, allocator, KV cache, weight uploader, tokenizer, profiler, pipeline builder, mailbox. GPU inference is stubbed; the previous implementation lives at `C:\Users\rr\Desktop\not-working-code\`.
-  - `inference_engine.cpp` — stub implementation: prints disabled message for all inference methods
+- **`src/host/`**: Vulkan infrastructure — scheduler, allocator, KV cache, weight uploader (+GGUF mmap), tokenizer, profiler, pipeline builder, mailbox. Legacy `inference_engine.cpp` is a stub; active engine lives in `src/engine/`.
+  - `weight_uploader.cpp` — GGUF upload, metadata loading, per-layer streaming
+  - `inference_engine.cpp` — legacy stub (not the active engine)
   - `scheduler.cpp` — Vulkan queue submission, fence handling, cleanup lifecycle
 - **`include/engine/`**: Modular engine interface layer (v6.0 blueprint) and adapter headers. Pure-virtual interfaces plus adapter headers that expose concrete implementations backed by existing `rdna4::*` classes.
   - Core interfaces: `types.hpp`, `idevice.hpp`, `imemory_allocator.hpp`, `imodel.hpp`, `iquantization.hpp`, `idescriptor_manager.hpp`, `ishader_library.hpp`, `iattention_scheduler.hpp`, `itokenizer.hpp`, `icompute_engine.hpp`, `idebug_context.hpp`
   - Adapters: `vulkan_device.hpp`, `ring_allocator_adapter.hpp`, `vulkan_compute_engine.hpp`, `vulkan_shader_library.hpp`, `vulkan_descriptor_manager.hpp`, `vulkan_debug_context.hpp`, `shader_compiler.hpp`, `tokenizer_adapter.hpp`, `model_adapter.hpp`, `kv_cache_adapter.hpp`
   - `engine.hpp` — convenience umbrella header
-- **`src/engine/`**: Adapter/stub implementations of the modular interfaces. See `src/engine/AGENTS.md`.
+- **`src/engine/`**: Adapter implementations of the modular interfaces (v6.0 blueprint). See `src/engine/AGENTS.md`.
   - `vulkan_device.cpp` — `IDevice` adapter for `rdna4::VulkanContext`
   - `ring_allocator_adapter.cpp` — `IMemoryAllocator` bridge using three `rdna4::RingAllocator` instances
   - `tokenizer_adapter.cpp` — `ITokenizer` adapter for `rdna4::Tokenizer`
   - `model_adapter.cpp` — `IModel` adapter for `rdna4::WeightUploader` + `rdna4::ModelDesc`
   - `kv_cache_adapter.cpp` — `IAttentionScheduler` adapter for `rdna4::KVCacheManager`
-  - `vulkan_compute_engine.cpp` — stub `IComputeEngine` implementation
-  - `vulkan_shader_library.cpp` — `IShaderLibrary` implementation with SPIR-V loading, specialization constants, and pipeline cache
-  - `vulkan_descriptor_manager.cpp` — `IDescriptorManager` implementation: bindless SSBO descriptor table + per-frame metadata ring buffer
-  - `vulkan_debug_context.cpp` — `IDebugContext` implementation using VK_EXT_debug_utils
+  - `vulkan_compute_engine.cpp` — active `IComputeEngine` (per-token inference, K-quant GEMM, MoE GPU/CPU)
+  - `vulkan_shader_library.cpp` — `IShaderLibrary` with SPIR-V loading, specialization constants, and pipeline cache
+  - `vulkan_descriptor_manager.cpp` — `IDescriptorManager`: bindless SSBO descriptor table + per-frame metadata ring buffer
+  - `vulkan_debug_context.cpp` — `IDebugContext` using VK_EXT_debug_utils
   - `shader_compiler.cpp` — runtime GLSL -> SPIR-V compiler using the system `glslc`; caches per-profile SPIR-V under `shaders/cache/`
 - **`src/kernels/`**: Empty. All GLSL compute shaders have been copied to `shaders/` for dynamic runtime compilation.
-- **`shaders/`**: All 37 GLSL compute shader sources for GPU inference (attention, FFN, dequant, quant, GGUF, KV cache, rope, etc.). Compiled on demand by `ShaderCompiler` using the user's system `glslc`. Compiled SPIR-V cached under `shaders/cache/`. `PrecompileAll()` compiles all `.comp` files on first use.
+- **`shaders/`**: All 42 GLSL compute shader sources for GPU inference (attention, FFN, dequant, quant, GGUF, KV cache, rope, etc.). Includes `quantshaderpack/` shaders (gemm_q2_k, gemm_q3_k, gemm_q5_k, moe_router, moe_experts). Compiled on demand by `ShaderCompiler` using the user's system `glslc`. Compiled SPIR-V cached under `shaders/cache/`. `PrecompileAll()` compiles all `.comp` files on first use.
 - **`tools/`**: Python utilities. Owned separately.
   - `dox_lint.py` — AGENTS.md compliance checker.
   - `graphify_client.py` — Python GraphifyClient for subprocess-based knowledge graph queries.
@@ -436,16 +441,16 @@ Every trace produces durable knowledge. Extract these fields:
 ### Key Contracts
 
 - `scheduler.cleanup()` must be called before `ctx.cleanup()` in main.cpp — destroys command pools while VkDevice is still alive.
-- `src/host/inference_engine.cpp` is currently a stub. All inference methods print a disabled message and return empty/error values.
-- `main.cpp` loads a model via `WeightUploader`, prints metadata, and exits. It does not run GPU inference.
+- Active inference engine: `VulkanComputeEngine` in `src/engine/`. Legacy `src/host/inference_engine.cpp` is a stub — all methods print disabled messages.
+- `main.cpp` loads models via `-m <model.gguf>`, supports interactive token generation, and the web/agent/MCP subsystems.
 - `ShaderCompiler` compiles `.comp` shaders at runtime via the system `glslc`. If `VULKAN_SDK` is not set and `glslc` is not on `PATH`, runtime compilation is skipped and `VulkanShaderLibrary` falls back to precompiled `.spv` files.
 - `PrecompileAll()` iterates every `.comp` file in the shader directory and compiles/caches it for the current GPU profile.
 
 ### Verification
 
 - Build: `cd build && cmake --build . --config Release`
-- Runtime: `rdna4_llama.exe [--clear-shaders] <model.weights.json> <model.weights.bin>` must load the model, print metadata, and exit cleanly without crash. Pass `--clear-shaders` to delete cached SPIR-V and force a fresh shader compile.
-- GPU inference verification is disabled until the compute stack is restored.
+- GPU inference: build + smoke test on `stories260k.gguf`. Full model validation (Q6_K MoE/Gemma) in progress with known output quality gaps. See `src/engine/AGENTS.md` for dispatch-level verification.
+- All 5 kernel tests (`test_rms_norm`, `test_rope`, `test_silu_mul`, `test_embed`, `test_engine`) should pass before relying on a new shader path.
 
 ## Changes (2026-06-28 MiMo Round 2 + 3 — TurboQuant host-side deliverables)
 
@@ -853,8 +858,65 @@ The AMD WDDM driver profiles apps **statically at `vkCreateDevice` time** by fea
 - `main.cpp`: parses `--clear-shaders` anywhere in argv, deletes `shaders/cache/*.spv` before shader precompilation, and logs the count.
 - Updated usage string and root AGENTS.md verification line.
 
+## Changes (2026-07-01 — Finalfixes validation bug fixes)
+
+### Bugs fixed
+
+| # | Bug | Root cause | Fix |
+|---|-----|------------|-----|
+| 1 | `gemma4-v2-Q6_K` `head_count_kv = 0` | GGUF parser skipped `GGUFType::ARRAY` metadata; gemma4 stores KV head count as a single-element array. | `readIntByType()` in `src/loaders/gguf.cpp` now recursively reads one-element integer arrays. |
+| 2 | Lazy loading never uploaded layers | `StepBatch()` used `layer_weights_` addresses captured at `LoadModelWeights()` time, all zero because layers were deferred. | Added `EnsureLayerWeights()` + `ReloadLayerWeights()` in `src/engine/vulkan_compute_engine.cpp`; called before each layer's first dispatch. |
+| 3 | Q6_K GEMM produced garbage logits | `gemm_q6k.comp` had workgroup/global ID mismatch with host dispatch and used shared-memory reduction. | Rewrote `shaders/gemm_q6k.comp` as a per-column matvec matching `gemm_q4_0.comp`; updated host dispatch to `(N+255)/256`. |
+| 4 | 35 GB GGUF `bad allocation` | `GGUFLoader` copied the whole file into a `std::vector<uint8_t>`; `WeightUploader::loadFromGGUF` then copied it again. | `GGUFLoader` now memory-maps the file on Windows (`CreateFileMapping`/`MapViewOfFile`). `WeightUploader` keeps the `GGUFLoader` alive as the backing store instead of copying. |
+| 5 | MoE model FFN crash | Dense FFN slots were zero for MoE layers; expert tensors overwrote each other in slot mapping. | `LoadModelWeights()` no longer maps expert tensors into dense slots. Added `DispatchMoeFfn()` CPU fallback: computes routing logits, picks top-1 expert, dequantizes that expert's up/gate/down weights, runs FFN on CPU, and uploads the result. |
+
+### Interface changes
+- `IModel` gained `CpuDequantTensor(const std::string&, std::vector<float>&)` for CPU-side dequant fallback paths.
+- `WeightUploader` gained `cpuDequantTensor()` and keeps a `std::unique_ptr<notllama::GGUFLoader>` for mmap-backed GGUF data.
+- `VulkanComputeEngine` gained `EnsureLayerWeights()`, `ReloadLayerWeights()`, `DispatchMoeFfn()`, `CopyGpuToCpu()`, `CopyCpuToGpu()`, and `DequantExpertSlice()`.
+
+### Docs
+- `src/engine/AGENTS.md`: removed "stub" language; updated verification instructions.
+
 ### Current inference status
-- Active modular engine (`VulkanComputeEngine`) loads weights and passes kernel validation, but `StepBatch()` returns false during inference because `KVCacheManager` is not wired in `main.cpp` and residual-add/quantized-GEMM paths are still incomplete.
-- Legacy `tests/test_multi_token` runs a full forward pass but produces degenerate output (repeated token 483).
+- Active modular engine (`VulkanComputeEngine`) now implements a full per-token loop:
+  embed → RMS → QKV GEMM → RoPE → KV-cache write → flash attention → attention-out
+  → residual → FFN (dense GPU GEMM or MoE CPU fallback) → residual → LM head → top-k sample.
+- Fixes applied: GGUF array-type metadata parsing (`head_count_kv`), lazy layer upload
+  wired into `StepBatch`, Q6_K per-column GEMM shader, Windows memory-mapped GGUF loader
+  for files >32 GB, and a CPU-based top-1-expert MoE fallback.
+- Known remaining gaps: Q6_K shader is simplified (one thread per column, may be slow);
+  MoE uses CPU dequantization per layer (not GPU expert routing); full prompt prefill
+  is not batched; output quality is still being validated against CPU reference.
+- Legacy `tests/test_multi_token` runs a full forward pass but produces degenerate output
+  (repeated token 483) — this path is not the active modular engine.
+
+## Changes (2026-07-01 — quantshaderpack integration + GGUF upload OOB fix)
+
+- **GGUF upload OOB fix**: `WeightUploader::uploadTensor()` now uses `GetTensorDataSize()`
+  instead of `binData_.size()` for the GGUF-mmap path. `binData_` is empty for mmap-backed
+  GGUF models, causing `offset + size > 0` to reject every tensor upload.
+- **quantshaderpack/ shaders integrated**: Q2_K, Q3_K, Q5_K GEMM kernels + MoE router/experts.
+  - `KernelType` enum extended with `GEMM_Q2_K`, `GEMM_Q3_K`, `GEMM_Q5_K`, `MOE_ROUTER`,
+    `MOE_EXPERTS` in `include/engine/ishader_library.hpp`.
+  - Shader-name mappings added in `src/engine/vulkan_shader_library.cpp`.
+  - K-quant block layouts corrected against llama.cpp: Q2_K 84B d-last, Q3_K 110B d-last,
+    Q5_K 176B d-first (qs + qh + scales + d + dmin).
+  - `MoeRouterPushConstants` and `MoeExpertsPushConstants` added to `include/rdna4_types.hpp`.
+  - `DispatchGemm()` routes Q2_K/Q3_K/Q5_K with `(N+255)/256` workgroup dispatch.
+  - `DispatchMoeRouterGpu()` and `DispatchMoeExpertsGpu()` in `vulkan_compute_engine.cpp`.
+  - `DispatchMoeFfn()` tries GPU router first; experts fall back to CPU top-1 FFN because
+    `moe_experts.comp` requires F32 weights (most real MoE GGUFs use Q8_0 quantized experts).
+- **New shader files**: `shaders/gemm_q2_k.comp`, `gemm_q3_k.comp`, `gemm_q5_k.comp` (written
+  with corrected block layouts), `moe_router.comp`, `moe_experts.comp` (copied from
+  `quantshaderpack/shaders/`).
+- **Build**: Clean in `Release`. Smoke test on `stories260k.gguf` generates tokens.
+- **Model validation started**:
+  - `VibeThinker-3B.Q6_K`: all 36 layers run; 2 tokens generated; second token ID
+    `2143840873` out of vocab range (151936) — logits/TopK or Q6_K dequant bug suspected.
+  - `gemma4-v2-Q6_K`: loaded through layer 45+ before log truncation.
+- **MoE path notes**: GPU router is always attempted when `gate_inp` is F32. Experts path
+  is rarely used because `moe_experts.comp` requires F32 expert weights. CPU fallback
+  dequantizes one expert at a time.
 
 

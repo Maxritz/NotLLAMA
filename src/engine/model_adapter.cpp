@@ -170,4 +170,15 @@ const void* ModelAdapter::GetWeightShadowCopy(const std::string& tensor_name) {
     return nullptr;
 }
 
+bool ModelAdapter::CpuDequantTensor(const std::string& tensor_name, std::vector<float>& out) {
+    for (auto& t : model_.tensors) {
+        if (t.name == tensor_name) {
+            return uploader_.cpuDequantTensor(t, out);
+        }
+    }
+    fprintf(stderr, "[ModelAdapter] CpuDequantTensor: tensor '%s' not found\n", tensor_name.c_str());
+    fflush(stderr);
+    return false;
+}
+
 } // namespace notllama

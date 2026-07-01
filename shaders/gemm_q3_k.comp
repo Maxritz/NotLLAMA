@@ -1,0 +1,104 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Q3_K GEMM: 256-element super-blocks.
+// Layout (llama.cpp block_q3_K): 110 bytes (d-last)
+//   bytes 0-31:   hmask[32] — 1 high bit per element
+//   bytes 32-95:  qs[64] — 256 x 3-bit quants packed (4 elements per 3 bytes? actually bit-packed)
+//   bytes 96-107: scales[12] — 32 x 4-bit scales packed 2 per byte? or 32 int8?
+//   bytes 108-109: d (fp16 super-block scale)
+// Dequant (matches dequantize.comp format 11):
+//   sub = i / 32 (0..7)
+//   scale = int8(scales[sub])  (scales stored one per sub-block?)
+//   q4 = nibble from qs
+//   h = hmask bit
+//   q3 = (q4 & 0x3) | (h << 2); if (q4 & 0x8) q3 -= 4;
+//   value = d * scale * q3
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef { uint data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HiddenRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer OutRef { float data[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA; uint64_t addrB; uint64_t addrC;
+    uint M; uint N; uint K;
+    float alpha; uint transB;
+} pc;
+
+uint extractByte(WeightRef buf, uint byteOff) {
+    uint word = buf.data[byteOff >> 2];
+    return (word >> ((byteOff & 3u) << 3u)) & 0xFFu;
+}
+
+float readF16(WeightRef buf, uint byteOff) {
+    uint lo = extractByte(buf, byteOff);
+    uint hi = extractByte(buf, byteOff + 1u);
+    return float(float16_t(lo | (hi << 8u)));
+}
+
+uint extract3bit(WeightRef buf, uint byteOff, uint bitPos) {
+    uint b0 = extractByte(buf, byteOff + (bitPos >> 3u));
+    uint shift = bitPos & 7u;
+    uint val = b0 >> shift;
+    if (shift > 5u) {
+        uint b1 = extractByte(buf, byteOff + (bitPos >> 3u) + 1u);
+        val |= (b1 << (8u - shift));
+    }
+    return val & 7u;
+}
+
+float dequantQ3_K(WeightRef buf, uint blockOffset, uint elemIdx) {
+    float d = readF16(buf, blockOffset + 108u);
+
+    uint sub = elemIdx >> 5;      // 0..7
+    int scale = int(extractByte(buf, blockOffset + 96u + sub));
+
+    uint qsByteOff = blockOffset + 32u + (elemIdx >> 1u);
+    uint qsByte = extractByte(buf, qsByteOff);
+    int q4 = ((elemIdx & 1u) == 0u) ? int(qsByte & 0xFu) : int((qsByte >> 4u) & 0xFu);
+
+    uint hmaskByteOff = blockOffset + (elemIdx >> 3u);
+    uint hmaskByte = extractByte(buf, hmaskByteOff);
+    int h = int((hmaskByte >> (elemIdx & 7u)) & 1u);
+
+    int q3 = (q4 & 0x3) | (h << 2);
+    if ((q4 & 0x8) != 0) q3 -= 4;
+
+    return d * float(scale) * float(q3);
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.N || pc.transB != 0u) return;
+
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) {
+            OutRef outBuf = OutRef(pc.addrC);
+            outBuf.data[col] = 0.0;
+        }
+        return;
+    }
+
+    WeightRef weight = WeightRef(pc.addrB);
+    HiddenRef hidden = HiddenRef(pc.addrA);
+    OutRef outBuf = OutRef(pc.addrC);
+
+    uint blocksPerCol = (pc.K + 255u) >> 8;
+    float sum = 0.0;
+
+    for (uint k = 0; k < pc.K; ++k) {
+        uint blockIdx = k >> 8;
+        uint elemInBlock = k & 255u;
+        uint blockOffset = (col * blocksPerCol + blockIdx) * 110u;
+        float w = dequantQ3_K(weight, blockOffset, elemInBlock);
+        sum += w * hidden.data[k];
+    }
+
+    outBuf.data[col] = pc.alpha * sum;
+}

@@ -29,6 +29,7 @@ VulkanComputeEngine::~VulkanComputeEngine() {
         if (scratch_ffn_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_ffn_);
         if (scratch_ffn_gate_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_ffn_gate_);
         if (scratch_logits_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_logits_);
+        if (scratch_moe_router_.buffer) allocator_->Free(MemoryType::TRANSIENT, scratch_moe_router_);
         if (rms_weight_.buffer) allocator_->Free(MemoryType::TRANSIENT, rms_weight_);
     }
 
@@ -134,6 +135,32 @@ void VulkanComputeEngine::SetModel(IModel* model) {
     fprintf(stderr, "[SetModel] n_layers=%u n_heads=%u n_kv=%u head_dim=%u embed=%u vocab=%u hidden=%u\n",
             n_layers_, n_heads_, n_kv_heads_, head_dim_, embed_dim_, vocab_size_, hidden_dim_);
     fflush(stderr);
+
+    // Detect MoE config from routing tensor shape / metadata
+    num_experts_ = 0;
+    top_k_ = 1;
+    auto raw_for_moe = model->GetRawTensors();
+    for (auto& t : raw_for_moe) {
+        if (t.name.find("gate_inp") != std::string::npos || t.name.find("ffn_gate_inp") != std::string::npos) {
+            if (t.shape.size() == 2) {
+                uint32_t candidate = (t.shape[0] == embed_dim_) ? (uint32_t)t.shape[1] : (uint32_t)t.shape[0];
+                if (candidate > 1 && candidate < 1000000) num_experts_ = candidate;
+            }
+        }
+    }
+    if (num_experts_ == 0) {
+        // Fallback: count expert-stack tensors
+        for (auto& t : raw_for_moe) {
+            if (t.name.find("ffn_gate_exps") != std::string::npos || t.name.find("gate_exps") != std::string::npos) {
+                if (t.shape.size() >= 1 && t.shape[0] > 1 && t.shape[0] < 1000000) {
+                    num_experts_ = (uint32_t)t.shape[0];
+                    break;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "[SetModel] MoE config: num_experts=%u top_k=%u\n", num_experts_, top_k_);
+    fflush(stderr);
 }
 
 void VulkanComputeEngine::SetKVCache(rdna4::KVCacheManager* kv_cache, uint32_t max_seq_len) {
@@ -218,10 +245,16 @@ bool VulkanComputeEngine::AllocScratchBuffers() {
     scratch_logits_ = AllocScratch(logits_size);
     rms_weight_ = AllocScratch(embed_size);
 
+    if (num_experts_ > 0) {
+        size_t moe_scratch_size = sizeof(float) * (num_experts_ + top_k_ * 2) + sizeof(uint32_t) * top_k_;
+        scratch_moe_router_ = AllocScratch(moe_scratch_size);
+    }
+
     scratch_allocated_ = scratch_q_.buffer && scratch_k_.buffer && scratch_v_.buffer &&
                          scratch_attn_.buffer && scratch_attn_out_.buffer && scratch_norm_.buffer &&
                          scratch_ffn_.buffer && scratch_ffn_gate_.buffer &&
                          scratch_logits_.buffer && rms_weight_.buffer;
+    if (num_experts_ > 0) scratch_allocated_ = scratch_allocated_ && scratch_moe_router_.buffer;
     rms_weight_loaded_ = scratch_allocated_;
     return scratch_allocated_;
 }
@@ -308,13 +341,16 @@ bool VulkanComputeEngine::LoadModelWeights() {
         else if (name.ends_with("ffn_gate.weight") || name.ends_with("gate_proj.weight")) slot = 7;
         else if (name.ends_with("ffn_down.weight") || name.ends_with("down_proj.weight")) slot = 8;
         else if (name.find("ffn_up_exps") != std::string::npos || name.find("up_exps") != std::string::npos) {
-            slot = 6; is_moe = true;
+            is_moe = true;
+            fprintf(stderr, "[LoadModelWeights] Layer %zu MoE up_exps: %s\n", layer, name.c_str());
         }
         else if (name.find("ffn_gate_exps") != std::string::npos || name.find("gate_exps") != std::string::npos) {
-            slot = 7; is_moe = true;
+            is_moe = true;
+            fprintf(stderr, "[LoadModelWeights] Layer %zu MoE gate_exps: %s\n", layer, name.c_str());
         }
         else if (name.find("ffn_down_exps") != std::string::npos || name.find("down_exps") != std::string::npos) {
-            slot = 8; is_moe = true;
+            is_moe = true;
+            fprintf(stderr, "[LoadModelWeights] Layer %zu MoE down_exps: %s\n", layer, name.c_str());
         }
         else if (name.find("ffn_gate_inp") != std::string::npos || name.find("gate_inp") != std::string::npos) {
             layer_moe_gate_[layer] = t.gpuAddress;
@@ -354,6 +390,57 @@ bool VulkanComputeEngine::LoadModelWeights() {
 
     model_weights_loaded_ = true;
     return true;
+}
+
+bool VulkanComputeEngine::ReloadLayerWeights(uint32_t layer) {
+    if (layer >= n_layers_ || !model_) return false;
+    auto raw = model_->GetRawTensors();
+    for (auto& t : raw) {
+        const auto& name = t.name;
+        size_t l = (size_t)-1;
+        auto try_prefix = [&](const std::string& prefix) -> bool {
+            auto p = name.find(prefix);
+            if (p == std::string::npos) return false;
+            auto dot = name.find('.', p + prefix.size());
+            if (dot == std::string::npos) return false;
+            l = std::stoul(name.substr(p + prefix.size(), dot - p - prefix.size()));
+            return true;
+        };
+        if (!try_prefix("blk.") && !try_prefix("layers.")) continue;
+        if (l != layer) continue;
+        if (t.gpuAddress == 0) continue;
+
+        int slot = -1;
+        if (name.find("attn_norm") != std::string::npos &&
+            name.find("post_") == std::string::npos) slot = 0;
+        else if (name.ends_with("attn_q.weight") || name.ends_with("q_proj.weight") ||
+                 (name.find("attn_q.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 1;
+        else if (name.ends_with("attn_k.weight") || name.ends_with("k_proj.weight") ||
+                 (name.find("attn_k.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 2;
+        else if (name.ends_with("attn_v.weight") || name.ends_with("v_proj.weight") ||
+                 (name.find("attn_v.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 3;
+        else if (name.ends_with("attn_output.weight") || name.ends_with("o_proj.weight")) slot = 4;
+        else if (name.find("ffn_norm") != std::string::npos && name.find("post_") == std::string::npos) slot = 5;
+        else if (name.ends_with("ffn_up.weight") || name.ends_with("up_proj.weight")) slot = 6;
+        else if (name.ends_with("ffn_gate.weight") || name.ends_with("gate_proj.weight")) slot = 7;
+        else if (name.ends_with("ffn_down.weight") || name.ends_with("down_proj.weight")) slot = 8;
+
+        if (slot >= 0 && slot < WEIGHTS_PER_LAYER) {
+            layer_weights_[layer][slot] = t.gpuAddress;
+            layer_weight_formats_[layer][slot] = t.format;
+        }
+    }
+    return true;
+}
+
+bool VulkanComputeEngine::EnsureLayerWeights(uint32_t layer) {
+    if (layer >= n_layers_ || !model_) return false;
+    if (!model_->StreamLayerWeights(layer, allocator_)) {
+        fprintf(stderr, "[EnsureLayerWeights] FAILED to stream layer %u\n", layer);
+        fflush(stderr);
+        return false;
+    }
+    return ReloadLayerWeights(layer);
 }
 
 bool VulkanComputeEngine::AddSequence(uint32_t seq_id, const std::vector<uint32_t>& tokens) {
@@ -449,6 +536,13 @@ bool VulkanComputeEngine::StepBatch() {
     //   ADD(hidden_state, scratch_norm_) → hidden_state  (residual add)
     if (current_layer_ < n_layers_ && step_phase_ >= StepPhase::LAYER_RMS_ATTN &&
                                       step_phase_ <= StepPhase::LAYER_NEXT) {
+        // Lazy-load the weights for this layer before any dispatch uses them.
+        if (!EnsureLayerWeights(current_layer_)) {
+            fprintf(stderr, "[StepBatch] FATAL: cannot ensure weights for layer %u\n", current_layer_);
+            fflush(stderr);
+            return false;
+        }
+
         auto& lw = layer_weights_[current_layer_];
         auto& lf = layer_weight_formats_[current_layer_];
         fprintf(stderr, "[StepBatch] per-layer phase=%d layer=%u seq=%u\n", (int)step_phase_, current_layer_, current_seq_id_); fflush(stderr);
@@ -545,6 +639,14 @@ bool VulkanComputeEngine::StepBatch() {
         }
 
         if (step_phase_ == StepPhase::LAYER_FFN_UP) {
+            // MoE layers do not have dense ffn_up/gate/down; use CPU fallback.
+            if (layer_is_moe_[current_layer_]) {
+                if (!DispatchMoeFfn(current_layer_, scratch_norm_.device_address,
+                                     scratch_norm_.device_address))
+                    return false;
+                step_phase_ = StepPhase::LAYER_FFN_RESIDUAL;
+                return true;
+            }
             if (!DispatchGemm(scratch_norm_.device_address, lw[6], scratch_ffn_.device_address,
                                1, hidden_dim_, embed_dim_, true, lf[6]))
                 return false;
@@ -856,10 +958,10 @@ bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b
         case rdna4::QuantFormat::Q8_0: kt = KernelType::GEMM_Q8_0; qtrans = false; break;
         case rdna4::QuantFormat::Q4_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
         case rdna4::QuantFormat::Q6_K: kt = KernelType::GEMM_Q6K;  qtrans = false; break;
+        case rdna4::QuantFormat::Q2_K: kt = KernelType::GEMM_Q2_K; qtrans = false; break;
+        case rdna4::QuantFormat::Q3_K: kt = KernelType::GEMM_Q3_K; qtrans = false; break;
+        case rdna4::QuantFormat::Q5_K: kt = KernelType::GEMM_Q5_K; qtrans = false; break;
         case rdna4::QuantFormat::Q1_0: kt = KernelType::GEMM_Q4_0; qtrans = false; break;
-        case rdna4::QuantFormat::Q2_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
-        case rdna4::QuantFormat::Q3_K: kt = KernelType::GEMM_Q4K;  qtrans = false; break;
-        case rdna4::QuantFormat::Q5_K: kt = KernelType::GEMM_Q6K;  qtrans = false; break;
         case rdna4::QuantFormat::Q8_K: kt = KernelType::GEMM_Q8_0; qtrans = false; break;
         default: break;
     }
@@ -881,7 +983,8 @@ bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b
     vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     if (kt == KernelType::COOPMAT_GEMM)
         vkCmdDispatch(cmd_buffer_, N, M, 1);
-    else if (kt == KernelType::GEMM_Q4_0 || kt == KernelType::GEMM_Q8_0)
+    else if (kt == KernelType::GEMM_Q4_0 || kt == KernelType::GEMM_Q8_0 || kt == KernelType::GEMM_Q6K ||
+             kt == KernelType::GEMM_Q2_K || kt == KernelType::GEMM_Q3_K || kt == KernelType::GEMM_Q5_K)
         vkCmdDispatch(cmd_buffer_, (N + 255) / 256, 1, 1);
     else
         vkCmdDispatch(cmd_buffer_, N, 1, 1);
@@ -1117,5 +1220,377 @@ void VulkanComputeEngine::ResetExecutionEngine() {
     step_phase_ = StepPhase::VALIDATE;
 }
 void VulkanComputeEngine::EnableProfiling(bool e) { profiling_ = e; }
+
+bool VulkanComputeEngine::CopyGpuToCpu(VkBuffer src_buf, VkDeviceSize src_offset, void* dst, size_t size) {
+    if (!src_buf || !dst || size == 0) return false;
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer readback;
+    if (vkCreateBuffer(device_, &bci, nullptr, &readback) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, readback, &mr);
+    VkPhysicalDeviceMemoryProperties pm; vkGetPhysicalDeviceMemoryProperties(physical_device_, &pm);
+    uint32_t mt = UINT32_MAX;
+    VkMemoryPropertyFlags hf = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < pm.memoryTypeCount; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (pm.memoryTypes[i].propertyFlags & hf) == hf)
+        { mt = i; break; }
+    if (mt == UINT32_MAX) { vkDestroyBuffer(device_, readback, nullptr); return false; }
+
+    VkMemoryAllocateInfo mai{}; mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+    VkDeviceMemory mem;
+    if (vkAllocateMemory(device_, &mai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, readback, nullptr); return false; }
+    if (vkBindBufferMemory(device_, readback, mem, 0) != VK_SUCCESS) { vkFreeMemory(device_, mem, nullptr); vkDestroyBuffer(device_, readback, nullptr); return false; }
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    VkBufferCopy region{}; region.srcOffset = src_offset; region.dstOffset = 0; region.size = size;
+    vkCmdCopyBuffer(cmd_buffer_, src_buf, readback, 1, &region);
+    vkEndCommandBuffer(cmd_buffer_);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) { vkFreeMemory(device_, mem, nullptr); vkDestroyBuffer(device_, readback, nullptr); return false; }
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+
+    void* mapped = nullptr;
+    vkMapMemory(device_, mem, 0, size, 0, &mapped);
+    if (mapped) { std::memcpy(dst, mapped, size); vkUnmapMemory(device_, mem); }
+    vkFreeMemory(device_, mem, nullptr);
+    vkDestroyBuffer(device_, readback, nullptr);
+    return mapped != nullptr;
+}
+
+bool VulkanComputeEngine::CopyCpuToGpu(const void* src, VkBuffer dst_buf, VkDeviceSize dst_offset, size_t size) {
+    if (!src || !dst_buf || size == 0) return false;
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer staging;
+    if (vkCreateBuffer(device_, &bci, nullptr, &staging) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, staging, &mr);
+    VkPhysicalDeviceMemoryProperties pm; vkGetPhysicalDeviceMemoryProperties(physical_device_, &pm);
+    uint32_t mt = UINT32_MAX;
+    VkMemoryPropertyFlags hf = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < pm.memoryTypeCount; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (pm.memoryTypes[i].propertyFlags & hf) == hf)
+        { mt = i; break; }
+    if (mt == UINT32_MAX) { vkDestroyBuffer(device_, staging, nullptr); return false; }
+
+    VkMemoryAllocateInfo mai{}; mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+    VkDeviceMemory mem;
+    if (vkAllocateMemory(device_, &mai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, staging, nullptr); return false; }
+    if (vkBindBufferMemory(device_, staging, mem, 0) != VK_SUCCESS) { vkFreeMemory(device_, mem, nullptr); vkDestroyBuffer(device_, staging, nullptr); return false; }
+
+    void* mapped = nullptr;
+    vkMapMemory(device_, mem, 0, size, 0, &mapped);
+    if (!mapped) { vkFreeMemory(device_, mem, nullptr); vkDestroyBuffer(device_, staging, nullptr); return false; }
+    std::memcpy(mapped, src, size);
+    vkUnmapMemory(device_, mem);
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    VkBufferCopy region{}; region.srcOffset = 0; region.dstOffset = dst_offset; region.size = size;
+    vkCmdCopyBuffer(cmd_buffer_, staging, dst_buf, 1, &region);
+    vkEndCommandBuffer(cmd_buffer_);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    bool ok = true;
+    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) ok = false;
+    if (ok) vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+
+    vkFreeMemory(device_, mem, nullptr);
+    vkDestroyBuffer(device_, staging, nullptr);
+    return ok;
+}
+
+bool VulkanComputeEngine::DequantExpertSlice(const std::string& tensor_name, uint32_t expert_index,
+                                              uint32_t expert_rows, uint32_t cols, std::vector<float>& out) {
+    if (!model_) return false;
+    const rdna4::TensorDesc* tensor = nullptr;
+    for (const auto& t : model_->GetRawTensors()) {
+        if (t.name == tensor_name) { tensor = &t; break; }
+    }
+    if (!tensor) return false;
+    if (tensor->shape.size() < 2) return false;
+    uint32_t total_rows = tensor->shape[0];
+    uint32_t actual_cols = tensor->shape[1];
+    if (actual_cols != cols) return false;
+    if (expert_index >= total_rows / expert_rows) return false;
+
+    // NOTE: this fallback dequantizes the entire expert-stack tensor, then copies
+    // the selected expert's rows. For very large expert stacks this is memory-heavy.
+    std::vector<float> full;
+    if (!model_->CpuDequantTensor(tensor->name, full)) return false;
+
+    uint32_t rows_before = expert_index * expert_rows;
+    uint32_t n_elements = expert_rows * cols;
+    size_t start = (size_t)rows_before * cols;
+    if (start + n_elements > full.size()) return false;
+    out.assign(full.begin() + start, full.begin() + start + n_elements);
+    return true;
+}
+
+bool VulkanComputeEngine::DispatchMoeRouterGpu(uint32_t layer, VkDeviceAddress input_addr,
+                                                VkDeviceAddress scratch_addr,
+                                                uint32_t num_experts, uint32_t top_k, float temperature) {
+    if (scratch_addr == 0 || layer_moe_gate_[layer] == 0) return false;
+
+    SpecializationMap spec{}; spec.subgroup_size = 32;
+    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(KernelType::MOE_ROUTER, PipelineVariant::FAST, spec);
+    VkPipeline pipeline = shader_lib_->GetPipeline(KernelType::MOE_ROUTER, PipelineVariant::FAST, spec);
+    if (!pipeline || !pl) return false;
+
+    rdna4::MoeRouterPushConstants push{};
+    push.addrHidden = input_addr;
+    push.addrGateInp = layer_moe_gate_[layer];
+    push.addrScratch = scratch_addr;
+    push.embedDim = embed_dim_;
+    push.numExperts = num_experts;
+    push.topK = top_k;
+    push.temperature = temperature;
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    vkCmdBindPipeline(cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd_buffer_, 1, 1, 1);
+    vkEndCommandBuffer(cmd_buffer_);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+    return true;
+}
+
+bool VulkanComputeEngine::DispatchMoeExpertsGpu(uint32_t layer, VkDeviceAddress input_addr,
+                                                 VkDeviceAddress output_addr,
+                                                 const uint32_t* expert_indices,
+                                                 const float* expert_weights,
+                                                 uint32_t top_k) {
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+    auto find_addr = [&](const std::string& suffix) -> VkDeviceAddress {
+        for (const auto& t : model_->GetRawTensors()) {
+            if (t.name.compare(0, prefix.size(), prefix) == 0 && t.name.find(suffix) != std::string::npos)
+                return t.gpuAddress;
+        }
+        return 0;
+    };
+
+    VkDeviceAddress gate_exps = find_addr("ffn_gate_exps");
+    VkDeviceAddress up_exps   = find_addr("ffn_up_exps");
+    VkDeviceAddress down_exps = find_addr("ffn_down_exps");
+    if (gate_exps == 0 || up_exps == 0 || down_exps == 0) return false;
+
+    SpecializationMap spec{}; spec.subgroup_size = 32;
+    VkPipelineLayout pl = shader_lib_->GetPipelineLayout(KernelType::MOE_EXPERTS, PipelineVariant::FAST, spec);
+    VkPipeline pipeline = shader_lib_->GetPipeline(KernelType::MOE_EXPERTS, PipelineVariant::FAST, spec);
+    if (!pipeline || !pl) return false;
+
+    rdna4::MoeExpertsPushConstants push{};
+    push.addrHidden = input_addr;
+    push.addrGateExps = gate_exps;
+    push.addrUpExps = up_exps;
+    push.addrDownExps = down_exps;
+    push.addrOut = output_addr;
+    push.embedDim = embed_dim_;
+    push.hiddenDim = hidden_dim_;
+    push.numExperts = num_experts_;
+    push.topK = top_k;
+    for (uint32_t i = 0; i < 8; ++i) {
+        push.expertIdx[i] = (i < top_k) ? expert_indices[i] : 0;
+        push.expertWeight[i] = (i < top_k) ? expert_weights[i] : 0.0f;
+    }
+
+    VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(cmd_buffer_, &bi);
+    vkCmdBindPipeline(cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdPushConstants(cmd_buffer_, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd_buffer_, (embed_dim_ + 255) / 256, 1, 1);
+    vkEndCommandBuffer(cmd_buffer_);
+
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
+    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+    return true;
+}
+
+bool VulkanComputeEngine::DispatchMoeFfn(uint32_t layer, VkDeviceAddress input_addr, VkDeviceAddress output_addr) {
+    if (!model_) return false;
+    fprintf(stderr, "[DispatchMoeFfn] layer=%u\n", layer); fflush(stderr);
+
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+    auto find_tensor = [&](const std::string& suffix) -> const rdna4::TensorDesc* {
+        for (const auto& t : model_->GetRawTensors()) {
+            if (t.name.compare(0, prefix.size(), prefix) == 0 && t.name.find(suffix) != std::string::npos)
+                return &t;
+        }
+        return nullptr;
+    };
+
+    const rdna4::TensorDesc* gate_t = find_tensor("ffn_gate_inp");
+    const rdna4::TensorDesc* gate_exps_t = find_tensor("ffn_gate_exps");
+    const rdna4::TensorDesc* up_exps_t   = find_tensor("ffn_up_exps");
+    const rdna4::TensorDesc* down_exps_t = find_tensor("ffn_down_exps");
+
+    if (!gate_t || !gate_exps_t || !up_exps_t || !down_exps_t) {
+        fprintf(stderr, "[DispatchMoeFfn] missing MoE tensors for layer %u\n", layer); fflush(stderr);
+        return false;
+    }
+
+    bool gate_f32 = (gate_t->format == rdna4::QuantFormat::F32);
+    bool experts_f32 = (gate_exps_t->format == rdna4::QuantFormat::F32) &&
+                       (up_exps_t->format == rdna4::QuantFormat::F32) &&
+                       (down_exps_t->format == rdna4::QuantFormat::F32);
+    bool small_hidden = hidden_dim_ > 0 && hidden_dim_ <= 4096;
+    bool use_gpu_experts = experts_f32 && small_hidden;
+
+    // GPU router path: always try if gate is F32 (fast). Read back selected experts.
+    if (gate_f32 && num_experts_ > 0 && scratch_moe_router_.buffer) {
+        if (!DispatchMoeRouterGpu(layer, input_addr, scratch_moe_router_.device_address,
+                                   num_experts_, top_k_, 1.0f)) {
+            fprintf(stderr, "[DispatchMoeFfn] GPU router failed, falling back to CPU\n"); fflush(stderr);
+        } else {
+            // Read back top-k indices and weights from scratch
+            // Layout from moe_router.comp: udata[0..topK-1] = indices, fdata[topK..2*topK-1] = weights
+            size_t scratch_bytes = sizeof(float) * (num_experts_ + top_k_ * 2) + sizeof(uint32_t) * top_k_;
+            std::vector<uint8_t> readback(scratch_bytes);
+            if (CopyGpuToCpu(scratch_moe_router_.buffer, scratch_moe_router_.offset,
+                             readback.data(), scratch_bytes)) {
+                uint32_t expert_indices[8] = {};
+                float expert_weights[8] = {};
+                for (uint32_t i = 0; i < top_k_ && i < 8; ++i) {
+                    std::memcpy(&expert_indices[i], readback.data() + i * sizeof(uint32_t), sizeof(uint32_t));
+                    std::memcpy(&expert_weights[i],
+                                readback.data() + top_k_ * sizeof(uint32_t) + i * sizeof(float),
+                                sizeof(float));
+                }
+                fprintf(stderr, "[DispatchMoeFfn] router top-k:"); fflush(stderr);
+                for (uint32_t i = 0; i < top_k_ && i < 8; ++i)
+                    fprintf(stderr, " [%u]=%u w=%.3f", i, expert_indices[i], expert_weights[i]);
+                fprintf(stderr, "\n"); fflush(stderr);
+
+                if (use_gpu_experts) {
+                    if (DispatchMoeExpertsGpu(layer, input_addr, output_addr,
+                                              expert_indices, expert_weights, top_k_)) {
+                        fprintf(stderr, "[DispatchMoeFfn] GPU experts path succeeded\n"); fflush(stderr);
+                        return true;
+                    }
+                    fprintf(stderr, "[DispatchMoeFfn] GPU experts failed, using CPU fallback\n"); fflush(stderr);
+                }
+
+                // CPU fallback but use router-selected experts
+                fprintf(stderr, "[DispatchMoeFfn] CPU fallback for selected experts\n"); fflush(stderr);
+                // TODO: pass router-selected experts/weights into CPU fallback
+                // for weighted multi-expert CPU compute. For now fall through to
+                // legacy top-1 CPU fallback.
+            }
+        }
+    }
+
+    fprintf(stderr, "[DispatchMoeFfn] CPU fallback\n"); fflush(stderr);
+
+    // 1. Read FFN input (scratch_norm_) to CPU
+    std::vector<float> ffn_in(embed_dim_);
+    if (!CopyGpuToCpu(scratch_norm_.buffer, scratch_norm_.offset,
+                      ffn_in.data(), embed_dim_ * sizeof(float))) {
+        fprintf(stderr, "[DispatchMoeFfn] failed to read FFN input\n"); fflush(stderr);
+        return false;
+    }
+
+    std::string gate_name = gate_t->name;
+    std::string up_name = up_exps_t->name;
+    std::string gate_exps_name = gate_exps_t->name;
+    std::string down_name = down_exps_t->name;
+
+    // 2. Dequant routing tensor and compute logits
+    std::vector<float> gate_inp;
+    if (!model_->CpuDequantTensor(gate_name, gate_inp)) return false;
+    uint32_t n_experts = 0;
+    bool gate_transposed = false;
+    {
+        auto raw = model_->GetRawTensors();
+        for (const auto& t : raw) {
+            if (t.name == gate_name) {
+                if (t.shape.size() == 2) {
+                    if (t.shape[0] == embed_dim_) { n_experts = t.shape[1]; gate_transposed = true; }
+                    else { n_experts = t.shape[0]; gate_transposed = false; }
+                }
+                break;
+            }
+        }
+    }
+    if (n_experts == 0) {
+        fprintf(stderr, "[DispatchMoeFfn] could not determine expert count\n"); fflush(stderr);
+        return false;
+    }
+
+    std::vector<float> logits(n_experts, 0.0f);
+    for (uint32_t e = 0; e < n_experts; ++e) {
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < embed_dim_; ++d) {
+            uint32_t idx = gate_transposed ? (d * n_experts + e) : (e * embed_dim_ + d);
+            sum += ffn_in[d] * gate_inp[idx];
+        }
+        logits[e] = sum;
+    }
+    float max_logit = logits[0];
+    for (float v : logits) if (v > max_logit) max_logit = v;
+    float sum_exp = 0.0f;
+    for (float& v : logits) { v = std::exp(v - max_logit); sum_exp += v; }
+    for (float& v : logits) v /= sum_exp;
+
+    uint32_t top_e = 0;
+    for (uint32_t e = 1; e < n_experts; ++e) if (logits[e] > logits[top_e]) top_e = e;
+    fprintf(stderr, "[DispatchMoeFfn] selected expert %u/%u (p=%.3f)\n", top_e, n_experts, logits[top_e]); fflush(stderr);
+
+    // 3. Dequant selected expert weights
+    std::vector<float> up_slice, gate_slice, down_slice;
+    if (!DequantExpertSlice(up_name, top_e, hidden_dim_, embed_dim_, up_slice)) return false;
+    if (!DequantExpertSlice(gate_exps_name, top_e, hidden_dim_, embed_dim_, gate_slice)) return false;
+    if (!DequantExpertSlice(down_name, top_e, embed_dim_, hidden_dim_, down_slice)) return false;
+
+    // 4. Compute FFN on CPU
+    std::vector<float> up_out(hidden_dim_, 0.0f);
+    for (uint32_t h = 0; h < hidden_dim_; ++h) {
+        float u = 0.0f, g = 0.0f;
+        for (uint32_t d = 0; d < embed_dim_; ++d) {
+            u += ffn_in[d] * up_slice[h * embed_dim_ + d];
+            g += ffn_in[d] * gate_slice[h * embed_dim_ + d];
+        }
+        float silu_g = g / (1.0f + std::exp(-g));
+        up_out[h] = silu_g * u;
+    }
+    std::vector<float> ffn_out(embed_dim_, 0.0f);
+    for (uint32_t d = 0; d < embed_dim_; ++d) {
+        float sum = 0.0f;
+        for (uint32_t h = 0; h < hidden_dim_; ++h)
+            sum += up_out[h] * down_slice[d * hidden_dim_ + h];
+        ffn_out[d] = sum;
+    }
+
+    // 5. Upload result back to scratch_norm_
+    if (!CopyCpuToGpu(ffn_out.data(), scratch_norm_.buffer, scratch_norm_.offset,
+                      embed_dim_ * sizeof(float))) {
+        fprintf(stderr, "[DispatchMoeFfn] failed to upload FFN output\n"); fflush(stderr);
+        return false;
+    }
+    return true;
+}
 
 } // namespace notllama

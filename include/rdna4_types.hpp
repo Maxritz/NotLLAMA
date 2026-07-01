@@ -286,4 +286,35 @@ struct AddRmsNormPushConstants {
 static_assert(sizeof(AddRmsNormPushConstants) <= 128,
     "AddRmsNormPushConstants must fit in 128 bytes");
 
+// ── MoE push constants ────────────────────────────────────────────
+// Matches moe_router.comp
+struct MoeRouterPushConstants {
+    uint64_t addrHidden;
+    uint64_t addrGateInp;
+    uint64_t addrScratch;
+    uint32_t embedDim;
+    uint32_t numExperts;
+    uint32_t topK;
+    float    temperature;
+}; // 40 bytes
+static_assert(sizeof(MoeRouterPushConstants) <= 128,
+    "MoeRouterPushConstants must fit in 128 bytes");
+
+// Matches moe_experts.comp (up to 8 experts hardcoded in shader)
+struct MoeExpertsPushConstants {
+    uint64_t addrHidden;
+    uint64_t addrGateExps;
+    uint64_t addrUpExps;
+    uint64_t addrDownExps;
+    uint64_t addrOut;
+    uint32_t embedDim;
+    uint32_t hiddenDim;
+    uint32_t numExperts;
+    uint32_t topK;
+    uint32_t expertIdx[8];
+    float    expertWeight[8];
+}; // 88 bytes
+static_assert(sizeof(MoeExpertsPushConstants) <= 128,
+    "MoeExpertsPushConstants must fit in 128 bytes");
+
 } // namespace rdna4

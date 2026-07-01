@@ -2,7 +2,10 @@
 #include "rdna4.hpp"
 #include <string>
 #include <vector>
+#include <memory>
 #include <nlohmann/json.hpp>
+
+namespace notllama { class GGUFLoader; }
 
 namespace rdna4 {
 
@@ -49,14 +52,15 @@ public:
     VkPhysicalDevice physicalDevice;
     uint32_t queueFamilyIndex;
 
-    WeightUploader(VkDevice dev, VkPhysicalDevice pdev, uint32_t qfi = 0)
-        : device(dev), physicalDevice(pdev), queueFamilyIndex(qfi) {}
+    WeightUploader(VkDevice dev, VkPhysicalDevice pdev, uint32_t qfi = 0);
+    ~WeightUploader();
 
     ModelDesc load(const std::string& jsonPath, const std::string& binPath);
     ModelDesc loadMetadata(const std::string& jsonPath, const std::string& binPath);
     ModelDesc loadFromGGUF(const std::string& ggufPath, Tokenizer* tokenizer = nullptr);
     bool uploadTensor(TensorDesc& desc);
     bool uploadLayer(ModelDesc& model, uint32_t layerIndex);
+    bool cpuDequantTensor(const TensorDesc& desc, std::vector<float>& out);
     void loadTokenizer(Tokenizer& tokenizer, const nlohmann::json& tokenizerJson);
     void freeTensor(const TensorDesc& desc);
     void freeAll(ModelDesc& model);
@@ -75,11 +79,15 @@ public:
     void FreeSystemRAMCopy();
 
     // Check if a tensor's data is still available in system RAM
-    bool HasSystemRAMCopy() const { return !binData_.empty(); }
+    bool HasSystemRAMCopy() const;
 
 private:
     std::vector<uint8_t> binData_;
+    std::unique_ptr<notllama::GGUFLoader> gguf_loader_;
     WeightLoadMode load_mode_ = WeightLoadMode::MIRROR;
+
+    const uint8_t* GetTensorDataPtr(const TensorDesc& desc) const;
+    size_t GetTensorDataSize() const;
 
     VkBuffer createGpuBuffer(size_t size, VkDeviceAddress* outAddr, VkDeviceMemory* outMem);
 };

@@ -64,13 +64,14 @@ struct GGUFFakeTensor {
 class GGUFLoader {
 public:
     GGUFLoader() = default;
-    ~GGUFLoader() = default;
+    ~GGUFLoader();
 
     bool load(const std::string& path);
 
     const GGUFMetadata& metadata() const { return meta_; }
     const std::vector<GGUFFakeTensor>& tensors() const { return tensors_; }
-    const std::vector<uint8_t>& data() const { return data_; }
+    const uint8_t* data() const { return data_; }
+    size_t dataSize() const { return dataSize_; }
     int tensorIndex(const std::string& name) const;
     void printInfo() const;
 
@@ -81,8 +82,16 @@ private:
     GGUFMetadata meta_{};
     std::vector<GGUFFakeTensor> tensors_;
     std::unordered_map<std::string, int> tensorMap_;
-    std::vector<uint8_t> data_;
+    const uint8_t* data_ = nullptr;
     size_t dataSize_ = 0;
+    std::vector<uint8_t> fallback_data_;  // used on non-Windows fallback path
+
+#ifdef _WIN32
+    void* fileHandle_ = nullptr;
+    void* mapHandle_ = nullptr;
+    const uint8_t* mappedBase_ = nullptr;
+    size_t mappedSize_ = 0;
+#endif
 };
 
 } // namespace notllama

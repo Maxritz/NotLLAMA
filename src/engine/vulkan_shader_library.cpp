@@ -115,6 +115,11 @@ std::string VulkanShaderLibrary::KernelTypeToString(KernelType type) const {
         case KernelType::GEMM_Q8_0: return "gemm_q8_0";
         case KernelType::GEMM_Q6K: return "gemm_q6k";
         case KernelType::GEMM_Q4K: return "gemm_q4k";
+        case KernelType::GEMM_Q2_K: return "gemm_q2_k";
+        case KernelType::GEMM_Q3_K: return "gemm_q3_k";
+        case KernelType::GEMM_Q5_K: return "gemm_q5_k";
+        case KernelType::MOE_ROUTER: return "moe_router";
+        case KernelType::MOE_EXPERTS: return "moe_experts";
         case KernelType::GEMM_TURBO: return "gemm_turbo";
         case KernelType::MATMUL_Q4_0: return "matmul_q4_0";
         case KernelType::MATMUL_Q8_0: return "matmul_q8_0";

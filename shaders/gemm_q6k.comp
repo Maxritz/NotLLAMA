@@ -5,6 +5,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 
+// Q6_K: 256-element blocks, 210 bytes each.
+// Layout per block (d-last):
+//   [0..127]   ql: low 4 bits of each quantized value (nibble-packed)
+//   [128..191] qh: high 2 bits of each quantized value
+//   [192..207] scales: int8 scale for each of 16 sub-blocks of 16 elements
+//   [208..209] d: fp16 global scale
+//
+// Per-thread matvec: each thread computes one output column.
+// Dispatch: ((N + 255) / 256, 1, 1) workgroups, local_size_x = 256.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef {
@@ -29,7 +38,8 @@ layout(push_constant, scalar) uniform PushConstants {
 } pc;
 
 uint extractByte(WeightRef buf, uint byteOff) {
-    uint word = buf.data[byteOff >> 2];
+    uint wordIdx = byteOff >> 2;
+    uint word = buf.data[wordIdx];
     return (word >> ((byteOff & 3u) << 3u)) & 0xFFu;
 }
 
@@ -39,67 +49,58 @@ float readF16(WeightRef buf, uint byteOff) {
     return float(float16_t(lo | (hi << 8u)));
 }
 
-float dequantQ6K(WeightRef buf, uint blockOffset, uint tid) {
-    uint subBlock = tid / 16u;
-    uint elemInSub = tid % 16u;
+float dequantQ6K(WeightRef buf, uint blockOffset, uint elemInBlock) {
+    uint subBlock = elemInBlock / 16u;
+    uint elemInSub = elemInBlock % 16u;
 
     float d = readF16(buf, blockOffset + 208u);
+
+    // Scale for this sub-block (signed int8)
     uint scRaw = extractByte(buf, blockOffset + 192u + subBlock);
-    int sc = int(scRaw) - int(scRaw & 0x80u) * 256;
+    int sc = int(scRaw);
+    if ((scRaw & 0x80u) != 0u) sc -= 256;
 
-    uint loIdx = blockOffset + (tid / 2u);
-    uint hiIdx = blockOffset + 128u + (tid / 4u);
-    uint loByte = extractByte(buf, loIdx);
-    uint hiByte = extractByte(buf, hiIdx);
-    int lo = int((loByte >> ((tid & 1u) * 4u)) & 0xFu);
-    int hi = int((hiByte >> ((tid & 3u) * 2u)) & 0x3u);
-    int q = (hi << 4) | lo;
-    q -= 32;
+    // Low 4 bits
+    uint loByteIdx = blockOffset + (elemInBlock >> 1u);
+    uint loByte = extractByte(buf, loByteIdx);
+    uint lo = (elemInBlock & 1u) == 0u ? (loByte & 0x0Fu) : ((loByte >> 4u) & 0x0Fu);
 
+    // High 2 bits
+    uint hiByteIdx = blockOffset + 128u + (elemInBlock >> 2u);
+    uint hiByte = extractByte(buf, hiByteIdx);
+    uint hi = (hiByte >> ((elemInBlock & 3u) << 1u)) & 0x3u;
+
+    int q = int(lo | (hi << 4u)) - 32;
     return d * float(sc) * float(q);
 }
 
-shared float partial[256];
-
 void main() {
-    uint col = gl_WorkGroupID.x;
+    uint col = gl_GlobalInvocationID.x;
+
     if (col >= pc.N || pc.transB != 0u) return;
-    uint tid = gl_LocalInvocationIndex;
+
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) {
+            OutRef outBuf = OutRef(pc.addrC);
+            outBuf.data[col] = 0.0;
+        }
+        return;
+    }
 
     WeightRef weight = WeightRef(pc.addrB);
     HiddenRef hidden = HiddenRef(pc.addrA);
     OutRef outBuf = OutRef(pc.addrC);
 
+    uint blocksPerCol = (pc.K + 255u) >> 8;
     float sum = 0.0;
-    uint numBlocks = pc.K / 256u;
-    uint remainder = pc.K % 256u;
 
-    for (uint b = 0; b < numBlocks; b++) {
-        uint blockOffset = (col * numBlocks + b) * 210u;
-        float w = dequantQ6K(weight, blockOffset, tid);
-        float h = hidden.data[b * 256u + tid];
-        sum += w * h;
+    for (uint k = 0u; k < pc.K; ++k) {
+        uint blockIdx = k >> 8;
+        uint elemInBlock = k & 255u;
+        uint blockOffset = (col * blocksPerCol + blockIdx) * 210u;
+        float w = dequantQ6K(weight, blockOffset, elemInBlock);
+        sum += w * hidden.data[k];
     }
 
-    if (tid < remainder) {
-        uint b = numBlocks;
-        uint blockOffset = (col * numBlocks + b) * 210u;
-        float w = dequantQ6K(weight, blockOffset, tid);
-        float h = hidden.data[b * 256u + tid];
-        sum += w * h;
-    }
-
-    partial[tid] = sum;
-    barrier();
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        barrier();
-    }
-
-    if (tid == 0) {
-        outBuf.data[col] = pc.alpha * partial[0];
-    }
+    outBuf.data[col] = pc.alpha * sum;
 }

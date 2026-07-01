@@ -65,6 +65,8 @@ private:
     uint32_t vocab_size_ = 0;
     uint32_t max_seq_len_ = 4096;
     uint32_t embed_dim_ = 4096;
+    uint32_t num_experts_ = 0;
+    uint32_t top_k_ = 1;
 
     // Per-layer weight device addresses (flat buffer)
     // Layout for each layer (each entry = device address):
@@ -97,6 +99,7 @@ private:
     GpuAllocation scratch_ffn_;    // [hidden_dim] (FFN intermediate)
     GpuAllocation scratch_ffn_gate_;// [hidden_dim] (gate output)
     GpuAllocation scratch_logits_; // [vocab_size]
+    GpuAllocation scratch_moe_router_; // [num_experts + top_k*2] floats (+ top_k uints aliased)
 
     GpuAllocation rms_weight_;     // reused for both attn_norm and ffn_norm
     bool rms_weight_loaded_ = false;
@@ -149,6 +152,8 @@ private:
     GpuAllocation AllocScratch(size_t size);
     bool AllocScratchBuffers();
     bool LoadModelWeights();
+    bool ReloadLayerWeights(uint32_t layer);
+    bool EnsureLayerWeights(uint32_t layer);
 
     // Dispatch helpers (all record into cmd_buffer_ + submit + wait)
     bool DispatchEmbed(uint32_t token_id, uint32_t token_pos, VkDeviceAddress hidden_addr);
@@ -171,6 +176,16 @@ private:
     bool DispatchKvCacheWrite(VkDeviceAddress k_in, VkDeviceAddress v_in,
                                VkDeviceAddress k_cache, VkDeviceAddress v_cache,
                                uint32_t seq_pos, uint32_t max_seq);
+    bool DispatchMoeRouterGpu(uint32_t layer, VkDeviceAddress input_addr, VkDeviceAddress scratch_addr,
+                               uint32_t num_experts, uint32_t top_k, float temperature);
+    bool DispatchMoeExpertsGpu(uint32_t layer, VkDeviceAddress input_addr, VkDeviceAddress output_addr,
+                                const uint32_t* expert_indices, const float* expert_weights,
+                                uint32_t top_k);
+    bool DispatchMoeFfn(uint32_t layer, VkDeviceAddress input_addr, VkDeviceAddress output_addr);
+    bool CopyGpuToCpu(VkBuffer src_buf, VkDeviceSize src_offset, void* dst, size_t size);
+    bool CopyCpuToGpu(const void* src, VkBuffer dst_buf, VkDeviceSize dst_offset, size_t size);
+    bool DequantExpertSlice(const std::string& tensor_name, uint32_t expert_index,
+                             uint32_t expert_rows, uint32_t cols, std::vector<float>& out);
 };
 
 } // namespace notllama

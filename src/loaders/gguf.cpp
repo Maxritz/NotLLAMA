@@ -1,6 +1,16 @@
 #include "loaders/gguf.h"
 #include "rdna4.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -14,6 +24,26 @@
 #endif
 
 namespace notllama {
+
+GGUFLoader::~GGUFLoader() {
+#ifdef _WIN32
+    if (data_) {
+        UnmapViewOfFile((LPCVOID)mappedBase_);
+        data_ = nullptr;
+        mappedBase_ = nullptr;
+    }
+    if (mapHandle_) {
+        CloseHandle((HANDLE)mapHandle_);
+        mapHandle_ = nullptr;
+    }
+    if (fileHandle_) {
+        CloseHandle((HANDLE)fileHandle_);
+        fileHandle_ = nullptr;
+    }
+#endif
+    // POSIX mmap path is left as a future exercise; for now Linux builds
+    // still use the std::vector fallback below if mmap is not enabled.
+}
 
 static constexpr uint32_t GGUF_MAGIC = 0x46554747;
 static constexpr uint32_t GGUF_VERSION = 3;
@@ -94,7 +124,8 @@ static bool skipValue(FILE* f, GGUFType type) {
     }
 }
 
-// Read an integer value whose GGUF type is known (handles uint32, uint64, int32, int64)
+// Read an integer value whose GGUF type is known (handles uint32, uint64, int32, int64,
+// and single-element arrays of those types — e.g. gemma4 stores head_count_kv as an array)
 static uint64_t readIntByType(FILE* f, GGUFType type) {
     uint64_t val = 0;
     switch (type) {
@@ -103,6 +134,19 @@ static uint64_t readIntByType(FILE* f, GGUFType type) {
         case GGUFType::UINT64: { uint64_t v; fread(&v, 8, 1, f); val = v; break; }
         case GGUFType::INT64:  { int64_t  v; fread(&v, 8, 1, f); val = v; break; }
         case GGUFType::FLOAT32: { float v; fread(&v, 4, 1, f); val = (uint64_t)v; break; }
+        case GGUFType::ARRAY: {
+            uint32_t arrType; readU32(f, arrType);
+            uint64_t arrLen; readU64(f, arrLen);
+            if (arrLen == 1) {
+                // Recurse to read the single scalar element
+                val = readIntByType(f, static_cast<GGUFType>(arrType));
+            } else {
+                // Multi-element array: not a scalar, skip all elements
+                for (uint64_t i = 0; i < arrLen; ++i)
+                    skipValue(f, static_cast<GGUFType>(arrType));
+            }
+            break;
+        }
         default: skipValue(f, type); break;
     }
     return val;
@@ -248,10 +292,46 @@ bool GGUFLoader::load(const std::string& path) {
         else if (t.type == GGUFTensorType::F16 || t.type == GGUFTensorType::BF16) t.nbytes = nElements * 2;
     }
 
-    data_.resize(dataSize_);
-    _fseeki64(f, dataStart, SEEK_SET);
-    fread(data_.data(), 1, dataSize_, f);
+#ifdef _WIN32
+    // Memory-map the file so models >4 GB do not need a single contiguous vector allocation.
     fclose(f);
+    f = nullptr;
+
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        std::cerr << "GGUF: cannot reopen for mmap " << path << std::endl;
+        return false;
+    }
+    LARGE_INTEGER fsLi;
+    fsLi.QuadPart = fileSize;
+    HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY,
+                                    fsLi.HighPart, fsLi.LowPart, NULL);
+    if (!hMap) {
+        std::cerr << "GGUF: CreateFileMapping failed (size " << fileSize << ")" << std::endl;
+        CloseHandle(hFile);
+        return false;
+    }
+    mappedBase_ = (const uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!mappedBase_) {
+        std::cerr << "GGUF: MapViewOfFile failed" << std::endl;
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return false;
+    }
+    fileHandle_ = hFile;
+    mapHandle_ = hMap;
+    data_ = mappedBase_ + dataStart;
+    mappedSize_ = (size_t)fileSize;
+#else
+    // Non-Windows fallback: read tensor data into a vector.
+    fallback_data_.resize(dataSize_);
+    _fseeki64(f, dataStart, SEEK_SET);
+    fread(fallback_data_.data(), 1, dataSize_, f);
+    data_ = fallback_data_.data();
+    fclose(f);
+    f = nullptr;
+#endif
 
     std::cout << "GGUF: " << path << std::endl << std::flush;
     std::cout << "  Arch: " << meta_.architecture << std::endl;

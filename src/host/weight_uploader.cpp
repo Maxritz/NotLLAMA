@@ -11,6 +11,11 @@
 
 namespace rdna4 {
 
+WeightUploader::WeightUploader(VkDevice dev, VkPhysicalDevice pdev, uint32_t qfi)
+    : device(dev), physicalDevice(pdev), queueFamilyIndex(qfi) {}
+
+WeightUploader::~WeightUploader() = default;
+
 static QuantFormat ggmlToQuantFormat(int ggmlType) {
     switch (ggmlType) {
         case  0: return QuantFormat::F32;
@@ -478,13 +483,14 @@ static void loadTokenizerFromGGUF(Tokenizer& tokenizer, const notllama::GGUFMeta
 }
 
 ModelDesc WeightUploader::loadFromGGUF(const std::string& ggufPath, Tokenizer* tokenizer) {
-    notllama::GGUFLoader loader;
-    if (!loader.load(ggufPath)) {
+    gguf_loader_ = std::make_unique<notllama::GGUFLoader>();
+    if (!gguf_loader_->load(ggufPath)) {
         fprintf(stderr, "[uploader] Failed to load GGUF: %s\n", ggufPath.c_str()); fflush(stderr);
+        gguf_loader_.reset();
         return ModelDesc();
     }
 
-    const auto& meta = loader.metadata();
+    const auto& meta = gguf_loader_->metadata();
     ModelDesc model;
     model.architecture = meta.architecture;
     model.blockCount = meta.nLayers;
@@ -495,7 +501,7 @@ ModelDesc WeightUploader::loadFromGGUF(const std::string& ggufPath, Tokenizer* t
     model.vocabSize = meta.nVocab;
     model.contextLength = meta.nCtx;
 
-    const auto& tensors = loader.tensors();
+    const auto& tensors = gguf_loader_->tensors();
     model.tensors.reserve(tensors.size());
     for (const auto& t : tensors) {
         TensorDesc desc;
@@ -538,25 +544,25 @@ ModelDesc WeightUploader::loadFromGGUF(const std::string& ggufPath, Tokenizer* t
         fprintf(stderr, "[uploader] WARNING: Could not derive headDim, using dim/headCount=%u\n", model.headDim);
     }
 
-    binData_ = loader.data();
     if (tokenizer) {
         loadTokenizerFromGGUF(*tokenizer, meta);
         fprintf(stderr, "[uploader] Tokenizer loaded: %zu tokens, %zu merges\n",
                 meta.tokens.size(), meta.merges.size());
         fflush(stderr);
     }
-    fprintf(stderr, "[uploader] GGUF loaded: %s | L=%u dim=%u heads=%u/%u | %zu tensors | %zu MB data (deferred upload)\n",
+    fprintf(stderr, "[uploader] GGUF loaded: %s | L=%u dim=%u heads=%u/%u | %zu tensors | %zu MB data (mmap)\n",
             model.architecture.c_str(), model.blockCount, model.embeddingLength,
             model.headCount, model.headCountKv, model.tensors.size(),
-            binData_.size() / 1024 / 1024);
+            gguf_loader_->dataSize() / 1024 / 1024);
     fflush(stderr);
     return model;
 }
 
 bool WeightUploader::uploadTensor(TensorDesc& desc) {
-    if (desc.binOffset + desc.binSize > binData_.size()) {
-        fprintf(stderr, "  [uploadTensor] OOB: offset %zu + size %zu > binData %zu\n",
-                desc.binOffset, desc.binSize, binData_.size()); fflush(stderr);
+    size_t dataSize = GetTensorDataSize();
+    if (desc.binOffset + desc.binSize > dataSize) {
+        fprintf(stderr, "  [uploadTensor] OOB: offset %zu + size %zu > data %zu\n",
+                desc.binOffset, desc.binSize, dataSize); fflush(stderr);
         return false;
     }
 
@@ -639,7 +645,16 @@ bool WeightUploader::uploadTensor(TensorDesc& desc) {
         return false;
     }
 
-    std::memcpy(mapped, binData_.data() + desc.binOffset, desc.binSize);
+    const uint8_t* src = GetTensorDataPtr(desc);
+    if (!src) {
+        fprintf(stderr, "  [uploadTensor] no source data for %s\n", desc.name.c_str()); fflush(stderr);
+        vkUnmapMemory(device, stagingMem);
+        vkFreeMemory(device, stagingMem, nullptr);
+        vkDestroyBuffer(device, staging, nullptr);
+        freeTensor(desc);
+        return false;
+    }
+    std::memcpy(mapped, src + desc.binOffset, desc.binSize);
     vkUnmapMemory(device, stagingMem);
 
     // Command pool + buffer for copy
@@ -750,6 +765,35 @@ bool WeightUploader::uploadLayer(ModelDesc& model, uint32_t layerIndex) {
     fflush(stderr);
 
     return count > 0;
+}
+
+bool WeightUploader::cpuDequantTensor(const TensorDesc& desc, std::vector<float>& out) {
+    const uint8_t* src = GetTensorDataPtr(desc);
+    if (!src) {
+        fprintf(stderr, "[cpuDequantTensor] no source data for %s\n", desc.name.c_str());
+        fflush(stderr);
+        return false;
+    }
+    uint32_t nElements = 1;
+    for (auto d : desc.shape) nElements *= d;
+    return cpuDequantToFloat(src + desc.binOffset, desc.binSize, desc.format,
+                             desc.blockSize, desc.blockElements, nElements, out);
+}
+
+const uint8_t* WeightUploader::GetTensorDataPtr(const TensorDesc& desc) const {
+    if (gguf_loader_) {
+        const uint8_t* base = gguf_loader_->data();
+        if (base && desc.binOffset + desc.binSize <= gguf_loader_->dataSize())
+            return base;  // caller adds desc.binOffset
+        return nullptr;
+    }
+    if (binData_.empty()) return nullptr;
+    return binData_.data();  // caller adds desc.binOffset
+}
+
+size_t WeightUploader::GetTensorDataSize() const {
+    if (gguf_loader_) return gguf_loader_->dataSize();
+    return binData_.size();
 }
 
 ModelDesc WeightUploader::load(const std::string& jsonPath, const std::string& binPath) {
@@ -1146,16 +1190,30 @@ void WeightUploader::freeAll(ModelDesc& model) {
 void WeightUploader::OnAllLayersUploaded(ModelDesc& model) {
     switch (load_mode_) {
     case WeightLoadMode::VRAM:
-        FreeSystemRAMCopy();
-        fprintf(stderr, "[WeightUploader] VRAM mode: freed system RAM copy, all weights on GPU\n");
+        if (!gguf_loader_) {
+            FreeSystemRAMCopy();
+            fprintf(stderr, "[WeightUploader] VRAM mode: freed system RAM copy, all weights on GPU\n");
+        } else {
+            fprintf(stderr, "[WeightUploader] VRAM mode: GGUF mmap kept (file-backed), all weights on GPU\n");
+        }
         break;
     case WeightLoadMode::MIRROR:
-        fprintf(stderr, "[WeightUploader] MIRROR mode: keeping system RAM shadow copy (%.1f MB)\n",
-                binData_.size() / (1024.0 * 1024.0));
+        if (gguf_loader_) {
+            fprintf(stderr, "[WeightUploader] MIRROR mode: GGUF mmap kept (%.1f MB mapped)\n",
+                    gguf_loader_->dataSize() / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "[WeightUploader] MIRROR mode: keeping system RAM shadow copy (%.1f MB)\n",
+                    binData_.size() / (1024.0 * 1024.0));
+        }
         break;
     case WeightLoadMode::LAZY:
-        fprintf(stderr, "[WeightUploader] LAZY mode: %zu tensors deferred, system RAM copy kept (%.1f MB)\n",
-                model.tensors.size(), binData_.size() / (1024.0 * 1024.0));
+        if (gguf_loader_) {
+            fprintf(stderr, "[WeightUploader] LAZY mode: %zu tensors deferred, GGUF mmap kept (%.1f MB)\n",
+                    model.tensors.size(), gguf_loader_->dataSize() / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "[WeightUploader] LAZY mode: %zu tensors deferred, system RAM copy kept (%.1f MB)\n",
+                    model.tensors.size(), binData_.size() / (1024.0 * 1024.0));
+        }
         break;
     }
 }
@@ -1167,6 +1225,10 @@ void WeightUploader::FreeSystemRAMCopy() {
         std::vector<uint8_t>().swap(binData_);
         fprintf(stderr, "[WeightUploader] Freed %.1f MB system RAM copy\n", freed / (1024.0 * 1024.0));
     }
+}
+
+bool WeightUploader::HasSystemRAMCopy() const {
+    return !binData_.empty() || (gguf_loader_ && gguf_loader_->data() != nullptr);
 }
 
 } // namespace rdna4

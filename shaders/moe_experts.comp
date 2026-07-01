@@ -1,0 +1,104 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Computes weighted sum of top-k expert FFN outputs.
+// Each expert:  silu(hidden @ gate_exps[e]) * (hidden @ up_exps[e]) @ down_exps[e]
+// Weight layout (GGUF):
+//   gate_exps: [num_experts, embed_dim, hidden_dim] row-major per expert
+//   up_exps:   [num_experts, embed_dim, hidden_dim] row-major per expert
+//   down_exps: [num_experts, hidden_dim, embed_dim] row-major per expert
+//
+// Dispatch: (embed_dim / 256 + 1, 1, 1) workgroups
+// Each thread computes one output element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HiddenRef   { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer GateExpsRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer UpExpsRef   { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer DownExpsRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer OutRef { float data[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrHidden;
+    uint64_t addrGateExps;
+    uint64_t addrUpExps;
+    uint64_t addrDownExps;
+    uint64_t addrOut;
+    uint embedDim;
+    uint hiddenDim;
+    uint numExperts;
+    uint topK;
+    uint expertIdx0; uint expertIdx1; uint expertIdx2; uint expertIdx3;
+    uint expertIdx4; uint expertIdx5; uint expertIdx6; uint expertIdx7;
+    float expertWeight0; float expertWeight1; float expertWeight2; float expertWeight3;
+    float expertWeight4; float expertWeight5; float expertWeight6; float expertWeight7;
+} pc;
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+void main() {
+    uint outIdx = gl_GlobalInvocationID.x;
+    if (outIdx >= pc.embedDim) return;
+
+    if (pc.addrHidden == 0u || pc.addrGateExps == 0u || pc.addrUpExps == 0u ||
+        pc.addrDownExps == 0u || pc.addrOut == 0u) {
+        if (outIdx < pc.embedDim && pc.addrOut != 0u) {
+            OutRef outBuf = OutRef(pc.addrOut);
+            outBuf.data[outIdx] = 0.0;
+        }
+        return;
+    }
+
+    HiddenRef hidden = HiddenRef(pc.addrHidden);
+    GateExpsRef gateExps = GateExpsRef(pc.addrGateExps);
+    UpExpsRef upExps = UpExpsRef(pc.addrUpExps);
+    DownExpsRef downExps = DownExpsRef(pc.addrDownExps);
+    OutRef outBuf = OutRef(pc.addrOut);
+
+    uint eIdx[8];
+    float eWgt[8];
+    eIdx[0] = pc.expertIdx0; eWgt[0] = pc.expertWeight0;
+    eIdx[1] = pc.expertIdx1; eWgt[1] = pc.expertWeight1;
+    eIdx[2] = pc.expertIdx2; eWgt[2] = pc.expertWeight2;
+    eIdx[3] = pc.expertIdx3; eWgt[3] = pc.expertWeight3;
+    eIdx[4] = pc.expertIdx4; eWgt[4] = pc.expertWeight4;
+    eIdx[5] = pc.expertIdx5; eWgt[5] = pc.expertWeight5;
+    eIdx[6] = pc.expertIdx6; eWgt[6] = pc.expertWeight6;
+    eIdx[7] = pc.expertIdx7; eWgt[7] = pc.expertWeight7;
+
+    uint k = min(pc.topK, 8u);
+    float accum = 0.0;
+
+    for (uint e = 0; e < k; ++e) {
+        uint expert = eIdx[e];
+        float weight = eWgt[e];
+        if (weight < 1e-8 || expert >= pc.numExperts) continue;
+
+        // For output element outIdx, compute:
+        // out = sum_i activated[i] * down_exps[expert][i][outIdx]
+        // where activated[i] = silu(gate_i) * up_i
+        //
+        // We compute gate_i and up_i on the fly for each i.
+        float expertOut = 0.0;
+        for (uint i = 0; i < pc.hiddenDim; ++i) {
+            float gateVal = 0.0;
+            float upVal = 0.0;
+            uint gBase = expert * pc.embedDim * pc.hiddenDim + i;
+            uint uBase = expert * pc.embedDim * pc.hiddenDim + i;
+            for (uint j = 0; j < pc.embedDim; ++j) {
+                gateVal += hidden.data[j] * gateExps.data[gBase + j * pc.hiddenDim];
+                upVal   += hidden.data[j] * upExps.data[uBase + j * pc.hiddenDim];
+            }
+            float activated = silu(gateVal) * upVal;
+            uint dOff = expert * pc.hiddenDim * pc.embedDim + i * pc.embedDim + outIdx;
+            expertOut += activated * downExps.data[dOff];
+        }
+        accum += weight * expertOut;
+    }
+
+    outBuf.data[outIdx] = accum;
+}

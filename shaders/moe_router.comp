@@ -1,0 +1,127 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Mixtral-style MoE router.
+// Input:  hidden state [embed_dim] float
+// Weight: gate_inp    [num_experts, embed_dim] float (row-major)
+// Output: scratch buffer with:
+//   [0..top_k-1]      uint  selected expert indices
+//   [top_k..2*top_k-1] float selected expert weights (softmaxed)
+//   [2*top_k..2*top_k+num_experts-1] float all router logits (for debug)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HiddenRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer GateInpRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer ScratchRef { uint udata[]; float fdata[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrHidden;
+    uint64_t addrGateInp;
+    uint64_t addrScratch;
+    uint embedDim;
+    uint numExperts;
+    uint topK;
+    float temperature;
+} pc;
+
+shared float s_logits[256];
+shared uint  s_idx[256];
+shared float s_topk_val[8];
+shared uint  s_topk_idx[8];
+
+void reduceMax(uint tid, uint wgSize) {
+    barrier();
+    for (uint s = wgSize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_logits[tid + s] > s_logits[tid]) {
+                s_logits[tid] = s_logits[tid + s];
+                s_idx[tid]    = s_idx[tid + s];
+            }
+        }
+        barrier();
+    }
+}
+
+void reduceSum(uint tid, uint wgSize) {
+    barrier();
+    for (uint s = wgSize >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_logits[tid] += s_logits[tid + s];
+        barrier();
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wgSize = gl_WorkGroupSize.x;
+    uint totalThreads = gl_NumWorkGroups.x * wgSize;
+
+    HiddenRef hidden = HiddenRef(pc.addrHidden);
+    GateInpRef gateInp = GateInpRef(pc.addrGateInp);
+    ScratchRef scratch = ScratchRef(pc.addrScratch);
+
+    uint itemsPerThread = (pc.numExperts + totalThreads - 1) / totalThreads;
+    uint start = min(tid * itemsPerThread, pc.numExperts);
+    uint end   = min(start + itemsPerThread, pc.numExperts);
+
+    float localMax = -1e30;
+    uint localMaxIdx = start;
+
+    for (uint e = start; e < end; ++e) {
+        float sum = 0.0;
+        uint rowOff = e * pc.embedDim;
+        for (uint i = 0; i < pc.embedDim; ++i) {
+            sum += hidden.data[i] * gateInp.data[rowOff + i];
+        }
+        sum /= max(pc.temperature, 1e-6);
+        scratch.fdata[2 * pc.topK + e] = sum;
+        if (sum > localMax) { localMax = sum; localMaxIdx = e; }
+    }
+
+    s_logits[tid] = localMax;
+    s_idx[tid]    = localMaxIdx;
+    reduceMax(tid, wgSize);
+    float globalMax = s_logits[0];
+
+    float localSum = 0.0;
+    for (uint e = start; e < end; ++e) {
+        float v = exp(scratch.fdata[2 * pc.topK + e] - globalMax);
+        scratch.fdata[2 * pc.topK + e] = v;
+        localSum += v;
+    }
+
+    s_logits[tid] = localSum;
+    reduceSum(tid, wgSize);
+    float globalSum = s_logits[0];
+
+    for (uint e = start; e < end; ++e) {
+        scratch.fdata[2 * pc.topK + e] /= max(globalSum, 1e-30);
+    }
+
+    barrier();
+
+    if (tid == 0) {
+        uint k = min(pc.topK, pc.numExperts);
+        for (uint i = 0; i < k; ++i) {
+            float bestVal = -1.0;
+            uint bestIdx = 0;
+            for (uint e = 0; e < pc.numExperts; ++e) {
+                float v = scratch.fdata[2 * pc.topK + e];
+                bool used = false;
+                for (uint j = 0; j < i; ++j) {
+                    if (s_topk_idx[j] == e) { used = true; break; }
+                }
+                if (!used && v > bestVal) { bestVal = v; bestIdx = e; }
+            }
+            s_topk_idx[i] = bestIdx;
+            s_topk_val[i] = bestVal;
+        }
+        for (uint i = 0; i < k; ++i) {
+            scratch.udata[i] = s_topk_idx[i];
+            scratch.fdata[pc.topK + i] = s_topk_val[i];
+        }
+    }
+}

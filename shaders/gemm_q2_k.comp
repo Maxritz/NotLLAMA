@@ -1,0 +1,89 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Q2_K GEMM: 256-element super-blocks.
+// Layout (llama.cpp block_q2_K): 84 bytes
+//   bytes 0-15:   scales[16] — one byte per 16-element sub-block:
+//                 low nibble = scale, high nibble = min
+//   bytes 16-79:  qs[64] — 256 x 2-bit quants (4 bytes per sub-block)
+//   bytes 80-81:  d   (fp16 super-block scale)
+//   bytes 82-83:  dmin (fp16 super-block min)
+// Dequant:
+//   sub = i / 16 (0..15)
+//   scale = scales[sub] & 0xF, min = scales[sub] >> 4
+//   q = (qs[(i%16)/4] >> (2*(i%4))) & 3
+//   value = d * scale * q - dmin * min
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer WeightRef { uint data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer HiddenRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer OutRef { float data[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA; uint64_t addrB; uint64_t addrC;
+    uint M; uint N; uint K;
+    float alpha; uint transB;
+} pc;
+
+uint extractByte(WeightRef buf, uint byteOff) {
+    uint word = buf.data[byteOff >> 2];
+    return (word >> ((byteOff & 3u) << 3u)) & 0xFFu;
+}
+
+float readF16(WeightRef buf, uint byteOff) {
+    uint lo = extractByte(buf, byteOff);
+    uint hi = extractByte(buf, byteOff + 1u);
+    return float(float16_t(lo | (hi << 8u)));
+}
+
+float dequantQ2_K(WeightRef buf, uint blockOffset, uint elemIdx) {
+    float d = readF16(buf, blockOffset + 80u);
+    float dmin = readF16(buf, blockOffset + 82u);
+
+    uint sub = elemIdx >> 4;      // 0..15
+    uint scaleByte = extractByte(buf, blockOffset + sub);
+    float scale = float(scaleByte & 0xFu);
+    float minv  = float((scaleByte >> 4u) & 0xFu);
+
+    uint elemInSub = elemIdx & 15u;
+    uint qsByteOff = blockOffset + 16u + sub * 4u + (elemInSub >> 2u);
+    uint qsByte = extractByte(buf, qsByteOff);
+    uint q = (qsByte >> ((elemInSub & 3u) << 1u)) & 3u;
+
+    return d * scale * float(q) - dmin * minv;
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.N || pc.transB != 0u) return;
+
+    if (pc.addrB == 0u || pc.addrA == 0u || pc.addrC == 0u) {
+        if (col < pc.N && pc.addrC != 0u) {
+            OutRef outBuf = OutRef(pc.addrC);
+            outBuf.data[col] = 0.0;
+        }
+        return;
+    }
+
+    WeightRef weight = WeightRef(pc.addrB);
+    HiddenRef hidden = HiddenRef(pc.addrA);
+    OutRef outBuf = OutRef(pc.addrC);
+
+    uint blocksPerCol = (pc.K + 255u) >> 8;
+    float sum = 0.0;
+
+    for (uint k = 0; k < pc.K; ++k) {
+        uint blockIdx = k >> 8;
+        uint elemInBlock = k & 255u;
+        uint blockOffset = (col * blocksPerCol + blockIdx) * 84u;
+        float w = dequantQ2_K(weight, blockOffset, elemInBlock);
+        sum += w * hidden.data[k];
+    }
+
+    outBuf.data[col] = pc.alpha * sum;
+}

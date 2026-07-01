@@ -26,6 +26,7 @@ public:
 
     virtual bool LoadFromPath(const std::string& path, IMemoryAllocator* allocator) = 0;
     virtual bool StreamLayerWeights(uint32_t layer_index, IMemoryAllocator* allocator) = 0;
+    virtual bool CpuDequantTensor(const std::string& tensor_name, std::vector<float>& out) = 0;
     virtual const void* GetWeightShadowCopy(const std::string& tensor_name) = 0;
 };
 

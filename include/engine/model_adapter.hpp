@@ -26,6 +26,7 @@ public:
     bool LoadFromPath(const std::string& path, IMemoryAllocator* allocator) override;
     bool LoadFromGGUF(const std::string& path);
     bool StreamLayerWeights(uint32_t layer_index, IMemoryAllocator* allocator) override;
+    bool CpuDequantTensor(const std::string& tensor_name, std::vector<float>& out) override;
     bool UploadGlobalWeights();
     const void* GetWeightShadowCopy(const std::string& tensor_name) override;
 
