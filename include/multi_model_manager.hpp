@@ -60,7 +60,8 @@ public:
                           const std::string& tags,
                           uint32_t gpu_layers,
                           size_t max_context,
-                          float temp, float top_p, int32_t top_k);
+                          float temp, float top_p, int32_t top_k,
+                          const std::string& load_mode = "mirror");
 
     // Unload a model by ID
     bool UnloadModel(const std::string& id);

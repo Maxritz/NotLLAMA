@@ -256,15 +256,15 @@ assign_layer:
         if (layer >= n_layers_) continue;
 
         int slot = -1;
-        if (name.find("attn_norm") != std::string::npos) slot = 0;
-        else if (name.find("attn_q") != std::string::npos || name.find("q_proj") != std::string::npos) slot = 1;
-        else if (name.find("attn_k") != std::string::npos || name.find("k_proj") != std::string::npos) slot = 2;
-        else if (name.find("attn_v") != std::string::npos || name.find("v_proj") != std::string::npos) slot = 3;
-        else if (name.find("attn_output") != std::string::npos || name.find("o_proj") != std::string::npos) slot = 4;
-        else if (name.find("ffn_norm") != std::string::npos) slot = 5;
-        else if (name.find("ffn_up") != std::string::npos || name.find("up_proj") != std::string::npos) slot = 6;
-        else if (name.find("ffn_gate") != std::string::npos || name.find("gate_proj") != std::string::npos) slot = 7;
-        else if (name.find("ffn_down") != std::string::npos || name.find("down_proj") != std::string::npos) slot = 8;
+        if (name.find("attn_norm") != std::string::npos && name.find("post_attn") == std::string::npos && name.find("post_ffw") == std::string::npos) slot = 0;
+        else if ((name.ends_with("attn_q.weight") || name.ends_with("q_proj.weight")) || (name.find("attn_q.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 1;
+        else if ((name.ends_with("attn_k.weight") || name.ends_with("k_proj.weight")) || (name.find("attn_k.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 2;
+        else if ((name.ends_with("attn_v.weight") || name.ends_with("v_proj.weight")) || (name.find("attn_v.") != std::string::npos && name.find("norm") == std::string::npos)) slot = 3;
+        else if (name.ends_with("attn_output.weight") || name.ends_with("o_proj.weight")) slot = 4;
+        else if (name.find("ffn_norm") != std::string::npos && name.find("post_ffw") == std::string::npos && name.find("post_attn") == std::string::npos) slot = 5;
+        else if (name.ends_with("ffn_up.weight") || name.ends_with("up_proj.weight")) slot = 6;
+        else if (name.ends_with("ffn_gate.weight") || name.ends_with("gate_proj.weight")) slot = 7;
+        else if (name.ends_with("ffn_down.weight") || name.ends_with("down_proj.weight")) slot = 8;
         if (slot >= 0 && slot < WEIGHTS_PER_LAYER) {
             layer_weights_[layer][slot] = t.gpuAddress;
             layer_weight_formats_[layer][slot] = t.format;
@@ -790,8 +790,16 @@ bool VulkanComputeEngine::DispatchGemm(VkDeviceAddress a_addr, VkDeviceAddress b
 
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd_buffer_;
-    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    VkResult submitResult = vkQueueSubmit(queue_, 1, &si, fence_);
+    if (submitResult != VK_SUCCESS) {
+        fprintf(stderr, "[DispatchGemm] vkQueueSubmit failed: %d\n", (int)submitResult); fflush(stderr);
+        return false;
+    }
+    VkResult waitResult = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (waitResult != VK_SUCCESS) {
+        fprintf(stderr, "[DispatchGemm] vkWaitForFences failed: %d\n", (int)waitResult); fflush(stderr);
+        return false;
+    }
     vkResetFences(device_, 1, &fence_);
     return true;
 }

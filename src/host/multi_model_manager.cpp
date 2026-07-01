@@ -51,7 +51,8 @@ std::string MultiModelManager::LoadModel(const std::string& path,
                                            const std::string& tags,
                                            uint32_t gpu_layers,
                                            size_t max_context,
-                                           float temp, float top_p, int32_t top_k) {
+                                           float temp, float top_p, int32_t top_k,
+                                           const std::string& load_mode) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (models_.count(id)) {
@@ -59,7 +60,13 @@ std::string MultiModelManager::LoadModel(const std::string& path,
         return "";
     }
 
-    fprintf(stderr, "[MultiModel] Loading model '%s' from %s...\n", id.c_str(), path.c_str());
+    // Parse load mode
+    rdna4::WeightLoadMode wmode = rdna4::WeightLoadMode::MIRROR;
+    if (load_mode == "vram") wmode = rdna4::WeightLoadMode::VRAM;
+    else if (load_mode == "lazy") wmode = rdna4::WeightLoadMode::LAZY;
+
+    fprintf(stderr, "[MultiModel] Loading model '%s' from %s [mode=%s]...\n",
+            id.c_str(), path.c_str(), load_mode.c_str());
 
     auto inst = std::make_unique<ModelInstance>();
     inst->id = id;
@@ -75,6 +82,7 @@ std::string MultiModelManager::LoadModel(const std::string& path,
 
     // Create adapter and load model
     inst->adapter = std::make_unique<notllama::ModelAdapter>(device_, physical_device_, queue_family_index_);
+    inst->adapter->SetLoadMode(wmode);
 
     bool is_gguf = (path.size() >= 5 && path.substr(path.size() - 5) == ".gguf");
     bool loaded = is_gguf ? inst->adapter->LoadFromGGUF(path)
@@ -84,10 +92,16 @@ std::string MultiModelManager::LoadModel(const std::string& path,
         return "";
     }
 
-    // Stream all layers to GPU
+    // Stream layers to GPU
     uint32_t n_layers = static_cast<uint32_t>(inst->adapter->GetNumLayers());
     uint32_t layers_to_upload = (gpu_layers == (uint32_t)-1) ? n_layers
                                 : std::min(gpu_layers, n_layers);
+
+    if (wmode == rdna4::WeightLoadMode::LAZY) {
+        // LAZY: don't upload any layers at load time
+        fprintf(stderr, "[MultiModel] LAZY mode: deferring %u layer uploads to first use\n", layers_to_upload);
+        layers_to_upload = 0;
+    }
 
     for (uint32_t l = 0; l < layers_to_upload; l++) {
         if (!inst->adapter->StreamLayerWeights(l, nullptr)) {
@@ -100,6 +114,9 @@ std::string MultiModelManager::LoadModel(const std::string& path,
         fprintf(stderr, "[MultiModel] FAILED to upload global weights for '%s'\n", id.c_str());
         return "";
     }
+
+    // Apply load-mode post-upload policy
+    inst->adapter->OnAllLayersUploaded();
 
     // Create KV cache
     uint32_t n_kv_heads = static_cast<uint32_t>(inst->adapter->GetNumKVHeads());

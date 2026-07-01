@@ -42,6 +42,7 @@ set(HOST_SRC
     src/host/agent_node.cpp
     src/host/graphify_client.cpp
     src/host/memory_tier.cpp
+    src/host/inference_runner.cpp
     src/loaders/gguf.cpp
     src/engine/vulkan_device.cpp
     src/engine/ring_allocator_adapter.cpp

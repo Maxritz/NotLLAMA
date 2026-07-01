@@ -1143,4 +1143,30 @@ void WeightUploader::freeAll(ModelDesc& model) {
     }
 }
 
+void WeightUploader::OnAllLayersUploaded(ModelDesc& model) {
+    switch (load_mode_) {
+    case WeightLoadMode::VRAM:
+        FreeSystemRAMCopy();
+        fprintf(stderr, "[WeightUploader] VRAM mode: freed system RAM copy, all weights on GPU\n");
+        break;
+    case WeightLoadMode::MIRROR:
+        fprintf(stderr, "[WeightUploader] MIRROR mode: keeping system RAM shadow copy (%.1f MB)\n",
+                binData_.size() / (1024.0 * 1024.0));
+        break;
+    case WeightLoadMode::LAZY:
+        fprintf(stderr, "[WeightUploader] LAZY mode: %zu tensors deferred, system RAM copy kept (%.1f MB)\n",
+                model.tensors.size(), binData_.size() / (1024.0 * 1024.0));
+        break;
+    }
+}
+
+void WeightUploader::FreeSystemRAMCopy() {
+    if (!binData_.empty()) {
+        size_t freed = binData_.size();
+        // Use clear + shrink_to_fit to actually release memory back to OS
+        std::vector<uint8_t>().swap(binData_);
+        fprintf(stderr, "[WeightUploader] Freed %.1f MB system RAM copy\n", freed / (1024.0 * 1024.0));
+    }
+}
+
 } // namespace rdna4
