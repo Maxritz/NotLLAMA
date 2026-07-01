@@ -30,6 +30,15 @@
 #include <chrono>
 #include <thread>
 
+// Cross-platform socket handle
+#ifdef _WIN32
+    typedef SOCKET socket_t;
+    #define INVALID_SOCKET_VAL INVALID_SOCKET
+#else
+    typedef int socket_t;
+    #define INVALID_SOCKET_VAL -1
+#endif
+
 // Cross-platform: ssize_t, errno, recv/send
 #ifdef _WIN32
     typedef int ssize_t_win;
@@ -127,8 +136,13 @@ bool WebServer::Start() {
     }
 
     // Allow address reuse
+#ifdef _WIN32
+    char opt = 1;
+    setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#else
     int opt = 1;
     setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -182,7 +196,15 @@ void WebServer::Run() {
     std::vector<struct pollfd> fds;
     fds.reserve(MAX_CLIENTS + 1);
 
-    fds.push_back({server_fd_, PLATFORM_POLLIN, 0});
+    struct pollfd server_pfd;
+#ifdef _WIN32
+    server_pfd.fd = (SOCKET)server_fd_;
+#else
+    server_pfd.fd = server_fd_;
+#endif
+    server_pfd.events = PLATFORM_POLLIN;
+    server_pfd.revents = 0;
+    fds.push_back(server_pfd);
 
     while (!stop_flag_.load()) {
         int ret = PLATFORM_POLL(fds.data(), static_cast<nfds_t>(fds.size()), 100); // 100ms timeout
@@ -203,7 +225,15 @@ void WebServer::Run() {
             if (client_fd >= 0) {
                 // Set client socket non-blocking
                 SET_NONBLOCKING(client_fd);
-                fds.push_back({client_fd, PLATFORM_POLLIN, 0});
+                struct pollfd client_pfd;
+#ifdef _WIN32
+                client_pfd.fd = (SOCKET)client_fd;
+#else
+                client_pfd.fd = client_fd;
+#endif
+                client_pfd.events = PLATFORM_POLLIN;
+                client_pfd.revents = 0;
+                fds.push_back(client_pfd);
             }
         }
 

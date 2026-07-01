@@ -125,15 +125,14 @@ std::string MultiModelManager::LoadModel(const std::string& path,
             case notllama::DataType::F32: bytes_per_elem = 4; break;
             case notllama::DataType::F16: bytes_per_elem = 2; break;
             case notllama::DataType::Q4_0:
-            case notllama::DataType::Q4_1: bytes_per_elem = 1; break; // 4 bits ~ 1 byte per 2 elems
+            case notllama::DataType::Q4_1: bytes_per_elem = 1; break; // ~0.5 bytes/elem
             case notllama::DataType::Q5_0:
             case notllama::DataType::Q5_1: bytes_per_elem = 1; break;
-            case notllama::DataType::Q8_0:
-            case notllama::DataType::Q8_1: bytes_per_elem = 1; break;
+            case notllama::DataType::Q8_0: bytes_per_elem = 1; break; // ~1 byte/elem
             case notllama::DataType::Q4_K:
             case notllama::DataType::Q5_K:
             case notllama::DataType::Q6_K:
-            case notllama::DataType::Q8_K: bytes_per_elem = 1; break; // K-quants ~1 byte/elem avg
+            case notllama::DataType::Q8_K: bytes_per_elem = 1; break; // K-quants ~1 byte/elem
             case notllama::DataType::FP8_E4M3:
             case notllama::DataType::FP8_E5M2: bytes_per_elem = 1; break;
             default: bytes_per_elem = 4; break;
