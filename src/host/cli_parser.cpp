@@ -101,6 +101,12 @@ bool CLIParser::Parse(int argc, char** argv, CLIOptions& out) {
                 fprintf(stderr, "Error: Invalid --gpu-layers value\n"); return false;
             }
         }
+        else if (arg == "--split-mode" && i + 1 < argc) {
+            out.extra["split-mode"] = argv[++i];
+        }
+        else if (arg == "--spill-dir" && i + 1 < argc) {
+            out.extra["spill-dir"] = argv[++i];
+        }
 
         // --- Prompt options ---
         else if ((arg == "--prompt" || arg == "-p") && i + 1 < argc) {
@@ -428,7 +434,9 @@ void CLIParser::PrintHelp(const char* program_name) {
     "      --model-id ID         Label for the model (default: filename)\n"
     "      --model-tags TAGS     Comma-separated tags (e.g., \"code,python\")\n"
     "      --draft-model FNAME   Draft model for speculative decoding\n"
-    "  -ngl, --gpu-layers N      GPU layers to offload (-1 = all)\n"
+    "  -ngl, --gpu-layers N      GPU layers to offload (-1 = all, 0 = CPU only)\n"
+    "      --split-mode MODE      How to split VRAM/RAM: 'layer' or 'row' (default: layer)\n"
+    "      --spill-dir PATH       Directory to page layers to when RAM full\n"
     "\n"
     "PROMPT OPTIONS:\n"
     "  -p, --prompt PROMPT       Prompt text\n"

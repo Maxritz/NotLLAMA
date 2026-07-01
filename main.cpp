@@ -4,6 +4,7 @@
 #include "mtp_engine.hpp"
 #include "web_server.hpp"
 #include "agent_node.hpp"
+#include "memory_tier.hpp"
 #include "rdna4_graphify.hpp"
 #include "engine/engine.hpp"
 #include "rdna4_vulkan.hpp"
@@ -53,6 +54,7 @@ static void PrintBanner() {
 
 static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
                                 MTPEngine* mtp, AgentNode* agent,
+                                MemoryTierManager* memory,
                                 const CLIOptions& opts) {
     fprintf(stderr, "\n=== Interactive Mode ===\n");
     fprintf(stderr, "Type 'quit' or 'exit' to stop\n");
@@ -60,12 +62,13 @@ static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
     fprintf(stderr, "Type '/switch <model_id>' to change model\n");
     fprintf(stderr, "Type '/route <prompt>' to see routing decision\n");
     fprintf(stderr, "Type '/clear' to clear context\n");
+    fprintf(stderr, "Type '/memory' to show VRAM/RAM tier stats\n");
     if (agent && agent->IsRunning()) {
         fprintf(stderr, "Type '/peers' to list agent peers\n");
         fprintf(stderr, "Type '/ask <peer> <prompt>' to ask a peer\n");
         fprintf(stderr, "Type '/askall <prompt>' to ask all peers\n");
-        fprintf(stderr, "Type '/graphify' to toggle Graphify awareness\n");
-        fprintf(stderr, "Type '/mcp' to toggle MCP awareness\n");
+        fprintf(stderr, "Type '/graphify' to check Graphify awareness\n");
+        fprintf(stderr, "Type '/mcp' to check MCP awareness\n");
     }
     fprintf(stderr, "========================\n\n");
 
@@ -116,6 +119,12 @@ static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
             } else {
                 fprintf(stderr, "[Model not found: %s]\n", new_id.c_str());
             }
+            continue;
+        }
+        if (input == "/memory") {
+            fprintf(stderr, "[MemoryTier] %s\n", memory->GetStatsString().c_str());
+            fprintf(stderr, "  gpu_layers=%d split_mode=%s\n",
+                    opts.gpu_layers, opts.extra.count("split-mode") ? opts.extra.at("split-mode").c_str() : "layer");
             continue;
         }
         if (input.starts_with("/route ")) {
@@ -457,6 +466,15 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[Init] Vulkan OK (wave32=%d, subgroup=%u)\n",
             ctx.isWave32() ? 1 : 0, ctx.subgroupSize);
 
+    // Create memory tier manager (VRAM / System RAM / Disk offloading)
+    MemoryTierManager memory_tier(ctx.device, ctx.physicalDevice, ctx.queueFamilyIndex);
+    TierConfig tier_cfg;
+    tier_cfg.gpu_layers = opts.gpu_layers;
+    if (opts.extra.count("split-mode")) tier_cfg.split_mode = opts.extra.at("split-mode");
+    if (opts.extra.count("spill-dir")) tier_cfg.spill_directory = opts.extra.at("spill-dir");
+    memory_tier.Configure(tier_cfg);
+    fprintf(stderr, "[MemoryTier] %s\n", memory_tier.GetStatsString().c_str());
+
     // Find shader directory
     std::string shader_dir = "shaders";
     {
@@ -642,7 +660,7 @@ int main(int argc, char** argv) {
 
     // Interactive or single-shot mode
     if (opts.interactive) {
-        RunInteractiveMode(&model_mgr, &router, &mtp, &agent_node, opts);
+        RunInteractiveMode(&model_mgr, &router, &mtp, &agent_node, &memory_tier, opts);
     } else {
         RunSingleShot(&model_mgr, &router, &mtp, opts);
     }
