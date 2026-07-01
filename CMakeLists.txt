@@ -39,6 +39,8 @@ set(HOST_SRC
     src/host/mtp_engine.cpp
     src/host/cli_parser.cpp
     src/host/web_server.cpp
+    src/host/agent_node.cpp
+    src/host/graphify_client.cpp
     src/loaders/gguf.cpp
     src/engine/vulkan_device.cpp
     src/engine/ring_allocator_adapter.cpp

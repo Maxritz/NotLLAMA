@@ -3,6 +3,8 @@
 #include "model_router.hpp"
 #include "mtp_engine.hpp"
 #include "web_server.hpp"
+#include "agent_node.hpp"
+#include "rdna4_graphify.hpp"
 #include "engine/engine.hpp"
 #include "rdna4_vulkan.hpp"
 #include <cstdio>
@@ -41,21 +43,30 @@ static std::string ReadPromptFromFile(const std::string& path) {
 static void PrintBanner() {
     fprintf(stderr,
         "\n"
-        "+=============================================+\n"
-        "|  NotLLAMA v0.2.0 - Vulkan Compute LLM       |\n"
-        "|  Multi-Model | MTP | Web API | llama.cpp CLI|\n"
-        "+=============================================+\n"
+        "+=====================================================+\n"
+        "|  NotLLAMA v0.3.0 - Vulkan Compute LLM               |\n"
+        "|  Multi-Model | MTP | Web | Agents | Graphify | MCP  |\n"
+        "|  llama.cpp-Compatible CLI | Distributed Reasoning   |\n"
+        "+=====================================================+\n"
         "\n");
 }
 
 static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
-                                MTPEngine* mtp, const CLIOptions& opts) {
+                                MTPEngine* mtp, AgentNode* agent,
+                                const CLIOptions& opts) {
     fprintf(stderr, "\n=== Interactive Mode ===\n");
     fprintf(stderr, "Type 'quit' or 'exit' to stop\n");
     fprintf(stderr, "Type '/models' to list loaded models\n");
     fprintf(stderr, "Type '/switch <model_id>' to change model\n");
     fprintf(stderr, "Type '/route <prompt>' to see routing decision\n");
     fprintf(stderr, "Type '/clear' to clear context\n");
+    if (agent && agent->IsRunning()) {
+        fprintf(stderr, "Type '/peers' to list agent peers\n");
+        fprintf(stderr, "Type '/ask <peer> <prompt>' to ask a peer\n");
+        fprintf(stderr, "Type '/askall <prompt>' to ask all peers\n");
+        fprintf(stderr, "Type '/graphify' to toggle Graphify awareness\n");
+        fprintf(stderr, "Type '/mcp' to toggle MCP awareness\n");
+    }
     fprintf(stderr, "========================\n\n");
 
     auto models = mgr->ListModels();
@@ -114,6 +125,63 @@ static void RunInteractiveMode(MultiModelManager* mgr, ModelRouter* router,
                     decision.primary_model_id.c_str(), decision.confidence);
             fprintf(stderr, "[Router] Reason: %s\n", decision.reason.c_str());
             continue;
+        }
+        // Agent commands
+        if (agent && agent->IsRunning()) {
+            if (input == "/peers") {
+                auto peers = agent->GetPeers();
+                fprintf(stderr, "[Agent] %zu peers:\n", peers.size());
+                for (const auto& p : peers) {
+                    fprintf(stderr, "  %s @ %s:%d | alive=%s | model=%s | tags=",
+                            p.name.c_str(), p.host.c_str(), p.port,
+                            p.alive ? "yes" : "no",
+                            p.model_loaded.c_str());
+                    for (const auto& t : p.tags) fprintf(stderr, "%s ", t.c_str());
+                    fprintf(stderr, "\n");
+                }
+                continue;
+            }
+            if (input.starts_with("/ask ")) {
+                std::string rest = input.substr(5);
+                size_t space = rest.find(' ');
+                if (space != std::string::npos) {
+                    std::string peer_name = rest.substr(0, space);
+                    std::string prompt = rest.substr(space + 1);
+                    AgentReasonRequest req;
+                    req.request_id = agent->GetName() + "-" + std::to_string(
+                        std::chrono::system_clock::now().time_since_epoch().count());
+                    req.from_agent = agent->GetName();
+                    req.query = prompt;
+                    auto resp = agent->AskPeer(peer_name, req);
+                    fprintf(stderr, "\n[Agent '%s' responded]:\n%s\n",
+                            resp.from_agent.c_str(), resp.answer.c_str());
+                } else {
+                    fprintf(stderr, "Usage: /ask <peer_name> <prompt>\n");
+                }
+                continue;
+            }
+            if (input.starts_with("/askall ")) {
+                std::string prompt = input.substr(8);
+                AgentReasonRequest req;
+                req.request_id = agent->GetName() + "-" + std::to_string(
+                    std::chrono::system_clock::now().time_since_epoch().count());
+                req.from_agent = agent->GetName();
+                req.query = prompt;
+                auto resp = agent->AskAll(req);
+                fprintf(stderr, "\n[Best from '%s' | confidence=%.2f]:\n%s\n",
+                        resp.from_agent.c_str(), resp.confidence, resp.answer.c_str());
+                continue;
+            }
+            if (input == "/graphify") {
+                fprintf(stderr, "[Graphify] Available: %s\n",
+                        agent ? "yes" : "no");
+                continue;
+            }
+            if (input == "/mcp") {
+                fprintf(stderr, "[MCP] Available: %s\n",
+                        agent ? "yes" : "no");
+                continue;
+            }
         }
         if (input.empty()) continue;
 
@@ -370,11 +438,14 @@ int main(int argc, char** argv) {
     PrintBanner();
 
     // Show parsed options
-    fprintf(stderr, "[Config] Models: %zu | Router: %s | MTP: %s | Server: %s\n",
+    fprintf(stderr, "[Config] Models: %zu | Router: %s | MTP: %s | Server: %s | Agent: %s\n",
             opts.model_paths.size(),
             opts.router_mode.c_str(),
             opts.enable_mtp ? "enabled" : "disabled",
-            opts.server_mode ? "enabled" : "disabled");
+            opts.server_mode ? "enabled" : "disabled",
+            (!opts.agent_name.empty() || opts.agent_port > 0) ? opts.agent_name.c_str() : "disabled");
+    if (opts.use_graphify) fprintf(stderr, "[Config] Graphify: enabled (%s)\n", opts.graphify_url.c_str());
+    if (opts.use_mcp) fprintf(stderr, "[Config] MCP: enabled (%s)\n", opts.mcp_url.c_str());
 
     // Initialize Vulkan
     fprintf(stderr, "[Init] Initializing Vulkan...\n");
@@ -477,6 +548,42 @@ int main(int argc, char** argv) {
     mtp.SetConfig(mtp_cfg);
     mtp.SetSeed(opts.seed);
 
+    // Create distributed agent node
+    AgentConfig agent_cfg;
+    agent_cfg.agent_name = opts.agent_name.empty() ? "notllama-agent-" + std::to_string(opts.port) : opts.agent_name;
+    agent_cfg.agent_port = opts.agent_port;
+    agent_cfg.agent_peers = opts.agent_peers;
+    agent_cfg.use_graphify = opts.use_graphify;
+    agent_cfg.graphify_url = opts.graphify_url;
+    agent_cfg.use_mcp = opts.use_mcp;
+    agent_cfg.mcp_url = opts.mcp_url;
+    agent_cfg.enable_reason_sharing = opts.enable_reason_sharing;
+    agent_cfg.enable_model_distill = opts.enable_model_distill;
+    agent_cfg.log_file = opts.log_file.empty() ? "" : opts.log_file + ".agent.log";
+    agent_cfg.log_max_size_mb = 50;
+    agent_cfg.log_verbosity = 2;
+
+    AgentNode agent_node(agent_cfg);
+    if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+        fprintf(stderr, "[Agent] Node '%s' ready | Peers: %zu\n",
+                agent_cfg.agent_name.c_str(), opts.agent_peers.size());
+        agent_node.RefreshPeers();
+    }
+
+    // Handle --create-model
+    if (!opts.create_model_name.empty()) {
+        ModelCreateRequest mc;
+        mc.model_name = opts.create_model_name;
+        mc.base_model_type = opts.create_model_type;
+        mc.size_mb = opts.create_model_size_mb;
+        mc.quant_format = opts.create_model_quant.empty() ? "Q4_K" : opts.create_model_quant;
+        mc.architecture_type = opts.create_model_arch.empty() ? "dense" : opts.create_model_arch;
+        if (!opts.agent_peers.empty()) {
+            agent_node.RequestModelCreation(mc);
+        }
+        fprintf(stderr, "[Model] Creation request queued: %s\n", opts.create_model_name.c_str());
+    }
+
     // Server mode
     if (opts.server_mode) {
         fprintf(stderr, "\n[Server] Starting HTTP API server...\n");
@@ -485,6 +592,15 @@ int main(int argc, char** argv) {
         if (!opts.api_key.empty()) server.SetApiKey(opts.api_key);
         server.EnableEmbeddings(opts.embedding_endpoint);
         server.EnableReranking(opts.reranking_endpoint);
+
+        // Wire agent endpoints to the web server
+        if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+            server.SetAgentHandler(
+                [&agent_node](const std::string& subpath, const nlohmann::json& body) -> std::string {
+                    return agent_node.HandleAgentEndpoint(subpath, body);
+                });
+            fprintf(stderr, "[Agent] Endpoints wired: /agent/reason, /agent/status, /agent/model/create\n");
+        }
 
         if (!server.Start()) {
             fprintf(stderr, "[FATAL] Failed to start server\n");
@@ -501,6 +617,11 @@ int main(int argc, char** argv) {
         if (opts.embedding_endpoint) fprintf(stderr, "  POST /v1/embeddings\n");
         fprintf(stderr, "  POST /tokenize\n");
         fprintf(stderr, "  POST /detokenize\n");
+        if (!opts.agent_peers.empty() || opts.agent_port > 0) {
+            fprintf(stderr, "  POST /agent/reason    (distributed reasoning)\n");
+            fprintf(stderr, "  GET  /agent/status    (agent status)\n");
+            fprintf(stderr, "  POST /agent/model/create\n");
+        }
         fprintf(stderr, "\nPress Ctrl+C to stop\n");
 
         while (g_running) {
@@ -521,7 +642,7 @@ int main(int argc, char** argv) {
 
     // Interactive or single-shot mode
     if (opts.interactive) {
-        RunInteractiveMode(&model_mgr, &router, &mtp, opts);
+        RunInteractiveMode(&model_mgr, &router, &mtp, &agent_node, opts);
     } else {
         RunSingleShot(&model_mgr, &router, &mtp, opts);
     }

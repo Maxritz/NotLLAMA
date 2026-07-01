@@ -93,8 +93,13 @@ public:
     void EnableEmbeddings(bool enable) { enable_embeddings_ = enable; }
     void EnableReranking(bool enable) { enable_reranking_ = enable; }
 
+    // Agent endpoint handler callback: (subpath, body_json) -> response_json_string
+    using AgentHandlerFn = std::function<std::string(const std::string&, const nlohmann::json&)>;
+    void SetAgentHandler(AgentHandlerFn fn) { agent_handler_ = fn; }
+
 private:
     MultiModelManager* model_mgr_;
+    AgentHandlerFn agent_handler_;
     ModelRouter* router_;
     MTPEngine* mtp_;
     std::string host_;

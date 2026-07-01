@@ -323,6 +323,59 @@ bool CLIParser::Parse(int argc, char** argv, CLIOptions& out) {
             out.prompt_benchmark = true;
         }
 
+        // --- Distributed Agent ---
+        else if (arg == "--agent-name" && i + 1 < argc) {
+            out.agent_name = argv[++i];
+        }
+        else if (arg == "--agent-port" && i + 1 < argc) {
+            if (!ParseInt(argv[++i], out.agent_port)) {
+                fprintf(stderr, "Error: Invalid --agent-port value\n"); return false;
+            }
+        }
+        else if (arg == "--agent-peer" && i + 1 < argc) {
+            out.agent_peers.push_back(argv[++i]);
+        }
+        else if (arg == "--enable-reason-sharing") {
+            out.enable_reason_sharing = true;
+        }
+        else if (arg == "--enable-model-distill") {
+            out.enable_model_distill = true;
+        }
+
+        // --- External tool awareness ---
+        else if (arg == "--use-graphify") {
+            out.use_graphify = true;
+        }
+        else if (arg == "--graphify-url" && i + 1 < argc) {
+            out.use_graphify = true;
+            out.graphify_url = argv[++i];
+        }
+        else if (arg == "--use-mcp") {
+            out.use_mcp = true;
+        }
+        else if (arg == "--mcp-url" && i + 1 < argc) {
+            out.use_mcp = true;
+            out.mcp_url = argv[++i];
+        }
+
+        // --- Model creation ---
+        else if (arg == "--create-model" && i + 1 < argc) {
+            out.create_model_name = argv[++i];
+        }
+        else if (arg == "--create-model-type" && i + 1 < argc) {
+            out.create_model_type = argv[++i];
+        }
+        else if (arg == "--create-model-size" && i + 1 < argc) {
+            char* end = nullptr;
+            out.create_model_size_mb = std::strtoul(argv[++i], &end, 10);
+        }
+        else if (arg == "--create-model-quant" && i + 1 < argc) {
+            out.create_model_quant = argv[++i];
+        }
+        else if (arg == "--create-model-arch" && i + 1 < argc) {
+            out.create_model_arch = argv[++i];
+        }
+
         // --- Unknown ---
         else if (arg.starts_with("--")) {
             // Store unknown args for forward compatibility
@@ -438,6 +491,26 @@ void CLIParser::PrintHelp(const char* program_name) {
     "      --benchmark           Run benchmark\n"
     "      --benchmark-iterations N (default: 10)\n"
     "      --prompt-benchmark    Benchmark prompt processing\n"
+    "\n"
+    "DISTRIBUTED AGENT OPTIONS:\n"
+    "      --agent-name NAME     Unique name for this node (default: notllama-agent)\n"
+    "      --agent-port PORT     Enable agent listener on this port (0 = disabled)\n"
+    "      --agent-peer HOST,PORT,NAME,TAGS  Add a peer agent (repeatable)\n"
+    "      --enable-reason-sharing  Allow agents to share reasoning\n"
+    "      --enable-model-distill   Allow cross-agent model distillation\n"
+    "\n"
+    "EXTERNAL TOOL AWARENESS:\n"
+    "      --use-graphify        Enable Graphify integration\n"
+    "      --graphify-url URL    Graphify endpoint URL\n"
+    "      --use-mcp             Enable MCP integration\n"
+    "      --mcp-url URL         MCP server URL\n"
+    "\n"
+    "MODEL CREATION:\n"
+    "      --create-model NAME   Create a new model (requires --create-model-type)\n"
+    "      --create-model-type   Base model type (llama, qwen, gemma)\n"
+    "      --create-model-size N Target size in MB\n"
+    "      --create-model-quant  Quantization (Q4_K, Q6_K, Q8_0)\n"
+    "      --create-model-arch   Architecture: dense, moe, mixed\n"
     "\n"
     "OTHER:\n"
     "  -h, --help                Show this help\n"

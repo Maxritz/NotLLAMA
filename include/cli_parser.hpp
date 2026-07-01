@@ -80,6 +80,26 @@ struct CLIOptions {
     int32_t benchmark_iterations = 10;            // --benchmark-iterations
     bool prompt_benchmark = false;                // --prompt-benchmark
 
+    // Distributed Agent options
+    std::string agent_name;                       // --agent-name (e.g., "deepseek-node")
+    int32_t agent_port = 0;                       // --agent-port (0 = disabled)
+    std::vector<std::string> agent_peers;         // --agent-peer (host,port,name,tags)
+    bool enable_reason_sharing = true;            // --enable-reason-sharing
+    bool enable_model_distill = false;            // --enable-model-distill
+
+    // External tool awareness (not built-in, just flags)
+    bool use_graphify = false;                    // --use-graphify
+    std::string graphify_url;                     // --graphify-url
+    bool use_mcp = false;                         // --use-mcp
+    std::string mcp_url;                          // --mcp-url
+
+    // Model creation
+    std::string create_model_name;                // --create-model <name>
+    std::string create_model_type;                // --create-model-type
+    size_t create_model_size_mb = 0;              // --create-model-size
+    std::string create_model_quant;               // --create-model-quant
+    std::string create_model_arch;                // --create-model-arch
+
     // Help
     bool show_help = false;                       // --help / -h
     bool show_version = false;                    // --version / -v

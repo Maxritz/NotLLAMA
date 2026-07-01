@@ -30,23 +30,32 @@
 #include <chrono>
 #include <thread>
 
+// Cross-platform: ssize_t, errno, recv/send
+#ifdef _WIN32
+    typedef int ssize_t_win;
+    typedef SSIZE_T ssize_t;
+    #define SOCK_ERRNO WSAGetLastError()
+    #define SOCK_EAGAIN WSAEWOULDBLOCK
+    #define SOCK_EWOULDBLOCK WSAEWOULDBLOCK
+    #define SOCK_SEND_FLAGS 0
+#else
+    typedef ssize_t ssize_t;
+    #define SOCK_ERRNO errno
+    #define SOCK_EAGAIN EAGAIN
+    #define SOCK_EWOULDBLOCK EWOULDBLOCK
+    #define SOCK_SEND_FLAGS MSG_NOSIGNAL
+#endif
+
 // Cross-platform helpers for poll/non-blocking I/O
 #ifdef _WIN32
-    typedef int nfds_t_win;
     typedef ULONG nfds_t;
-    #define POLLIN_WIN 0x0100
-    #define POLLPRI_WIN 0x0200
-    #define POLLERR_WIN 0x0001
-    #define POLLHUP_WIN 0x0002
     #define SET_NONBLOCKING(fd) do { u_long mode = 1; ioctlsocket((fd), FIONBIO, &mode); } while(0)
     #define PLATFORM_POLL(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
-    #define PLATFORM_POLLIN POLLIN_WIN
-    #define PLATFORM_POLLERR POLLERR_WIN
-    #define PLATFORM_POLLHUP POLLHUP_WIN
+    #define PLATFORM_POLLIN 0x0100
+    #define PLATFORM_POLLERR 0x0001
+    #define PLATFORM_POLLHUP 0x0002
     #define ERRNO_EINTR (WSAGetLastError() == WSAEINTR)
-    struct pollfd_win { SOCKET fd; SHORT events; SHORT revents; };
 #else
-    typedef nfds_t nfds_t;
     #define SET_NONBLOCKING(fd) do { int fl = fcntl((fd), F_GETFL, 0); fcntl((fd), F_SETFL, fl | O_NONBLOCK); } while(0)
     #define PLATFORM_POLL(fds, nfds, timeout) poll((fds), (nfds), (timeout))
     #define PLATFORM_POLLIN POLLIN
@@ -231,7 +240,7 @@ void WebServer::HandleRequest(int client_fd) {
     // Read request with timeout
     auto start = std::chrono::steady_clock::now();
     while (total < static_cast<ssize_t>(sizeof(buffer)) - 1) {
-        ssize_t n = recv(client_fd, buffer + total, sizeof(buffer) - 1 - total, 0);
+        ssize_t n = recv(client_fd, buffer + total, sizeof(buffer) - 1 - static_cast<size_t>(total), 0);
         if (n > 0) {
             total += n;
             buffer[total] = '\0';
@@ -240,7 +249,8 @@ void WebServer::HandleRequest(int client_fd) {
         } else if (n == 0) {
             break; // Connection closed
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int err = SOCK_ERRNO;
+            if (err == SOCK_EAGAIN || err == SOCK_EWOULDBLOCK) {
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 if (elapsed > std::chrono::seconds(timeout_seconds_)) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -252,7 +262,7 @@ void WebServer::HandleRequest(int client_fd) {
 
     if (total == 0) return;
     buffer[total] = '\0';
-    std::string request(buffer, total);
+    std::string request(buffer, static_cast<size_t>(total));
 
     std::string method = ParseMethod(request);
     std::string path = ParsePath(request);
@@ -261,7 +271,7 @@ void WebServer::HandleRequest(int client_fd) {
 
     std::string response = RouteRequest(method, path, body, auth);
 
-    send(client_fd, response.c_str(), response.size(), MSG_NOSIGNAL);
+    send(client_fd, response.c_str(), static_cast<int>(response.size()), SOCK_SEND_FLAGS);
 }
 
 std::string WebServer::ParseMethod(const std::string& request) {
@@ -354,6 +364,16 @@ std::string WebServer::RouteRequest(const std::string& method,
         // Detokenize
         if (method == "POST" && (path == "/detokenize" || path == "/v1/detokenize")) {
             return HandleDetokenize(nlohmann::json::parse(body.empty() ? "{}" : body));
+        }
+        // Agent endpoints (distributed agent protocol)
+        if (path.starts_with("/agent/")) {
+            if (agent_handler_) {
+                std::string subpath = path.substr(1); // remove leading /
+                return make_http_response(200, "application/json",
+                    agent_handler_(subpath, nlohmann::json::parse(body.empty() ? "{}" : body)));
+            }
+            return make_http_response(503, "application/json",
+                nlohmann::json{{"error", "Agent node not initialized"}}.dump());
         }
     } catch (const nlohmann::json::exception& e) {
         return MakeErrorResponse(400, std::string("JSON parse error: ") + e.what(),
