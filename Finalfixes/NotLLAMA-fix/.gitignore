@@ -1,0 +1,47 @@
+build/
+graphify-out/
+update/
+update-*/
+udpate*/
+*.spv
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.vs/
+*.user
+x64/
+Debug/
+Release/
+MinSizeRel/
+RelWithDebInfo/
+
+# Reference implementations
+VindexLLM/
+reference/
+
+stderr.txt
+
+__pycache__/
+
+# Model files
+model/*.bin
+model/*.json
+*.weights.bin
+*.weights.json
+
+# Large PDFs
+*.pdf
+
+# Temporary files
+*.tmp
+*.log
+

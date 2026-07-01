@@ -1,0 +1,150 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// =============================================================================
+// Flash Attention — wave32-tiled KV cache layout
+// =============================================================================
+// Each thread handles hd/32 elements of Q/K/V. Uses subgroupAdd for the dot
+// product reduction — no shared memory, no barriers inside the KV loop.
+//
+// KV cache layout (new): [head][seqTile][dim][32]
+//   K[pos = seqTile*32 + seqOff] at index: seqTile * 32 * hd + dim * 32 + seqOff
+//
+// This trades single-position stride-1 dim access for batched stride-1 pos
+// access. The old [seq][dim] layout was better for single query at a time.
+// The tiled layout enables wave32-coalesced reads when processing 32 positions
+// in parallel (future batched decode).
+//
+// MAX_HEAD_DIM=256 keeps per-thread arrays at 8 elements (256/32).
+// Models with larger headDim will be rejected at runtime.
+// =============================================================================
+
+#define MAX_HEAD_DIM 256u
+#define MAX_HD_PER_THREAD (MAX_HEAD_DIM / 32u)
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer QRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer KCacheRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer VCacheRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrQ;
+    uint64_t addrKCache;
+    uint64_t addrVCache;
+    uint64_t addrOut;
+    uint seqLen;
+    uint headDim;
+    uint qRowStart;
+    uint qRowCount;
+    uint kvTileSize;
+    float invSqrtHeadDim;
+} pc;
+
+// Read K/V from wave32-tiled KV cache:
+//   K[pos, dim] = KCache[(pos/32) * 32 * hd + dim * 32 + (pos % 32)]
+// This is slower per-element than the old [seq][dim] layout but enables
+// coalesced batched reads across 32 consecutive positions.
+float readKCached(uint pos, uint dim) {
+    uint seqTile = pos / 32u;
+    uint seqOff = pos % 32u;
+    KCacheRef K = KCacheRef(pc.addrKCache);
+    return K.data[seqTile * 32u * pc.headDim + dim * 32u + seqOff];
+}
+
+float readVCached(uint pos, uint dim) {
+    uint seqTile = pos / 32u;
+    uint seqOff = pos % 32u;
+    VCacheRef V = VCacheRef(pc.addrVCache);
+    return V.data[seqTile * 32u * pc.headDim + dim * 32u + seqOff];
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = pc.headDim;
+    uint sl = pc.seqLen;
+    uint qStart = pc.qRowStart;
+    uint kvTile = pc.kvTileSize;
+
+    QRef Q = QRef(pc.addrQ);
+    OutRef Out = OutRef(pc.addrOut);
+
+    uint qRow = qStart + tid;
+    bool valid = qRow < sl && hd <= MAX_HEAD_DIM;
+
+    uint hdPerThread = max(hd / 32u, 1u);
+
+    float myQ[MAX_HD_PER_THREAD];
+    float myAcc[MAX_HD_PER_THREAD];
+    for (uint d = 0; d < MAX_HD_PER_THREAD; ++d) { myQ[d] = 0.0; myAcc[d] = 0.0; }
+    float m = -1e30;
+    float l = 0.0;
+
+    if (valid) {
+        uint qBase = qRow * hd;
+        for (uint d = 0; d < hdPerThread; ++d) {
+            uint idx = tid * hdPerThread + d;
+            if (idx < hd) myQ[d] = Q.data[qBase + idx];
+        }
+    }
+
+    uint numKvTiles = (sl + kvTile - 1) / kvTile;
+
+    for (uint kvIdx = 0; kvIdx < numKvTiles; ++kvIdx) {
+        uint kvStart = kvIdx * kvTile;
+        uint kvEnd = min(kvStart + kvTile, sl);
+
+        for (uint j = kvStart; j < kvEnd; ++j) {
+            float partialDot = 0.0;
+            if (valid) {
+                for (uint d = 0; d < hdPerThread; ++d) {
+                    uint idx = tid * hdPerThread + d;
+                    if (idx >= hd) break;
+                    partialDot += myQ[d] * readKCached(j, idx);
+                }
+            }
+
+            float score = subgroupAdd(partialDot) * pc.invSqrtHeadDim;
+
+            if (valid && j > qRow) score = -1e30;
+
+            if (valid) {
+                float mNew = max(m, score);
+                float expScale = exp(m - mNew);
+                float p = exp(score - mNew);
+
+                for (uint d = 0; d < hdPerThread; ++d) {
+                    uint idx = tid * hdPerThread + d;
+                    if (idx >= hd) break;
+                    myAcc[d] = myAcc[d] * expScale + p * readVCached(j, idx);
+                }
+                l = l * expScale + p;
+                m = mNew;
+            }
+        }
+    }
+
+    if (valid) {
+        float invL = 1.0 / l;
+        uint outBase = qRow * hd;
+        for (uint d = 0; d < hdPerThread; ++d) {
+            uint idx = tid * hdPerThread + d;
+            if (idx >= hd) break;
+            Out.data[outBase + idx] = myAcc[d] * invL;
+        }
+    }
+}

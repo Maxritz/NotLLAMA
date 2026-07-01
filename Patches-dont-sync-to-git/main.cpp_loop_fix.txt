@@ -1,0 +1,63 @@
+// Replace your main.cpp generation loop with this robust version:
+
+uint32_t prev_token = 0xFFFFFFFF;
+int tokens_generated = 0;
+int max_tokens = 128;
+int max_steps = max_tokens * 100;
+int steps = 0;
+std::vector<uint32_t> output_tokens;
+
+auto start = std::chrono::high_resolution_clock::now();
+
+while (tokens_generated < max_tokens && steps < max_steps) {
+    bool ok = engine.StepBatch();
+    ++steps;
+
+    if (!ok) {
+        fprintf(stderr, "[MAIN] StepBatch FAILED at phase=%d, step=%d\n", 
+                engine.GetPhase(), steps);
+        fflush(stderr);
+        break;
+    }
+
+    uint32_t token = engine.LastTokenId();
+
+    // Count NEW non-zero tokens (allow same token ID consecutively, just not 0)
+    if (token != 0) {
+        output_tokens.push_back(token);
+        prev_token = token;
+        ++tokens_generated;
+
+        fprintf(stderr, "[MAIN] Token %d: id=%u (after %d steps)\n", 
+                tokens_generated, token, steps);
+        fflush(stderr);
+    }
+
+    // Safety: stuck in IDLE
+    static int idle_streak = 0;
+    if (engine.GetPhase() == 2) {
+        ++idle_streak;
+        if (idle_streak > 5) {
+            fprintf(stderr, "[MAIN] Stuck in IDLE for %d steps, breaking\n", idle_streak);
+            fflush(stderr);
+            break;
+        }
+    } else {
+        idle_streak = 0;
+    }
+}
+
+auto end = std::chrono::high_resolution_clock::now();
+double elapsed = std::chrono::duration<double>(end - start).count();
+
+fprintf(stderr, "[MAIN] Generated %d tokens in %d steps, %.3fs (%.1f tok/s)\n",
+        tokens_generated, steps, elapsed, 
+        tokens_generated / (elapsed + 0.0001));
+fflush(stderr);
+
+// Decode and print
+std::string output_text;
+for (auto t : output_tokens) {
+    output_text += tokenizer.decode({t});
+}
+printf("\n--- Output ---\n%s\n", output_text.c_str());

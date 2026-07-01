@@ -1,0 +1,35 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// cpy_f16_f32.comp — Copy F16 buffer to F32 buffer.
+// Dispatch one thread per element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Float16Ref {
+    float16_t data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer FloatOutRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrSrc;
+    uint64_t addrDst;
+    uint n;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+
+    Float16Ref src = Float16Ref(pc.addrSrc);
+    FloatOutRef dst = FloatOutRef(pc.addrDst);
+
+    dst.data[idx] = float(src.data[idx]);
+}

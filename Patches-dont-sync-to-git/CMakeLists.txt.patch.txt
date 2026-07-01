@@ -1,0 +1,15 @@
+# In CMakeLists.txt, find these lines and change:
+
+# Line ~1xx:
+target_include_directories(test_engine PRIVATE include)
+# CHANGE TO:
+target_include_directories(test_engine PRIVATE include src)
+
+# In the add_kernel_test function (~line 1xx):
+function(add_kernel_test NAME)
+    add_executable(${NAME} test/${NAME}.cpp ${KERNEL_TEST_SRC})
+    target_include_directories(${NAME} PRIVATE include)
+# CHANGE TO:
+function(add_kernel_test NAME)
+    add_executable(${NAME} test/${NAME}.cpp ${KERNEL_TEST_SRC})
+    target_include_directories(${NAME} PRIVATE include src)

@@ -1,0 +1,41 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_AMD_gpu_shader_half_float : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint seq_len;
+    uint max_seq;
+    float scale;
+    uint num_q_heads;
+    uint gqa_ratio;
+    uint off_q;
+} pc;
+
+layout(std430, binding = 0) buffer QBuf { float16_t Q[]; };
+layout(std430, binding = 1) buffer KBuf { float16_t K[]; };
+layout(std430, binding = 2) buffer ScoresBuf { float scores[]; };
+
+shared float shared_max[16];
+shared float shared_sum[16];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint pos = gl_WorkGroupID.y;
+
+    if (head >= pc.num_q_heads || pos >= pc.seq_len) return;
+
+    uint kv_head = head / pc.gqa_ratio;
+    uint q_base = (head * pc.max_seq + pc.off_q) * pc.head_dim;
+    uint k_base = (kv_head * pc.max_seq + pos) * pc.head_dim;
+
+    float acc = 0.0;
+    for (uint d = tid; d < pc.head_dim; d += 256)
+        acc += float(Q[q_base + d]) * float(K[k_base + d]);
+
+    uint score_idx = head * pc.max_seq + pos;
+    scores[score_idx] = acc * pc.scale;
+}

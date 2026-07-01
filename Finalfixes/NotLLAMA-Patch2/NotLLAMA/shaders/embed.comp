@@ -1,0 +1,43 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// =============================================================================
+// EMBEDDING — Lookup token ID in embedding table.
+// =============================================================================
+// Output: hidden_state[token_pos * dim + d] = embed_table[token_id * dim + d]
+// =============================================================================
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer EmbedTableRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrEmbedTable;
+    uint64_t addrHiddenState;
+    uint tokenId;
+    uint tokenPos;
+    uint dim;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.dim;
+    uint embedOffset = pc.tokenId * dim;
+    uint hiddenOffset = pc.tokenPos * dim;
+
+    EmbedTableRef E = EmbedTableRef(pc.addrEmbedTable);
+    HiddenStateRef H = HiddenStateRef(pc.addrHiddenState);
+
+    for (uint d = tid; d < dim; d += 32) {
+        H.data[hiddenOffset + d] = E.data[embedOffset + d];
+    }
+}

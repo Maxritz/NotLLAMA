@@ -1,0 +1,78 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// =============================================================================
+// WAVE32/WAVE64 COOPERATIVE GEMM
+// =============================================================================
+// One workgroup per output element. SUBGROUP_SIZE threads each process
+// K/SUBGROUP_SIZE inner elements, then subgroupAdd reduces to a single
+// dot product. Uses subgroupAdd (not manual DPP cascade) so it's correct
+// on both wave32 and wave64 — AMD's compiler maps subgroupAdd to DPP natively.
+//
+// Dispatch: x=N (one per output column), y=M (one per output row)
+//
+// SUBGROUP_SIZE define controls workgroup size and inner stride.
+// Default 32 for wave32 on RDNA4 (2× faster than wave64 for compute).
+// =============================================================================
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 32
+#endif
+
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ARef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer CRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA;
+    uint64_t addrB;
+    uint64_t addrC;
+    uint M;
+    uint N;
+    uint K;
+    float alpha;
+    uint transB;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint col = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+
+    if (col >= pc.N || row >= pc.M) return;
+
+    ARef A = ARef(pc.addrA);
+    BRef B = BRef(pc.addrB);
+    CRef C = CRef(pc.addrC);
+
+    // Each thread accumulates a strided K-slice for the SAME output element
+    float part = 0.0;
+    for (uint k = tid; k < pc.K; k += SUBGROUP_SIZE) {
+        float a_val = A.data[row * pc.K + k];
+        float b_val = (pc.transB != 0)
+            ? B.data[col * pc.K + k]
+            : B.data[k * pc.N + col];
+        part += a_val * b_val;
+    }
+
+    // subgroupAdd sums across all SUBGROUP_SIZE active lanes.
+    // On RDNA4 with forced wave32: adds across all 32 threads.
+    // On RDNA2/GCN wave64: adds across the active lanes of a 64-wide wave.
+    // Inactive threads contribute 0; result is identical on all threads.
+    float total = subgroupAdd(part);
+
+    uint outIdx = row * pc.N + col;
+    C.data[outIdx] = pc.alpha * total;
+}

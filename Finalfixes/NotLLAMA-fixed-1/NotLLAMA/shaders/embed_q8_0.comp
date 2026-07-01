@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// =============================================================================
+// EMBED Q8_0 — Lookup token ID in Q8_0 embedding table, output F32.
+// =============================================================================
+// Output: hidden_state[token_pos * dim + d] = dequant(embed_table[token_id * dim + d])
+// =============================================================================
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer QuantRef {
+    uint data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer HiddenStateRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrQuantTable;
+    uint64_t addrHiddenState;
+    uint tokenId;
+    uint tokenPos;
+    uint dim;
+} pc;
+
+uint readByte(uint addr) {
+    uint wordIdx = addr / 4;
+    uint byteInWord = addr % 4;
+    uint word = QuantRef(pc.addrQuantTable).data[wordIdx];
+    return (word >> (byteInWord * 8)) & 0xFF;
+}
+
+uint readU16(uint addr) {
+    return readByte(addr) | (readByte(addr + 1) << 8);
+}
+
+float readF16(uint addr) {
+    uint raw = readU16(addr);
+    return unpackFloat2x16(raw).x;
+}
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= pc.dim) return;
+
+    uint globalIdx = pc.tokenId * pc.dim + d;
+
+    // Q8_0 block layout: 34 bytes per 32 elements
+    // bytes 0-1: delta (F16 LE)
+    // bytes 2-33: 32 quantized int8 values
+    uint blockIdx = globalIdx / 32;
+    uint eleInBlock = globalIdx % 32;
+    uint blockOffset = blockIdx * 34;
+
+    float delta = readF16(blockOffset);
+    int q = int(readByte(blockOffset + 2 + eleInBlock));
+    if (q > 127) q -= 256;
+
+    uint hiddenOffset = pc.tokenPos * pc.dim;
+    HiddenStateRef(pc.addrHiddenState).data[hiddenOffset + d] = delta * float(q);
+}

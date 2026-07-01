@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint seq_len;
+    uint max_seq;
+    uint num_q_heads;
+    uint gqa_ratio;
+} pc;
+
+layout(std430, binding = 0) buffer ScoresBuf { float scores[]; };
+layout(std430, binding = 1) buffer VBuf { float V[]; };
+layout(std430, binding = 2) buffer OutBuf { float output_data[]; };
+
+shared float shared_data[256];
+
+void main() {
+    uint dim = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (dim >= pc.head_dim || head >= pc.num_q_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint kv_head = head / pc.gqa_ratio;
+    float acc = 0.0;
+    for (uint pos = tid; pos < pc.seq_len; pos += 256) {
+        float w = scores[head * pc.max_seq + pos];
+        acc += w * V[(kv_head * pc.max_seq + pos) * pc.head_dim + dim];
+    }
+
+    // tree reduce
+    shared_data[tid] = acc;
+    barrier();
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shared_data[tid] += shared_data[tid + stride];
+        barrier();
+    }
+    if (tid == 0)
+        output_data[head * pc.head_dim + dim] = shared_data[0];
+}

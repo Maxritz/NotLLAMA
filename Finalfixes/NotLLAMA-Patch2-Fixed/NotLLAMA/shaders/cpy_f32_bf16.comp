@@ -1,0 +1,43 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+// cpy_f32_bf16.comp — Copy F32 buffer to BF16 buffer.
+// BF16: 1 sign + 8 exponent + 7 mantissa bits.
+// Dispatch one thread per element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer FloatRef {
+    float data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Uint16OutRef {
+    uint16_t data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrSrc;
+    uint64_t addrDst;
+    uint n;
+} pc;
+
+uint floatToBf16(float val) {
+    uint bits = floatBitsToUint(val);
+    // Round to nearest even: add bias bit before truncation
+    uint bias = ((bits >> 16) & 1u) + 0x7FFFu;
+    return (bits + bias) >> 16;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+
+    FloatRef src = FloatRef(pc.addrSrc);
+    Uint16OutRef dst = Uint16OutRef(pc.addrDst);
+
+    dst.data[idx] = uint16_t(floatToBf16(src.data[idx]));
+}

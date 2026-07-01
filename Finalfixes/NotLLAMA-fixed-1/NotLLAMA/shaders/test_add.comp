@@ -1,0 +1,21 @@
+#version 450
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 32
+#endif
+
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer InputA { float data[]; } input_a;
+layout(set = 0, binding = 1) buffer InputB { float data[]; } input_b;
+layout(set = 0, binding = 2) buffer OutputC { float data[]; } output_c;
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) return;
+    output_c.data[gid] = input_a.data[gid] + input_b.data[gid];
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ContextCompressionConfig",
+  "type": "object",
+  "required": ["enabled", "trigger_threshold_percent", "target_percent", "strategy"],
+  "properties": {
+    "enabled": { "type": "boolean", "default": true },
+    "trigger_threshold_percent": {
+      "type": "number",
+      "minimum": 50,
+      "maximum": 100,
+      "default": 85,
+      "description": "When context usage exceeds this %, trigger compression"
+    },
+    "target_percent": {
+      "type": "number",
+      "minimum": 10,
+      "maximum": 90,
+      "default": 50,
+      "description": "Compress down to this % of max context"
+    },
+    "strategy": {
+      "type": "string",
+      "enum": ["sliding_window", "half_slide", "fifo", "importance", "summary"],
+      "default": "importance"
+    },
+    "strategies": {
+      "type": "object",
+      "properties": {
+        "sliding_window": {
+          "type": "object",
+          "properties": {
+            "window_size": { "type": "integer", "minimum": 64, "default": 1024 },
+            "stride": { "type": "integer", "minimum": 1, "default": 512 }
+          }
+        },
+        "half_slide": {
+          "type": "object",
+          "properties": {
+            "preserve_recent": { "type": "integer", "minimum": 64, "default": 512 }
+          }
+        },
+        "fifo": {
+          "type": "object",
+          "properties": {
+            "drop_percent": { "type": "number", "minimum": 1, "maximum": 99, "default": 50 }
+          }
+        },
+        "importance": {
+          "type": "object",
+          "properties": {
+            "scorer": {
+              "type": "string",
+              "enum": ["attention_entropy", "gradient_magnitude", "token_frequency"],
+              "default": "attention_entropy"
+            },
+            "keep_top_percent": { "type": "number", "minimum": 1, "maximum": 99, "default": 50 }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "properties": {
+            "summarizer_model": { "type": "string", "enum": ["internal", "external"], "default": "internal" },
+            "compress_ratio": { "type": "number", "minimum": 0.01, "maximum": 1.0, "default": 0.3 }
+          }
+        }
+      }
+    }
+  }
+}

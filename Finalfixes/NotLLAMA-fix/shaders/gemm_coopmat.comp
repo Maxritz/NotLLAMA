@@ -1,0 +1,62 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// =============================================================================
+// WAVE32/WAVE64 COOPERATIVE GEMM (2D dispatch, dequant-aware)
+// =============================================================================
+// One workgroup per output element. SUBGROUP_SIZE threads cooperatively
+// compute a dot product via subgroupAdd. Correct on wave32 and wave64.
+//
+// Dispatch: x=N (output columns), y=M (output rows)
+// SUBGROUP_SIZE defined at compile time (32 for wave32, 64 for wave64).
+// =============================================================================
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 32
+#endif
+
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ARef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer BRef {
+    float data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer CRef {
+    float data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrA;
+    uint64_t addrB;
+    uint64_t addrC;
+    uint M;
+    uint N;
+    uint K;
+    float alpha;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint col = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+
+    if (col >= pc.N || row >= pc.M) return;
+
+    ARef A = ARef(pc.addrA);
+    BRef B = BRef(pc.addrB);
+    CRef C = CRef(pc.addrC);
+
+    float part = 0.0;
+    for (uint k = tid; k < pc.K; k += SUBGROUP_SIZE) {
+        part += A.data[row * pc.K + k] * B.data[k * pc.N + col];
+    }
+
+    float total = subgroupAdd(part);
+    C.data[row * pc.N + col] = pc.alpha * total;
+}

@@ -1,0 +1,83 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Fused Gate+Up+SiLU GEMM shader.
+// Computes: intermediate[h] = SiLU(dot(input, gate[h])) * dot(input, up[h])
+//           output[d] = dot(intermediate, down[d])
+//
+// Weight layout (row-major):
+//   gate: [dim, hiddenDim] — gate[k][h] = gate[k * hiddenDim + h]
+//   up:   [dim, hiddenDim] — up[k][h]   = up[k * hiddenDim + h]
+//   down: [hiddenDim, dim] — down[h][d] = down[h * dim + d]
+//
+// Workgroup: 32 threads, each thread computes one output element.
+// Dispatch: (dim + 31) / 32 workgroups, 1, 1
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer InRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer GateRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer UpRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer DownRef { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer OutRef { float data[]; };
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrIn;
+    uint64_t addrGate;
+    uint64_t addrUp;
+    uint64_t addrDown;
+    uint64_t addrOut;
+    uint dim;
+    uint hiddenDim;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dIdx = gl_WorkGroupID.x * 32 + tid;
+    if (dIdx >= pc.dim) return;
+
+    InRef In = InRef(pc.addrIn);
+    GateRef Gate = GateRef(pc.addrGate);
+    UpRef Up = UpRef(pc.addrUp);
+    DownRef Down = DownRef(pc.addrDown);
+    OutRef Out = OutRef(pc.addrOut);
+
+    uint dim = pc.dim;
+    uint hidden = pc.hiddenDim;
+
+    float acc = 0.0;
+
+    // Process hidden dimension in chunks of 32
+    for (uint hBase = 0; hBase < hidden; hBase += 32) {
+        uint chunkSize = min(32u, hidden - hBase);
+
+        // Compute gate and up matvecs for this chunk
+        float intermediate[32];
+        for (uint h = 0; h < chunkSize; ++h) {
+            uint hIdx = hBase + h;
+            float gateAcc = 0.0;
+            float upAcc = 0.0;
+            for (uint k = 0; k < dim; ++k) {
+                float x = In.data[k];
+                gateAcc += x * Gate.data[k * hidden + hIdx];
+                upAcc   += x * Up.data[k * hidden + hIdx];
+            }
+            // SiLU activation on gate
+            float g = gateAcc;
+            float silu = g / (1.0 + exp(-g));
+            intermediate[h] = silu * upAcc;
+        }
+
+        // Accumulate down projection for this output element
+        for (uint h = 0; h < chunkSize; ++h) {
+            acc += intermediate[h] * Down.data[(hBase + h) * dim + dIdx];
+        }
+    }
+
+    Out.data[dIdx] = acc;
+}

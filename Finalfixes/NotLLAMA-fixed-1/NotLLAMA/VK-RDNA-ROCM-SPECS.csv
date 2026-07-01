@@ -1,0 +1,144 @@
+Extension Name,Extension Type,RDNA 1,RDNA 2,RDNA 3,RDNA 4,Description,ROCm/HIP Equivalent,Notes,,
+VK_KHR_ray_tracing_pipeline,KHR,No,Yes,Yes,Yes,Full ray tracing pipeline with shader binding tables,HIP-RT / rocrt,RDNA 2+ supports ray tracing; RDNA 4 has 2x throughput,,
+VK_KHR_ray_query,KHR,No,Yes,Yes,Yes,Inline ray queries in shaders,HIP-RT / rocrt,Similar to hiprtQuery,,
+VK_KHR_acceleration_structure,KHR,No,Yes,Yes,Yes,Build and manage BVH acceleration structures,HIP-RT / rocrt,Required for ray tracing,,
+VK_KHR_deferred_host_operations,KHR,Yes,Yes,Yes,Yes,Defer host operations to background threads,N/A,Utility for ray tracing builds,,
+VK_KHR_pipeline_library,KHR,No,Yes,Yes,Yes,Combine ray tracing pipelines from libraries,N/A,"
+VK_KHR_cooperative_matrix,KHR,No,No,Yes (RDNA3),Yes,Matrix multiply-accumulate using tensor cores,rocBLAS / hipWMMA,RDNA3: AI Accelerators; RDNA4: 2x rate"," FP8/INT4""",
+VK_KHR_shader_float16_int8,KHR,Yes,Yes,Yes,Yes,FP16 and INT8 shader support,__half / hipFloat16,"
+VK_KHR_16bit_storage,KHR,Yes,Yes,Yes,Yes,16-bit storage in buffers and push constants,hipFloat16,",,
+VK_KHR_8bit_storage,KHR,Yes,Yes,Yes,Yes,8-bit storage in buffers,"
+VK_KHR_shader_subgroup_extended_types,KHR,Yes,Yes,Yes,Yes,Extended subgroup types (8/16/64-bit),__shfl / __ballot,",,,
+VK_KHR_subgroup_size_control,KHR,Yes (RDNA2+),Yes,Yes,Yes,Control subgroup/wavefront size,__hip_wave_size(),RDNA supports Wave32 and Wave64,,
+VK_KHR_dynamic_rendering,KHR,Yes,Yes,Yes,Yes,Render passes without framebuffer objects,N/A,Promoted to Vulkan 1.4 core,,
+VK_KHR_dynamic_rendering_local_read,KHR,Yes,Yes,Yes,Yes,Local reads in dynamic rendering,N/A,"
+VK_KHR_push_descriptor,KHR,Yes (RDNA2+),Yes,Yes,Yes,Push descriptor sets,N/A,Promoted to Vulkan 1.4 core""",,
+VK_KHR_scalar_block_layout,KHR,Yes (RDNA2+),Yes,Yes,Yes,Scalar layout for block members,N/A,Promoted to Vulkan 1.4 core,,
+VK_KHR_maintenance1-6,KHR,Yes (varies),Yes,Yes,Yes,Various maintenance fixes,N/A,All promoted to Vulkan 1.4 core,,
+VK_KHR_depth_clamp_zero_one,KHR,No,No,No,Yes,Depth clamp to [0,1] range,N/A,Added in Vulkan 1.4.305,
+VK_KHR_global_priority,KHR,Yes,Yes,Yes,Yes,Global queue priority,N/A,"
+VK_KHR_line_rasterization,KHR,Yes,Yes,Yes,Yes,Line rasterization modes,N/A,",,
+VK_KHR_map_memory2,KHR,Yes,Yes,Yes,Yes,Extended memory mapping,N/A,"
+VK_KHR_separate_depth_stencil_layouts,KHR,Yes,Yes,Yes,Yes,Separate depth/stencil layouts,N/A,",,
+VK_KHR_uniform_buffer_standard_layout,KHR,Yes,Yes,Yes,Yes,Standard uniform buffer layout,N/A,"
+VK_KHR_buffer_device_address,KHR,Yes (RDNA2+),Yes,Yes,Yes,GPU virtual addresses for buffers,hipGetDeviceAddress,",,
+VK_KHR_device_address_commands,KHR,Yes (RDNA2+),Yes,Yes,Yes,Device address commands,"
+VK_KHR_shader_clock,KHR,Yes,Yes,Yes,Yes,Shader clock access,__clock64(),",,,
+VK_KHR_shader_terminate_invocation,KHR,Yes,Yes,Yes,Yes,Terminate shader invocation,N/A,"
+VK_KHR_fragment_shading_rate,KHR,No,Yes,Yes,Yes,VRS / coarse shading,N/A,",,
+VK_KHR_variable_pointers,KHR,Yes,Yes,Yes,Yes,Variable pointers in SPIR-V,N/A,"
+VK_KHR_relaxed_block_layout,KHR,Yes,Yes,Yes,Yes,Relaxed block layout,N/A,",,
+VK_KHR_storage_buffer_storage_class,KHR,Yes,Yes,Yes,Yes,Storage buffer storage class,N/A,"
+VK_KHR_sampler_ycbcr_conversion,KHR,Yes,Yes,Yes,Yes,YCbCr conversions,N/A,",,
+VK_KHR_bind_memory2,KHR,Yes,Yes,Yes,Yes,Extended memory binding,N/A,"
+VK_KHR_dedicated_allocation,KHR,Yes,Yes,Yes,Yes,Dedicated allocation,N/A,",,
+VK_KHR_get_memory_requirements2,KHR,Yes,Yes,Yes,Yes,Extended memory requirements,N/A,"
+VK_KHR_descriptor_update_template,KHR,Yes,Yes,Yes,Yes,Descriptor update templates,N/A,",,
+VK_KHR_surface,KHR,Yes,Yes,Yes,Yes,Window system surface,N/A,"
+VK_KHR_swapchain,KHR,Yes,Yes,Yes,Yes,Swapchain presentation,N/A,",,
+VK_KHR_display,KHR,Yes,Yes,Yes,Yes,Direct display,N/A,"
+VK_KHR_display_swapchain,KHR,Yes,Yes,Yes,Yes,Display swapchain,N/A,",,
+VK_KHR_xlib_surface,KHR,Yes,Yes,Yes,Yes,X11 surface (Linux),N/A,"
+VK_KHR_wayland_surface,KHR,Yes,Yes,Yes,Yes,Wayland surface (Linux),N/A,",,
+VK_KHR_win32_surface,KHR,Yes,Yes,Yes,Yes,Windows surface,N/A,"
+VK_KHR_external_memory,KHR,Yes,Yes,Yes,Yes,External memory import/export,hipExternalMemory,",,
+VK_KHR_external_memory_win32,KHR,Yes,Yes,Yes,Yes,Windows external memory,N/A,"
+VK_KHR_external_memory_fd,KHR,Yes,Yes,Yes,Yes,Linux fd external memory,N/A,",,
+VK_KHR_external_semaphore,KHR,Yes,Yes,Yes,Yes,External semaphores,hipExternalSemaphore,"
+VK_KHR_external_semaphore_win32,KHR,Yes,Yes,Yes,Yes,Windows external semaphores,N/A,",,
+VK_KHR_external_semaphore_fd,KHR,Yes,Yes,Yes,Yes,Linux fd external semaphores,N/A,"
+VK_KHR_external_fence,KHR,Yes,Yes,Yes,Yes,External fences,hipExternalFence,",,
+VK_KHR_external_fence_win32,KHR,Yes,Yes,Yes,Yes,Windows external fences,N/A,"
+VK_KHR_external_fence_fd,KHR,Yes,Yes,Yes,Yes,Linux fd external fences,N/A,",,
+VK_KHR_timeline_semaphore,KHR,Yes (RDNA2+),Yes,Yes,Yes,Timeline semaphores,hipSignalSemaphore,"
+VK_KHR_synchronization2,KHR,Yes,Yes,Yes,Yes,Enhanced synchronization,N/A,",,
+VK_KHR_pipeline_executable_properties,KHR,Yes,Yes,Yes,Yes,Query pipeline executable info,N/A,"
+VK_KHR_shader_non_semantic_info,KHR,Yes,Yes,Yes,Yes,Non-semantic debug info,N/A,",,
+VK_KHR_zero_initialize_workgroup_memory,KHR,Yes,Yes,Yes,Yes,Zero-initialize workgroup memory,N/A,"
+VK_KHR_workgroup_memory_explicit_layout,KHR,Yes (RDNA2+),Yes,Yes,Yes,Explicit workgroup memory layout,__shared__,""
+VK_KHR_copy_commands2,KHR,Yes,Yes,Yes,Yes,Extended copy commands,N/A,",,
+VK_KHR_format_feature_flags2,KHR,Yes,Yes,Yes,Yes,64-bit format feature flags,N/A,"
+VK_KHR_maintenance7,KHR,Yes,Yes,Yes,Yes,Maintenance 7 fixes,N/A,",,
+VK_EXT_shader_float8,EXT,No,No,No,Yes,8-bit floating point (FP8) shader support,N/A (ROCm has FP8 via hipFloat8),RDNA4: native FP8 math hardware,,
+VK_EXT_shader_atomic_float,EXT,Yes (RDNA2+),Yes,Yes,Yes,Atomic ops on floating-point values,atomicAdd for floats,RDNA3+ supports shaderBufferFloat32AtomicAdd,,
+VK_EXT_shader_atomic_float2,EXT,Yes (RDNA2+),Yes,Yes,Yes,Extended float atomics,N/A,"
+VK_EXT_shader_image_atomic_int64,EXT,Yes (RDNA2+),Yes,Yes,Yes,64-bit image atomics,N/A,",,
+VK_EXT_shader_subgroup_ballot,EXT,Yes,Yes,Yes,Yes,Subgroup ballot operations,__ballot,"
+VK_EXT_shader_subgroup_vote,EXT,Yes,Yes,Yes,Yes,Subgroup vote operations,__vote,",,
+VK_EXT_subgroup_size_control,EXT,Yes (RDNA2+),Yes,Yes,Yes,Control subgroup size,__hip_wave_size(),"
+VK_EXT_memory_budget,EXT,Yes,Yes,Yes,Yes,Query memory budget,hipMemGetInfo,",,
+VK_EXT_memory_priority,EXT,Yes,Yes,Yes,Yes,Memory priority hints,N/A,"
+VK_EXT_calibrated_timestamps,EXT,Yes,Yes,Yes,Yes,Calibrated timestamps,N/A,",,
+VK_EXT_debug_utils,EXT,Yes,Yes,Yes,Yes,Debug utilities,N/A,"
+VK_EXT_debug_marker,EXT,Yes,Yes,Yes,Yes,Debug markers,N/A,",,
+VK_EXT_tooling_info,EXT,Yes,Yes,Yes,Yes,Tooling info,N/A,"
+VK_EXT_validation_features,EXT,Yes,Yes,Yes,Yes,Validation features,N/A,",,
+VK_EXT_private_data,EXT,Yes,Yes,Yes,Yes,Private data in objects,N/A,"
+VK_EXT_custom_border_color,EXT,Yes,Yes,Yes,Yes,Custom border colors,N/A,",,
+VK_EXT_filter_cubic,EXT,Yes,Yes,Yes,Yes,Cubic filtering,N/A,"
+VK_EXT_image_view_min_lod,EXT,Yes,Yes,Yes,Yes,Min LOD for image views,N/A,",,
+VK_EXT_vertex_attribute_divisor,EXT,Yes,Yes,Yes,Yes,Vertex attribute divisor,N/A,"
+VK_EXT_index_type_uint8,EXT,Yes,Yes,Yes,Yes,UINT8 index buffers,N/A,",,
+VK_EXT_line_rasterization,EXT,Yes,Yes,Yes,Yes,Line rasterization,N/A,"
+VK_EXT_provoking_vertex,EXT,Yes,Yes,Yes,Yes,Provoking vertex control,N/A,",,
+VK_EXT_depth_clip_control,EXT,Yes,Yes,Yes,Yes,Depth clip control,N/A,"
+VK_EXT_depth_clamp_zero_one,EXT,No,No,No,Yes,Depth clamp to [0,1],N/A,",,
+VK_EXT_memory_decompression,EXT,No,No,No,Yes,Hardware memory decompression,N/A,RDNA4: dedicated decompression hardware,,
+VK_EXT_shader_64bit_indexing,EXT,No,No,No,Yes,64-bit indexing in shaders,N/A,"
+VK_EXT_ray_tracing_invocation_reorder,EXT,No,No,No,Yes,Shader Execution Reordering (SER),N/A,20-50% ray tracing gains on RDNA4""",,
+VK_EXT_opacity_micromap,EXT,No,No,No,Yes,Opacity micromap support,N/A,Added in Vulkan 1.4.305,,
+VK_EXT_attachment_feedback_loop_layout,EXT,Yes,Yes,Yes,Yes,Attachment feedback loop,N/A,"
+VK_EXT_extended_dynamic_state,EXT,Yes (RDNA2+),Yes,Yes,Yes,Dynamic state,",,
+VK_EXT_extended_dynamic_state2,EXT,Yes (RDNA2+),Yes,Yes,Yes,Extended dynamic state,N/A,"
+VK_EXT_extended_dynamic_state3,EXT,Yes (RDNA2+),Yes,Yes,Yes,Further extended dynamic state,N/A,",,
+VK_EXT_vertex_input_dynamic_state,EXT,Yes (RDNA2+),Yes,Yes,Yes,Dynamic vertex input,N/A,"
+VK_EXT_color_write_enable,EXT,Yes (RDNA2+),Yes,Yes,Yes,Color write enable,N/A,",,
+VK_EXT_primitive_topology_list_restart,EXT,Yes,Yes,Yes,Yes,List restart for primitive topology,N/A,"
+VK_EXT_swapchain_maintenance1,EXT,Yes,Yes,Yes,Yes,Swapchain maintenance,N/A,",,
+VK_EXT_display_control,EXT,Yes,Yes,Yes,Yes,Display control,N/A,"
+VK_EXT_display_surface_counter,EXT,Yes,Yes,Yes,Yes,Display surface counter,N/A,",,
+VK_EXT_full_screen_exclusive,EXT,Yes,Yes,Yes,Yes,Full-screen exclusive,N/A,"
+VK_EXT_acquire_drm_display,EXT,Yes,Yes,Yes,Yes,Acquire DRM display,N/A,",,
+VK_EXT_direct_mode_display,EXT,Yes,Yes,Yes,Yes,Direct mode display,N/A,"
+VK_EXT_astc_decode_mode,EXT,Yes,Yes,Yes,Yes,ASTC decode mode,N/A,",,
+VK_EXT_ycbcr_2plane_444_formats,EXT,Yes,Yes,Yes,Yes,YCbCr 2-plane 444,N/A,"
+VK_EXT_image_robustness,EXT,Yes,Yes,Yes,Yes,Image robustness,N/A,",,
+VK_EXT_pipeline_robustness,EXT,Yes,Yes,Yes,Yes,Pipeline robustness,N/A,"
+VK_EXT_robustness2,EXT,Yes,Yes,Yes,Yes,Robustness 2,N/A,",,
+VK_EXT_texel_buffer_alignment,EXT,Yes,Yes,Yes,Yes,Texel buffer alignment,N/A,"
+VK_EXT_descriptor_buffer,EXT,Yes (RDNA2+),Yes,Yes,Yes,Descriptor buffers,N/A,",,
+VK_EXT_descriptor_indexing,EXT,Yes (RDNA2+),Yes,Yes,Yes,Descriptor indexing,N/A,"
+VK_EXT_inline_uniform_block,EXT,Yes,Yes,Yes,Yes,Inline uniform blocks,N/A,",,
+VK_EXT_pipeline_creation_cache_control,EXT,Yes,Yes,Yes,Yes,Pipeline cache control,N/A,"
+VK_EXT_pipeline_creation_feedback,EXT,Yes,Yes,Yes,Yes,Pipeline creation feedback,N/A,",,
+VK_EXT_shader_demote_to_helper_invocation,EXT,Yes,Yes,Yes,Yes,Demote to helper invocation,N/A,"
+VK_EXT_shader_viewport_index_layer,EXT,Yes,Yes,Yes,Yes,Viewport index layer,N/A,",,
+VK_EXT_conservative_rasterization,EXT,Yes,Yes,Yes,Yes,Conservative rasterization,N/A,"
+VK_EXT_sample_locations,EXT,Yes,Yes,Yes,Yes,Sample locations,N/A,",,
+VK_EXT_texel_filter_minmax,EXT,Yes,Yes,Yes,Yes,Texel filter minmax,N/A,"
+VK_EXT_image_drm_format_modifier,EXT,Yes,Yes,Yes,Yes,DRM format modifiers,N/A,",,
+VK_EXT_physical_device_drm,EXT,Yes,Yes,Yes,Yes,DRM physical device,N/A,"
+VK_EXT_display_surface_counter,EXT,Yes,Yes,Yes,Yes,Display surface counter,N/A,",,
+VK_EXT_hdr_metadata,EXT,Yes,Yes,Yes,Yes,HDR metadata,N/A,"
+VK_EXT_headless_surface,EXT,Yes,Yes,Yes,Yes,Headless surface,N/A,",,
+VK_EXT_metal_surface,EXT,Yes,Yes,Yes,Yes,Metal surface (macOS),N/A,"
+VK_EXT_metal_objects,EXT,Yes,Yes,Yes,Yes,Metal objects,N/A,",,
+VK_EXT_swapchain_colorspace,EXT,Yes,Yes,Yes,Yes,Swapchain colorspace,N/A,"
+VK_AMDX_dense_geometry_format,AMDX,No,No,No,Yes,Build RT acceleration structures from compressed DGF data,N/A (ROCm ray tracing uses different compression),RDNA4: Dense Geometry Format; AMD driver 25.10.25.02+""",,
+VK_AMD_buffer_marker,AMD,Yes,Yes,Yes,Yes,Write buffer markers for profiling,N/A,"
+VK_AMD_draw_indirect_count,AMD,Yes,Yes,Yes,Yes,Indirect draw with count,N/A,",,
+VK_AMD_gcn_shader,AMD,Yes,Yes,Yes,Yes,GCN shader intrinsics,N/A,Deprecated for RDNA,,
+VK_AMD_gpu_shader_half_float,AMD,Yes,Yes,Yes,Yes,GPU shader half-float,N/A,"
+VK_AMD_gpu_shader_int16,AMD,Yes,Yes,Yes,Yes,GPU shader int16,N/A,",,
+VK_AMD_mixed_attachment_samples,AMD,Yes,Yes,Yes,Yes,Mixed attachment samples,N/A,"
+VK_AMD_shader_core_properties,AMD,Yes,Yes,Yes,Yes,Shader core properties,N/A,",,
+VK_AMD_shader_core_properties2,AMD,Yes,Yes,Yes,Yes,Extended shader core properties,N/A,"
+VK_AMD_device_coherent_memory,AMD,Yes,Yes,Yes,Yes,Device coherent memory,N/A,",,
+VK_AMD_anti_lag,AMD,Yes,Yes,Yes,Yes,Anti-lag / input latency reduction,N/A,"
+VK_AMD_gpa_interface,AMD,Yes,Yes,Yes,Yes,GPU Performance API (GPA) interface,N/A,Performance counters", SPM," SQTT"""
+VK_AMD_pipeline_compiler_control,AMD,Yes,Yes,Yes,Yes,Control pipeline compiler behavior,N/A,"
+VK_AMD_shader_image_load_store_lod,AMD,Yes,Yes,Yes,Yes,Image load/store with LOD,N/A,",,
+VK_AMD_shader_trinary_minmax,AMD,Yes,Yes,Yes,Yes,Trinary minmax operations,N/A,"
+VK_AMD_texture_gather_bias_lod,AMD,Yes,Yes,Yes,Yes,Texture gather with bias/LOD,N/A,",,
+VK_AMD_display_native_hdr,AMD,Yes,Yes,Yes,Yes,Display native HDR,N/A,"
+VK_AMD_rasterization_order,AMD,Yes,Yes,Yes,Yes,Rasterization order,N/A,",,

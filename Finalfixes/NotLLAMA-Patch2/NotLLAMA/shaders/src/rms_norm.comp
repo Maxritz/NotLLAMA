@@ -1,0 +1,47 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint dim;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) buffer InBuf { float in_buf[]; };
+layout(std430, binding = 1) buffer WeightBuf { float weight[]; };
+layout(std430, binding = 2) buffer OutBuf { float out_buf[]; };
+
+shared float partial[8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint base = row * pc.dim;
+
+    float sum_sq = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256) {
+        float v = in_buf[base + i];
+        sum_sq += v * v;
+    }
+
+    sum_sq = subgroupAdd(sum_sq);
+
+    uint sg = gl_LocalInvocationIndex / gl_SubgroupSize;
+    if (gl_SubgroupInvocationID == 0)
+        partial[sg] = sum_sq;
+    barrier();
+
+    if (tid == 0) {
+        float total = 0.0;
+        uint nsg = gl_WorkGroupSize.x / gl_SubgroupSize;
+        for (uint i = 0; i < nsg; i++)
+            total += partial[i];
+        partial[0] = inversesqrt(total / float(pc.dim) + pc.eps);
+    }
+    barrier();
+
+    float rms = partial[0];
+    for (uint i = tid; i < pc.dim; i += 256)
+        out_buf[base + i] = (in_buf[base + i] * rms) * weight[i];
+}

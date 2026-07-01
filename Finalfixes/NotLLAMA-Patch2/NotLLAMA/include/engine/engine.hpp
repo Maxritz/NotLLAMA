@@ -1,0 +1,23 @@
+#pragma once
+#include "engine/types.hpp"
+#include "engine/idevice.hpp"
+#include "engine/imemory_allocator.hpp"
+#include "engine/imodel.hpp"
+#include "engine/iquantization.hpp"
+#include "engine/idescriptor_manager.hpp"
+#include "engine/ishader_library.hpp"
+#include "engine/iattention_scheduler.hpp"
+#include "engine/itokenizer.hpp"
+#include "engine/icompute_engine.hpp"
+#include "engine/idebug_context.hpp"
+
+// Adapter / implementation headers
+#include "engine/vulkan_device.hpp"
+#include "engine/ring_allocator_adapter.hpp"
+#include "engine/vulkan_compute_engine.hpp"
+#include "engine/vulkan_shader_library.hpp"
+#include "engine/vulkan_descriptor_manager.hpp"
+#include "engine/vulkan_debug_context.hpp"
+#include "engine/tokenizer_adapter.hpp"
+#include "engine/model_adapter.hpp"
+#include "engine/kv_cache_adapter.hpp"

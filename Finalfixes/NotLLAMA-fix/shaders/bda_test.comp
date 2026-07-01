@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer OutRef {
+    uint data[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t addrOut;
+    uint nElements;
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= pc.nElements) return;
+
+    OutRef outBuf = OutRef(pc.addrOut);
+    outBuf.data[tid] = 0xDEADBEEF + tid;
+}

@@ -1,0 +1,120 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteRef {
+    uint data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer F16OutRef {
+    float16_t data[];
+};
+
+layout(push_constant, scalar) uniform Params {
+    uint64_t addrSrc;
+    uint64_t addrDst;
+    uint n;
+    uint blockSize;
+    uint bits;
+    uint scaleBits;
+    uint zeroPoint;
+    float    scale;
+} pc;
+
+// --- Byte-level reads (scalar, no shared memory) ---
+
+uint readByte(uint addr) {
+    uint wordIdx = addr / 4;
+    uint byteInWord = addr % 4;
+    uint word = ByteRef(pc.addrSrc).data[wordIdx];
+    return (word >> (byteInWord * 8)) & 0xFF;
+}
+
+float readF16(uint addr) {
+    uint lo = readByte(addr);
+    uint hi = readByte(addr + 1);
+    return unpackFloat2x16(lo | (hi << 8)).x;
+}
+
+// --- TQ4 dequantization: 4-bit packed, d-last layout ---
+// Block layout: [scale(2B)] [weights(64B)] = 66 bytes / 128 elements
+// Packing: 2 weights per byte, low nibble = even index
+
+void dequant_tq4(uint gi, out float w) {
+    uint blockIdx = gi / pc.blockSize;
+    uint eleInBlock = gi % pc.blockSize;
+    uint bytesPerBlock = (pc.blockSize / 2) + 2;  // 64 + 2 = 66
+    uint bs = blockIdx * bytesPerBlock;
+
+    float s = readF16(bs);  // scale at start (d-last = scale is separate)
+
+    // Weights start at offset 2
+    uint byteIdx = bs + 2 + (eleInBlock / 2);
+    uint bval = readByte(byteIdx);
+    uint nibble = (eleInBlock % 2 == 0) ? (bval & 0x0F) : ((bval >> 4) & 0x0F);
+
+    float q = float(nibble) - 8.0;
+    if (pc.zeroPoint != 0u) q = float(nibble);
+    w = (q * s) * pc.scale;
+}
+
+// --- TQ6 dequantization: 6-bit packed, d-last layout ---
+// Block layout: [scale(2B)] [weights(48B)] = 50 bytes / 64 elements
+// Packing: 4 weights per 3 bytes (24 bits), little-endian bit stream
+
+void dequant_tq6(uint gi, out float w) {
+    uint blockIdx = gi / pc.blockSize;
+    uint eleInBlock = gi % pc.blockSize;
+    uint bytesPerBlock = (pc.blockSize * 6 / 8) + 2;  // 48 + 2 = 50
+    uint bs = blockIdx * bytesPerBlock;
+
+    float s = readF16(bs);  // scale
+
+    // Bit-level unpacking: weight i starts at bit offset i*6 within the weight region
+    uint bitOffset = eleInBlock * 6;
+    uint byteStart = bs + 2 + (bitOffset / 8);
+    uint bitInByte = bitOffset % 8;
+
+    // Read 3 bytes spanning the weight (may span at most 3 bytes)
+    uint b0 = readByte(byteStart);
+    uint b1 = readByte(byteStart + 1);
+    uint b2 = readByte(byteStart + 2);
+    uint bits = b0 | (b1 << 8) | (b2 << 16);
+    uint q6 = (bits >> bitInByte) & 0x3Fu;
+
+    float q = float(q6) - 32.0;
+    if (pc.zeroPoint != 0u) q = float(q6);
+    w = (q * s) * pc.scale;
+}
+
+// --- TQ3 stub (v2) ---
+void dequant_tq3(uint gi, out float w) {
+    // TODO: 3-bit packing — 8 weights per 3 bytes (24 bits, no waste)
+    // Block layout: [scale(2B)] [weights(48B)] = 50 bytes / 128 elements
+    w = 0.0;
+}
+
+void main() {
+    F16OutRef Out = F16OutRef(pc.addrDst);
+
+    uint gid = gl_GlobalInvocationID.x;
+    uint stride = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+
+    for (uint i = gid; i < pc.n; i += stride) {
+        float w = 0.0;
+
+        if (pc.bits == 4u) {
+            dequant_tq4(i, w);
+        } else if (pc.bits == 6u) {
+            dequant_tq6(i, w);
+        } else if (pc.bits == 3u) {
+            dequant_tq3(i, w);
+        }
+
+        Out.data[i] = float16_t(w);
+    }
+}
